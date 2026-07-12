@@ -78,11 +78,23 @@ site grid / inverter limits.
 ## Deployment
 
 Production deployment is via the ansible-nas `energy_optimizer` role, which pulls the image
-from GHCR (no local build). CI builds `linux/amd64` and pushes to
-`ghcr.io/<owner>/energy-optimizer` on tag. To run a GHCR image with compose directly:
+from GHCR (no local build). Tagged releases are published automatically by GitHub Actions
+(see [basen](https://github.com/vanklompf/basen) for the same pattern):
 
 ```bash
-EO_IMAGE=ghcr.io/<owner>/energy-optimizer:latest docker compose up -d
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+This builds and pushes to GHCR with tags `latest` and `v0.1.0`:
+
+- `ghcr.io/vanklompf/energy-optimizer:latest`
+- `ghcr.io/vanklompf/energy-optimizer:v0.1.0`
+
+To run a GHCR image with compose directly:
+
+```bash
+EO_IMAGE=ghcr.io/vanklompf/energy-optimizer:latest docker compose up -d
 ```
 
 ## Status
