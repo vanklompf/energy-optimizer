@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  # Lint, type-check and test inside the dev image (docker-first: no host toolchain).
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build dev image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: dev
+          load: true
+          tags: energy-optimizer:dev
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Lint (ruff)
+        run: docker run --rm energy-optimizer:dev ruff check src tests
+      - name: Type-check (mypy)
+        run: docker run --rm energy-optimizer:dev mypy src
+        continue-on-error: true
+      - name: Test (pytest)
+        run: docker run --rm energy-optimizer:dev pytest -q
+
+  # Build the production image (includes the SPA build) and push to GHCR on tag.
+  build:
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build (amd64) and optionally push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: runtime
+          platforms: linux/amd64
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/energy-optimizer:latest
+            ghcr.io/${{ github.repository_owner }}/energy-optimizer:${{ github.ref_name }}
