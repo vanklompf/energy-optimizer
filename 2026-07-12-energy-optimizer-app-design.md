@@ -21,7 +21,7 @@ refinements were found during review:
    GET https://api.pstryk.pl/integrations/meter-data/unified-metrics/
        ?metrics=pricing&resolution=hour
        &window_start=2026-07-12T00:00:00Z&window_end=2026-07-14T00:00:00Z
-   Authorization: <raw api key, no Bearer prefix>
+   Authorization: *** key, no Bearer prefix>
    ```
 
    Response: `{ "frames": [...], "summary": {...} }`, with prices in
@@ -55,16 +55,32 @@ refinements were found during review:
    constraint handling, trivially extensible (flexible loads, reserve penalties), and a 48-step
    hourly problem solves in milliseconds. Keep the DP only if a solver dependency proves painful.
 
-7. **Distribution fees belong in the buy price.** `price_gross` is the energy price; the true
-   marginal import cost includes variable distribution components (dystrybucja, quality fee, OZE,
-   etc. per the OSD tariff). Model as a configurable `distribution_markup_pln_kwh` (flat or
-   hour-banded) added to buy price. Getting this wrong biases grid-charging decisions. Verify
-   against an actual invoice during dry-run.
+7. **Do not add distribution fees twice.** A live 2026-07-12 Pstryk response showed that
+   `price_gross` / `full_price` already incorporates `service_price`, `dist_price`, VAT and excise
+   on top of the TGE component. The default import price is therefore `full_price` (falling back to
+   `price_gross`), not `price_gross + distribution_markup`. Persist all returned components and
+   support a configurable `import_price_adjustment_pln_kwh` only for invoice components proven to
+   be missing. Verify the composition against an actual invoice during dry-run.
 
 8. **Settlement semantics stay an open question but are contained.** Whether
    `price_prosumer_gross` applies exactly to battery-sourced export, and how the prosumer deposit
    nets against the invoice, must be verified against a real invoice before controlled mode. Until
    then the savings dashboard shows both "raw hourly" and "invoice-model" valuations.
+
+9. **Aggregate battery variables are insufficient.** Use explicit source/destination flows
+   (`pv_to_load`, `pv_to_battery`, `pv_to_grid`, `grid_to_load`, `grid_to_battery`,
+   `battery_to_load`, `battery_to_grid`). This makes battery-export and grid-charge feature flags
+   exact instead of accidentally disabling all export. Separate binaries prevent simultaneous
+   charge/discharge and simultaneous grid import/export.
+
+10. **Time-step duration is explicit.** Every interval carries `dt_hours`; power (kW) is converted
+    to interval energy (kWh) before SoC/accounting equations. Use aligned 15-minute steps so a run
+    part-way through an hour never optimises elapsed time as if it were future.
+
+11. **Startup history and PV forecasts need real bootstrap inputs.** App SQLite is empty on first
+    start, HA recorder has only 14 days, and no dedicated Forecast.Solar/Solcast entity was found
+    during live review. Phase 0 is mandatory. Support an optional one-off InfluxDB backfill, and
+    require configured PV-array geometry rather than treating a weather entity as a PV forecast.
 
 ## System context
 
@@ -73,7 +89,7 @@ refinements were found during review:
 | PV | ~7 kWp, observed peak ~5.75 kW |
 | Battery | Sigen, 18.08 kWh rated, 8.8 kW charge / 9.6 kW discharge limits |
 | HA | `http://dom.korta.top:8123`, Sigenergy-Local-Modbus (HACS) entities live |
-| Pricing | Pstryk, hourly dynamic, unified-metrics API |
+| Pricing | Pstryk, hourly dynamic, unified-metrics API; live 48-frame horizon verified 2026-07-12 |
 | Infra | HpeNas: HA, Mosquitto, InfluxDB (`ha_raw`), Traefik, ansible-nas managed |
 
 Key HA entities (read-only in MVP):
@@ -100,7 +116,7 @@ the same process. No external services beyond HA, Pstryk, forecast provider, and
 flowchart LR
   pstryk[Pstryk unified-metrics API] --> core
   ha[Home Assistant REST/WS] --> core
-  fcst[Forecast.Solar / HA forecast entities] --> core
+  fcst[Forecast.Solar / Solcast with configured PV planes] --> core
   subgraph container [energy-optimizer container]
     core[Collector + Forecaster + Optimiser + Scheduler] --> db[(SQLite /data)]
     core --> api[FastAPI REST + static SPA]
@@ -116,14 +132,14 @@ Internal modules (single Python package `energy_optimizer`):
 | `config.py` | Pydantic Settings; all config via env vars / env file |
 | `ha_client.py` | HA REST: live states, history API; retry + staleness detection |
 | `pstryk_client.py` | unified-metrics client; caching; known-price-horizon reporting |
-| `forecast/pv.py` | Forecast.Solar (or HA forecast entity) + recent-error correction |
+| `forecast/pv.py` | Forecast.Solar/Solcast using configured PV planes + recent-error correction |
 | `forecast/load.py` | rolling median by (hour, weekday/weekend) from stored history |
 | `forecast/price.py` | price padding beyond known horizon (marked low-confidence) |
-| `optimiser.py` | MILP formulation + solve (HiGHS); returns plan + duals/reasons |
+| `optimiser.py` | duration-aware explicit-flow MILP + HiGHS; returns plan + constraint metadata |
 | `simulator.py` | replay engine: applies a policy to a historical series (backtests, counterfactuals) |
 | `policies.py` | baseline policies: pv-only, self-consumption, actual-sigen (from telemetry) |
 | `accounting.py` | cost/value calculation, degradation cost, invoice model |
-| `explain.py` | turns plan + duals + safety outcomes into a human `reason` string |
+| `explain.py` | deterministic reasons from selected flows and binding constraints; LP-relaxation metadata is advisory |
 | `safety.py` | rule checks; produces blockers/warnings; owns `control_enabled` (always false in MVP) |
 | `scheduler.py` | APScheduler jobs: collect (1 min), prices (15 min), optimise (15 min), daily report (00:15) |
 | `store.py` | SQLite via SQLAlchemy; migrations via Alembic |
@@ -136,68 +152,103 @@ frontend server, no SSR — the SPA only consumes the app's own REST API.
 ## Storage schema (SQLite, `/data/energy_optimizer.sqlite`)
 
 ```
-telemetry(ts, soc_pct, batt_kw, pv_kw, load_kw, grid_import_kw, grid_export_kw, ems_mode, stale bool)
-prices(hour_start, buy_gross, sell_gross, tge, source {api|forecast}, fetched_at)
-forecasts(run_id, hour_start, kind {pv|load|price_buy|price_sell}, value, confidence)
+telemetry(ts, soc_pct, batt_charge_kw, batt_discharge_kw, pv_kw, load_kw, grid_import_kw,
+          grid_export_kw, ems_mode, stale bool)
+prices(interval_start, tge, service, distribution, excise, vat, base, buy_gross, full_price,
+       sell_gross, source {api|forecast}, fetched_at)
+forecasts(run_id, interval_start, kind {pv|load|price_buy|price_sell}, value, confidence)
 runs(run_id, ts, mode, horizon_hours, known_price_hours, input_state json,
-     objective_pln, status {ok|blocked|low_confidence}, reason, safety json, solve_ms)
-plan_steps(run_id, hour_start, charge_kw, discharge_kw, grid_import_kwh, grid_export_kwh,
-           curtail_kwh, soc_pct_end, marginal_value)
+     solver_input json, solver_input_schema, solver_input_sha256, objective_pln,
+     status {ok|blocked|low_confidence}, reason, safety json, solve_ms)
+plan_steps(run_id, interval_start, dt_hours, pv_to_load_kwh, pv_to_battery_kwh, pv_to_grid_kwh,
+           grid_to_load_kwh, grid_to_battery_kwh, battery_to_load_kwh,
+           battery_to_grid_kwh, curtail_kwh, soc_pct_end, marginal_value)
 daily_reports(date, actual_cost_pln, optimizer_sim_cost_pln, pvonly_cost_pln, selfcons_cost_pln,
               missed_opportunity_pln, actual_import_kwh, actual_export_kwh, battery_cycles,
               degradation_cost_pln, pv_forecast_mae_kwh, load_forecast_mae_kwh, forecast_error_cost_pln)
 ```
 
-`runs` + `plan_steps` are the audit log: every optimisation run is fully reproducible from its row.
+`runs` + `plan_steps` are the audit log. `solver_input` is an immutable, versioned snapshot of all
+normalised telemetry, forecasts, prices, interval durations, battery/tariff parameters, feature
+flags and solver version used by the run; its SHA-256 detects mutation. Mutable price-cache rows
+alone are never used as the reproducibility record.
 Retention: raw telemetry downsampled to 5-min after 90 days; everything else kept indefinitely
-(SQLite stays small). InfluxDB export is **not** an app concern — HA already ships entities there.
+(SQLite stays small). Continuous InfluxDB export is **not** an app concern — HA already ships
+entities there — but an optional read-only startup backfill is supported.
 
 ## Optimisation model
 
-Rolling horizon MILP, hourly steps for MVP (15-min later), re-run every 15 min.
+Rolling-horizon MILP using aligned 15-minute steps and re-running every 15 minutes. Hourly provider
+prices and initial forecasts are expanded to quarter-hours without inventing sub-hourly variation.
+Each interval has `dt_hours` (normally 0.25); equations operate on kWh, not mixed kW/kWh units.
 
-Decision variables per step `t`: `soc[t]`, `charge[t]`, `discharge[t]`, `grid_import[t]`,
-`grid_export[t]`, `curtail[t]`, binary `is_charging[t]`.
+Decision variables per interval: `soc`, explicit flows `pv_to_load`, `pv_to_battery`, `pv_to_grid`,
+`grid_to_load`, `grid_to_battery`, `battery_to_load`, `battery_to_grid`, `curtail`, and binaries
+`is_charging` and `is_importing`.
 
 Objective (minimise):
 
 ```
-Σ_t  grid_import[t] * (buy_price[t] + distribution_markup)
+Σ_t  grid_import[t] * (full_price[t] + import_price_adjustment[t])
    - grid_export[t] * sell_price[t]
-   + (charge[t] + discharge[t]) * degradation_cost_pln_kwh / 2
+   + (battery_charge_energy[t] + battery_discharge_energy[t])
+        * degradation_cost_pln_kwh_throughput
    + reserve_shortfall_penalty[t]
 ```
 
-Constraints:
+Core constraints (all flows are non-negative interval energies):
 
 ```
-energy balance:  pv[t] - curtail[t] + grid_import[t] + discharge[t]*η_d
-                 = load[t] + charge[t]/η_c + grid_export[t]
-soc dynamics:    soc[t+1] = soc[t] + charge[t] - discharge[t]
-bounds:          soc_min ≤ soc[t] ≤ soc_max        (20% / 98% of 18.08 kWh default)
-power limits:    charge[t] ≤ 8.8 * is_charging[t];  discharge[t] ≤ 9.6 * (1 - is_charging[t])
-options:         grid_export ≤ 0 if battery-export disabled; grid_import→charge ≤ 0 if
-                 grid-charging disabled; curtail ≤ pv[t]
-terminal value:  soc[T] valued at conservative future price (avoid end-of-horizon dumping)
+PV allocation:       pv_to_load + pv_to_battery/η_c + pv_to_grid + curtail = pv_energy
+load supply:         pv_to_load + grid_to_load + battery_to_load*η_d = load_energy
+battery dynamics:    soc[t+1] = soc[t] + pv_to_battery + grid_to_battery
+                                  - battery_to_load - battery_to_grid
+grid import:         grid_import = grid_to_load + grid_to_battery/η_c
+grid export:         grid_export = pv_to_grid + battery_to_grid*η_d
+bounds:              soc_min ≤ soc[t] ≤ soc_max       (20% / 98% default)
+charge limit:        pv_to_battery + grid_to_battery
+                       ≤ max_charge_kw * dt_hours * is_charging
+discharge limit:     battery_to_load + battery_to_grid
+                       ≤ max_discharge_kw * dt_hours * (1-is_charging)
+grid direction:      grid_import ≤ site_import_limit_kw * dt_hours * is_importing
+                     grid_export ≤ site_export_limit_kw * dt_hours * (1-is_importing)
+options:             battery_to_grid = 0 if battery export disabled
+                     grid_to_battery = 0 if grid charging disabled
 ```
 
-η_c = η_d = √0.90. Degradation start value 0.05 PLN/kWh throughput. The binary `is_charging`
-prevents simultaneous charge/discharge arbitrage under negative prices.
+Also constrain the combined inverter output where required by the Sigen/site hardware. Site import,
+export and inverter limits are required configuration; do not infer them from battery ratings.
 
-Explainability: after solving, `explain.py` derives the `reason` from the active constraints and
-price structure, e.g. *"Hold charge: export spread to the 19:00–21:00 window (1.42 PLN/kWh) exceeds
-current sell value plus losses"*. Duals/reduced costs from the LP relaxation feed
-`marginal_value` per step.
+η_c = η_d = √0.90. Degradation starts at 0.05 PLN per kWh of total battery-side throughput, with
+no implicit `/2`; any equivalent-cycle convention requires a separately named setting. The two
+binaries prevent simultaneous charge/discharge and import/export arbitrage under negative prices.
+
+Sigen sign normalisation is explicit and fixture-tested: live verification showed
+`sensor.sigen_plant_battery_power > 0` while charging and `< 0` while discharging. Internally,
+charge and discharge are separate non-negative values.
+
+Terminal policy: if the horizon is short or mostly padded, preserve at least the starting SoC.
+Otherwise value terminal SoC using a conservative configured salvage value. Keep emergency reserve,
+normal economic reserve and optional outage/weather reserve conceptually separate.
+
+Explainability is deterministic from selected flows, binding constraints and price structure, e.g.
+*"Hold charge: export spread to 19:00–21:00 exceeds current sell value plus losses"*. Optional LP
+relaxation duals may populate `marginal_value`, but are not the authoritative explanation for an
+integer solution.
 
 ## Forecasting (MVP)
 
-- **PV**: Forecast.Solar free tier (plane parameters in config) or an existing HA forecast entity
-  if present; corrected by the ratio of actual/forecast over the trailing 3 h.
+- **PV**: Forecast.Solar or Solcast with latitude/longitude and one or more configured planes
+  (`peak_kwp`, tilt/declination, azimuth, inverter limit); corrected by a capped actual/forecast
+  ratio over the trailing 3 h. `weather.forecast_dom` is not treated as a PV forecast.
 - **Load**: median by (hour-of-day, weekday/weekend) over trailing 28 days from `telemetry`;
-  fallback to HA recorder history on first runs (only 14 days available) and, for deeper history,
-  a one-off InfluxDB backfill once Sigen entities are added to the include list.
-- **Price padding**: beyond the Pstryk-known horizon, median by hour of trailing 7 days,
-  `confidence = low`.
+  fallback to HA recorder history on first runs (only 14 days available). An optional read-only
+  InfluxDB bootstrap client can backfill deeper history after Phase 0; otherwise insufficient
+  history is explicitly low-confidence.
+- **Price padding**: startup backfills 14–30 days of Pstryk prices. Beyond the known horizon,
+  median by local hour requires a minimum sample count; otherwise use a conservative fallback.
+  Padded buy/sell prices are separate and low-confidence. Grid charging and battery export are
+  disabled by default when expected profit depends on padded prices.
 - Every forecast is stored per run, so forecast error is measurable per day (feeds
   `daily_reports`).
 
@@ -207,7 +258,8 @@ current sell value plus losses"*. Duals/reduced costs from the LP relaxation fee
 - Battery export only if spread > losses + degradation + `minimum_export_spread` (0.30 PLN/kWh).
 - Grid charging only if future value > true buy cost + losses + degradation + margin (0.30 PLN/kWh).
 - No cycling for gains below degradation cost.
-- Stale HA telemetry (> 5 min) → run status `blocked`, no recommendation published.
+- Fast power telemetry stale (> 5 min) → `blocked`; SoC uses a 10-minute threshold. Static rated
+  values and EMS mode must be readable but are not stale merely because their state did not change.
 - Missing Pstryk prices for current hour → `blocked`.
 - Missing PV/load forecast → `low_confidence`, recommendation published with warning.
 - `control_enabled` is hardcoded false in MVP; the flag and rate-limit scaffolding exist so
@@ -229,6 +281,10 @@ sensor.energy_optimizer_decision_reason
 sensor.energy_optimizer_confidence               (ok|low_confidence|blocked)
 binary_sensor.energy_optimizer_control_enabled   (always off in MVP)
 ```
+
+Retain discovery and current state where appropriate and republish after reconnect. Configure MQTT
+username/password, TLS toggle, discovery prefix and unique client ID; never assume anonymous access.
+Use HpeNas IP:1883 initially unless the role deliberately joins the `homeassistant` Docker network.
 
 ## REST API (consumed by the SPA; also usable from HA REST sensors as fallback)
 
@@ -266,8 +322,8 @@ energy-optimizer/
   DESIGN.md                 # this document
 ```
 
-CI (GitHub Actions): lint (ruff), type-check (mypy), pytest, build and push multi-arch image to
-GHCR on tag. The existing `/home/terion/solar_backtest/*.csv` files become regression fixtures:
+CI (GitHub Actions): lint (ruff), type-check (mypy), pytest, then build amd64. Add other
+architectures only after CI proves compatible HiGHS wheels; push to GHCR on tag. The existing `/home/terion/solar_backtest/*.csv` files become regression fixtures:
 the new `simulator.py` must reproduce the oracle backtest numbers within tolerance.
 
 ## Ansible-nas integration (after the image exists)
@@ -284,13 +340,17 @@ energy_optimizer_image_name: ghcr.io/<owner>/energy-optimizer
 energy_optimizer_image_version: latest
 energy_optimizer_port: "8320"
 energy_optimizer_directory: "{{ docker_home }}/energy-optimizer"   # mounted at /data
-energy_optimizer_memory: 512m
+energy_optimizer_memory: 768m       # profile first; reduce to 512m if safe
 energy_optimizer_mode: dry_run
 energy_optimizer_ha_url: "http://{{ ansible_nas_ip }}:{{ homeassistant_port }}"
 energy_optimizer_ha_token: ""          # wire to homeassistant_access_token in host config
 energy_optimizer_pstryk_api_key: ""    # wire to pstryk_api_key in host config
 energy_optimizer_mqtt_host: "{{ ansible_nas_ip }}"
 energy_optimizer_mqtt_port: "{{ mosquitto_port_a }}"
+energy_optimizer_mqtt_username: ""
+energy_optimizer_mqtt_password: ""
+energy_optimizer_mqtt_tls: false
+energy_optimizer_influxdb_bootstrap_enabled: false
 ```
 
 HpeNas config (`AnsibleNasConfigs/HpeNas/group_vars/nas/main.yml`) reuses existing secrets —
@@ -303,22 +363,25 @@ energy_optimizer_pstryk_api_key: "{{ pstryk_api_key }}"
 ```
 
 Container env: `EO_MODE=dry_run`, `EO_HA_URL`, `EO_HA_TOKEN`, `EO_PSTRYK_API_KEY`, `EO_MQTT_*`,
-`EO_DB=/data/energy_optimizer.sqlite`, `TZ=Europe/Warsaw`. Traefik labels only if
-`available_externally` (keep internal initially).
+PV-plane/site-grid settings, optional read-only InfluxDB bootstrap settings,
+`EO_DB=/data/energy_optimizer.sqlite`, `TZ=Europe/Warsaw`. Run non-root with one Uvicorn process
+(to avoid duplicate APScheduler jobs), SQLite WAL/busy timeout, graceful shutdown and a documented
+`/data` backup policy. Traefik labels only if `available_externally` (keep internal initially).
 
 ## Implementation phases
 
 **Phase 0 — prep (in AnsibleNasConfigs, do now, no app code)**
-Add Sigen entities to `homeassistant_influxdb_include_entities` and redeploy the homeassistant
-role, so history accumulates while the app is being built.
+Add all power/SoC/EMS/rating Sigen entities listed above to
+`homeassistant_influxdb_include_entities` and redeploy the homeassistant role. Capture PV plane
+geometry plus site import/export and combined inverter limits as configuration prerequisites.
 
 **Phase 1 — data spine (app repo)**
-Repo scaffold, config, SQLite store, `pstryk_client` (unified-metrics), `ha_client`, collector
-scheduler job. Exit: container runs on a laptop against live HA/Pstryk, telemetry and prices land
+Repo scaffold, config, SQLite store, `pstryk_client` (unified-metrics plus historical price
+bootstrap), `ha_client`, optional InfluxDB history bootstrap, collector scheduler job. Exit: container runs on a laptop against live HA/Pstryk, telemetry and prices land
 in SQLite, `/api/status` works.
 
 **Phase 2 — optimiser + simulator**
-MILP optimiser, policies, simulator, accounting. Exit: `POST /api/backtest` reproduces the
+Explicit-flow, duration-aware MILP optimiser, policies, simulator, accounting. Exit: `POST /api/backtest` reproduces the
 2026-06-25→07-09 oracle backtest numbers within tolerance; golden tests in CI.
 
 **Phase 3 — forecasts + live dry-run loop**
@@ -355,3 +418,6 @@ battery-to-grid export control. Out of scope here.
    deposit mechanics are known?
 4. Forecast.Solar free tier adequacy vs Solcast for a ~7 kWp single-plane array.
 5. Sigen control surface (Phase 7 gate — listed above).
+6. Exact site grid import/export and combined inverter limits.
+7. PV array planes: per-plane peak power, tilt and azimuth; Forecast.Solar vs Solcast.
+8. MQTT authentication policy (dedicated credentials preferred over anonymous).
