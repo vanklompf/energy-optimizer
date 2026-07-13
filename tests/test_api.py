@@ -96,6 +96,63 @@ def test_backtest_no_data_404(client: TestClient) -> None:
     assert resp.status_code == 404
 
 
+def _seed_hours(app_store, end: dt.datetime, hours: int) -> None:
+    with app_store.session() as session:
+        for h in range(hours):
+            ts = end - dt.timedelta(hours=h)
+            buy = 0.2 if ts.hour < 6 else 2.0
+            session.add(
+                Price(
+                    interval_start=ts,
+                    buy_gross=buy,
+                    full_price=buy,
+                    sell_gross=buy * 0.5,
+                    source="api",
+                )
+            )
+            session.add(
+                Telemetry(
+                    ts=ts,
+                    soc_pct=50.0,
+                    pv_kw=0.0,
+                    load_kw=1.0,
+                    grid_import_kw=1.0,
+                    grid_export_kw=0.0,
+                    batt_charge_kw=0.0,
+                    batt_discharge_kw=0.0,
+                    stale=False,
+                )
+            )
+
+
+def test_savings_windows(client: TestClient) -> None:
+    store = client.app.state.store
+    end = dt.datetime.now(tz=dt.UTC).replace(minute=0, second=0, microsecond=0)
+    # Cover the full trailing week plus today so both windows have data regardless
+    # of what local time the test runs at.
+    _seed_hours(store, end, 8 * 24)
+    resp = client.get("/api/savings")
+    assert resp.status_code == 200
+    body = resp.json()
+    for window in ("day", "week"):
+        assert window in body
+        w = body[window]
+        assert w["intervals"] > 0
+        assert w["actual_cost_pln"] is not None
+        assert w["optimiser_cost_pln"] is not None
+        assert w["savings_pln"] is not None
+        # Optimiser is never worse than the measured actual, so savings >= 0.
+        assert w["savings_pln"] >= -1e-6
+
+
+def test_savings_empty(client: TestClient) -> None:
+    resp = client.get("/api/savings")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["day"]["intervals"] == 0
+    assert body["day"]["savings_pln"] is None
+
+
 def test_prices_window(client: TestClient) -> None:
     store = client.app.state.store
     now = dt.datetime.now(tz=dt.UTC)

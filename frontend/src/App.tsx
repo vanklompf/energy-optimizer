@@ -1,13 +1,11 @@
 import { useState } from "react";
 import NowView from "./views/NowView";
-import PlanView from "./views/PlanView";
 import SavingsView from "./views/SavingsView";
 
-type Tab = "now" | "plan" | "savings";
+type Tab = "now" | "savings";
 
 const TABS: { id: Tab; label: string }[] = [
-  { id: "now", label: "Now" },
-  { id: "plan", label: "Plan" },
+  { id: "now", label: "Dashboard" },
   { id: "savings", label: "Savings" },
 ];
 
@@ -35,7 +33,6 @@ export default function App() {
       </header>
       <main className="content">
         {tab === "now" && <NowView />}
-        {tab === "plan" && <PlanView />}
         {tab === "savings" && <SavingsView />}
       </main>
     </div>

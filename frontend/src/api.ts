@@ -94,6 +94,19 @@ export interface BacktestResponse {
   results: PolicyResult[];
 }
 
+export interface SavingsWindow {
+  actual_cost_pln: number | null;
+  optimiser_cost_pln: number | null;
+  savings_pln: number | null;
+  intervals: number;
+}
+
+export interface SavingsResponse {
+  now: string;
+  day: SavingsWindow;
+  week: SavingsWindow;
+}
+
 async function getJSON<T>(url: string): Promise<T> {
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`${url} -> ${resp.status}`);
@@ -105,6 +118,7 @@ export const api = {
   plan: () => getJSON<PlanResponse>("/api/plan"),
   prices: (pastHours = 12, futureHours = 24) =>
     getJSON<PricesResponse>(`/api/prices?past_hours=${pastHours}&future_hours=${futureHours}`),
+  savings: () => getJSON<SavingsResponse>("/api/savings"),
   dailyReports: () => getJSON<{ reports: Record<string, unknown>[] }>("/api/reports/daily"),
   backtest: async (body: {
     start: string;

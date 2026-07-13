@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import select
@@ -174,7 +175,19 @@ def post_backtest(request: Request, body: BacktestRequest) -> BacktestResponse:
             results.append(_policy_result(name, sim.cost))
 
     # Optimiser plan valuation over the same series.
-    intervals = [
+    intervals = _series_to_intervals(series)
+    opt = optimise(intervals, soc_start, _optimiser_params(settings, body.battery_overrides))
+    if opt.status == "optimal":
+        cost = value_optimiser_plan(opt, series, battery)
+        results.append(_policy_result("optimiser", cost))
+
+    return BacktestResponse(
+        start=body.start, end=body.end, intervals=len(series), results=results
+    )
+
+
+def _series_to_intervals(series: list[SeriesInterval]) -> list[IntervalInput]:
+    return [
         IntervalInput(
             interval_start=s.interval_start,
             dt_hours=s.dt_hours,
@@ -185,14 +198,65 @@ def post_backtest(request: Request, body: BacktestRequest) -> BacktestResponse:
         )
         for s in series
     ]
-    opt = optimise(intervals, soc_start, _optimiser_params(settings, body.battery_overrides))
-    if opt.status == "optimal":
-        cost = value_optimiser_plan(opt, series, battery)
-        results.append(_policy_result("optimiser", cost))
 
-    return BacktestResponse(
-        start=body.start, end=body.end, intervals=len(series), results=results
+
+def _window_savings(
+    store: Store, settings: Settings, start: dt.datetime, end: dt.datetime
+) -> dict:
+    """Realised savings over a *past* window: measured actual cost minus the
+    perfect-foresight optimiser cost over the same recorded PV/load/prices."""
+    empty = {
+        "actual_cost_pln": None,
+        "optimiser_cost_pln": None,
+        "savings_pln": None,
+        "intervals": 0,
+    }
+    series = _load_series(store, start, end)
+    if not series:
+        return empty
+
+    battery = _battery_params(settings, {})
+    soc_start = _soc_start_kwh(store, start, settings)
+
+    actual = value_actual(series, battery)
+    actual_cost = actual.cost.net_cost_pln if actual.cost is not None else None
+
+    opt = optimise(_series_to_intervals(series), soc_start, _optimiser_params(settings, {}))
+    opt_cost = (
+        value_optimiser_plan(opt, series, battery).net_cost_pln
+        if opt.status == "optimal"
+        else None
     )
+
+    savings = (
+        actual_cost - opt_cost
+        if actual_cost is not None and opt_cost is not None
+        else None
+    )
+    return {
+        "actual_cost_pln": round(actual_cost, 4) if actual_cost is not None else None,
+        "optimiser_cost_pln": round(opt_cost, 4) if opt_cost is not None else None,
+        "savings_pln": round(savings, 4) if savings is not None else None,
+        "intervals": len(series),
+    }
+
+
+@router.get("/savings")
+def get_savings(request: Request) -> dict:
+    """Past (realised) savings for today and the trailing 7 days."""
+    store = _store(request)
+    settings = _settings(request)
+    now = dt.datetime.now(tz=dt.UTC)
+    local_now = now.astimezone(ZoneInfo(settings.tz))
+    day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(
+        dt.UTC
+    )
+    week_start = day_start - dt.timedelta(days=6)
+    return {
+        "now": _iso(now),
+        "day": _window_savings(store, settings, day_start, now),
+        "week": _window_savings(store, settings, week_start, now),
+    }
 
 
 # --- serialisation helpers -------------------------------------------------
