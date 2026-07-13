@@ -1,0 +1,49 @@
+# Development against real HA/Pstryk (read-only, safe: dry_run only).
+# Source is bind-mounted for hot reload; the `dev` image target carries dev deps + tests.
+#
+#   cp .env.example .env
+#   docker compose -f compose.dev.yml up --build          # hot-reloading dev server
+#   docker compose -f compose.dev.yml run --rm app pytest # run the test suite
+#   docker compose -f compose.dev.yml run --rm app ruff check src tests
+#
+# The frontend dev server (optional) runs separately with live proxy to this backend:
+#   docker compose -f compose.dev.yml --profile frontend up frontend
+
+services:
+  app:
+    build:
+      context: .
+      target: dev
+    image: energy-optimizer:dev
+    container_name: energy-optimizer-dev
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      EO_MODE: dry_run
+      EO_DB: /data/energy_optimizer.sqlite
+      EO_HTTP_HOST: 0.0.0.0
+      EO_HTTP_PORT: "8320"
+      TZ: Europe/Warsaw
+    ports:
+      - "8320:8320"
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+      - ./pyproject.toml:/app/pyproject.toml:ro
+      - ./data:/data
+
+  # Optional Vite dev server for the SPA (proxies /api to the app service).
+  frontend:
+    profiles: ["frontend"]
+    image: node:20-slim
+    working_dir: /app/frontend
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    environment:
+      VITE_API_PROXY: http://app:8320
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app/frontend
+    depends_on:
+      - app
