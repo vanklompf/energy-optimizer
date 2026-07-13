@@ -47,7 +47,9 @@ body {
 }
 
 .logo {
-  font-size: 22px;
+  display: block;
+  width: 24px;
+  height: 24px;
 }
 
 .tabs {

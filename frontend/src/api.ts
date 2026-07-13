@@ -43,6 +43,22 @@ export interface StatusResponse {
   last_run: RunSummary | null;
 }
 
+export interface PricePoint {
+  interval_start: string;
+  buy_gross: number | null;
+  sell_gross: number | null;
+  full_price: number | null;
+  is_cheap: boolean | null;
+  is_expensive: boolean | null;
+  source: string;
+}
+
+export interface PricesResponse {
+  now: string;
+  current_hour: string | null;
+  prices: PricePoint[];
+}
+
 export interface PlanStep {
   interval_start: string;
   dt_hours: number;
@@ -87,6 +103,8 @@ async function getJSON<T>(url: string): Promise<T> {
 export const api = {
   status: () => getJSON<StatusResponse>("/api/status"),
   plan: () => getJSON<PlanResponse>("/api/plan"),
+  prices: (pastHours = 12, futureHours = 24) =>
+    getJSON<PricesResponse>(`/api/prices?past_hours=${pastHours}&future_hours=${futureHours}`),
   dailyReports: () => getJSON<{ reports: Record<string, unknown>[] }>("/api/reports/daily"),
   backtest: async (body: {
     start: string;

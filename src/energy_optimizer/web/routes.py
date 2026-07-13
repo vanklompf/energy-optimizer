@@ -58,6 +58,32 @@ def get_status(request: Request) -> dict:
     }
 
 
+@router.get("/prices")
+def get_prices(request: Request, past_hours: int = 12, future_hours: int = 24) -> dict:
+    """Hourly prices in a window around now for the dashboard chart. Past hours are actual;
+    future hours are day-ahead where published (source ``api``) or padded (``forecast``)."""
+    store = _store(request)
+    now = dt.datetime.now(tz=dt.UTC)
+    floor = now.replace(minute=0, second=0, microsecond=0)
+    past_hours = max(0, min(past_hours, 168))
+    future_hours = max(0, min(future_hours, 168))
+    start = floor - dt.timedelta(hours=past_hours)
+    end = floor + dt.timedelta(hours=future_hours + 1)
+    with store.session() as session:
+        rows = (
+            session.execute(
+                select(Price)
+                .where(Price.interval_start >= start)
+                .where(Price.interval_start < end)
+                .order_by(Price.interval_start)
+            )
+            .scalars()
+            .all()
+        )
+    prices = [_price_dict(p) for p in rows if p.buy_gross is not None]
+    return {"now": now.isoformat(), "current_hour": _iso(floor), "prices": prices}
+
+
 @router.get("/plan")
 def get_plan(request: Request) -> dict:
     store = _store(request)

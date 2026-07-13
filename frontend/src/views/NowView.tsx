@@ -2,6 +2,71 @@ import ReactECharts from "echarts-for-react";
 import { api } from "../api";
 import { usePolling } from "../hooks";
 
+const AXIS_COLOR = "#8a909c";
+
+function priceChartOption(prices: { interval_start: string; buy_gross: number | null; sell_gross: number | null }[], nowIso: string) {
+  const buy = prices.map((p) => [p.interval_start, p.buy_gross] as [string, number | null]);
+  const sell = prices.map((p) => [p.interval_start, p.sell_gross] as [string, number | null]);
+  return {
+    tooltip: { trigger: "axis" },
+    legend: { data: ["Buy", "Sell"], textStyle: { color: AXIS_COLOR }, top: 0 },
+    grid: { left: 52, right: 16, top: 34, bottom: 28 },
+    xAxis: {
+      type: "time",
+      axisLabel: { color: AXIS_COLOR },
+      axisLine: { lineStyle: { color: "#ffffff22" } },
+    },
+    yAxis: {
+      type: "value",
+      name: "PLN/kWh",
+      nameTextStyle: { color: AXIS_COLOR },
+      axisLabel: { color: AXIS_COLOR },
+      splitLine: { lineStyle: { color: "#ffffff10" } },
+    },
+    series: [
+      {
+        name: "Buy",
+        type: "line",
+        step: "end",
+        showSymbol: false,
+        data: buy,
+        itemStyle: { color: "#61afef" },
+        markLine: {
+          symbol: "none",
+          data: [{ xAxis: nowIso }],
+          lineStyle: { color: "#e5c07b", type: "dashed" },
+          label: { formatter: "now", color: "#e5c07b" },
+        },
+      },
+      {
+        name: "Sell",
+        type: "line",
+        step: "end",
+        showSymbol: false,
+        data: sell,
+        itemStyle: { color: "#98c379" },
+      },
+    ],
+  };
+}
+
+function PriceChart() {
+  const { data, error } = usePolling(() => api.prices(12, 24), 60000);
+  return (
+    <div className="grid-single" style={{ marginBottom: 16 }}>
+      <section className="panel">
+        <h2>Prices — past &amp; forecast</h2>
+        {error && <div className="badge badge-block">{error}</div>}
+        {data && data.prices.length > 0 ? (
+          <ReactECharts option={priceChartOption(data.prices, data.now)} style={{ height: 260 }} notMerge />
+        ) : (
+          <p className="muted">No price history yet.</p>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function fmt(v: number | null | undefined, unit = "", digits = 2): string {
   if (v === null || v === undefined) return "—";
   return `${v.toFixed(digits)}${unit}`;
@@ -50,6 +115,8 @@ export default function NowView() {
   const run = data.last_run;
 
   return (
+    <>
+    <PriceChart />
     <div className="grid">
       <section className="panel">
         <h2>Battery</h2>
@@ -102,5 +169,6 @@ export default function NowView() {
         )}
       </section>
     </div>
+    </>
   );
 }

@@ -192,7 +192,7 @@ def build_snapshot(states: dict[str, HaState | None], now: dt.datetime) -> Telem
         ("grid import", grid_in),
         ("grid export", grid_out),
     ):
-        if _is_stale(st, now, POWER_STALE_SECONDS):
+        if _is_stale(st, now, POWER_STALE_SECONDS, zero_is_fresh=True):
             stale_reasons.append(f"{name} telemetry stale (>5min) or missing")
 
     return TelemetrySnapshot(
@@ -219,9 +219,22 @@ def _split_battery_power(batt_kw: float | None) -> tuple[float | None, float | N
     return 0.0, -batt_kw
 
 
-def _is_stale(state: HaState | None, now: dt.datetime, threshold_s: int) -> bool:
+def _is_stale(
+    state: HaState | None,
+    now: dt.datetime,
+    threshold_s: int,
+    *,
+    zero_is_fresh: bool = False,
+) -> bool:
     if state is None or state.state in _UNAVAILABLE:
         return True
+    # HA power sensors commonly stop emitting updates when their value is pinned at zero
+    # (PV overnight, an idle battery, no grid export). A valid numeric zero is a legitimate
+    # steady state, so its age must not mark the whole snapshot stale and block a run.
+    if zero_is_fresh:
+        value = state.as_float()
+        if value is not None and abs(value) < 1e-9:
+            return False
     if state.last_updated is None:
         return True
     age = (now - state.last_updated).total_seconds()

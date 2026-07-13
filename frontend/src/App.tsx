@@ -17,7 +17,7 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <div className="brand">
-          <span className="logo">⚡</span>
+          <img src="/favicon.svg" alt="" className="logo" width={24} height={24} />
           <span>Energy Optimizer</span>
           <span className="badge badge-dryrun">dry_run</span>
         </div>

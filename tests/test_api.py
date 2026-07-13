@@ -94,3 +94,27 @@ def test_backtest_no_data_404(client: TestClient) -> None:
         json={"start": "2020-01-01T00:00:00Z", "end": "2020-01-02T00:00:00Z"},
     )
     assert resp.status_code == 404
+
+
+def test_prices_window(client: TestClient) -> None:
+    store = client.app.state.store
+    now = dt.datetime.now(tz=dt.UTC)
+    floor = now.replace(minute=0, second=0, microsecond=0)
+    with store.session() as session:
+        for h in range(-4, 5):
+            session.add(
+                Price(
+                    interval_start=floor + dt.timedelta(hours=h),
+                    buy_gross=1.0 + h * 0.1,
+                    full_price=1.0 + h * 0.1,
+                    sell_gross=0.5,
+                    source="api",
+                )
+            )
+    resp = client.get("/api/prices?past_hours=3&future_hours=3")
+    assert resp.status_code == 200
+    body = resp.json()
+    # 3h past + current + 3h future = 7 hourly points within the requested window.
+    assert len(body["prices"]) == 7
+    assert body["current_hour"] is not None
+    assert all("buy_gross" in p for p in body["prices"])

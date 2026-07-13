@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Energy Optimizer">
+  <rect width="32" height="32" rx="7" fill="#282c34"/>
+  <rect x="4" y="6" width="13" height="9" rx="1.5" fill="#61afef" fill-opacity="0.22" stroke="#61afef" stroke-width="1.2"/>
+  <path d="M10.5 6v9M4 10.5h13" stroke="#61afef" stroke-width="0.9" stroke-linecap="round"/>
+  <rect x="19" y="8" width="9" height="13" rx="2" fill="none" stroke="#98c379" stroke-width="1.4"/>
+  <rect x="21.5" y="5" width="4" height="3" rx="1" fill="#98c379"/>
+  <rect x="20.5" y="11" width="6" height="7" rx="1.2" fill="#98c379"/>
+  <path d="M13.5 18.5 11 24h3l-1.5 4.5L17.5 20h-2.5l-1.5-1.5Z" fill="#e5c07b"/>
+</svg>

@@ -66,6 +66,24 @@ def test_snapshot_stale_power_flags() -> None:
     assert any("battery power" in r for r in snap.stale_reasons)
 
 
+def test_snapshot_zero_power_sensor_is_not_stale() -> None:
+    # PV pinned at 0 overnight (and an idle battery) stop emitting HA updates; a valid
+    # numeric zero must not mark the snapshot stale and block the optimiser.
+    now = dt.datetime(2026, 7, 12, 23, 0, tzinfo=dt.UTC)
+    states = {
+        ENTITY_SOC: _state(ENTITY_SOC, "44", 60, now),
+        ENTITY_BATTERY_POWER: _state(ENTITY_BATTERY_POWER, "0.0", 3600, now),
+        ENTITY_PV_POWER: _state(ENTITY_PV_POWER, "0.0", 14400, now),
+        ENTITY_CONSUMED_POWER: _state(ENTITY_CONSUMED_POWER, "0.2", 30, now),
+        ENTITY_GRID_IMPORT_POWER: _state(ENTITY_GRID_IMPORT_POWER, "0.0", 3600, now),
+        ENTITY_GRID_EXPORT_POWER: _state(ENTITY_GRID_EXPORT_POWER, "0.0", 3600, now),
+        ENTITY_EMS_MODE: _state(ENTITY_EMS_MODE, "Custom", 3600, now),
+    }
+    snap = build_snapshot(states, now)
+    assert snap.stale is False
+    assert snap.pv_kw == 0.0
+
+
 def test_snapshot_missing_soc_is_stale() -> None:
     now = dt.datetime(2026, 7, 12, 12, 0, tzinfo=dt.UTC)
     states = {

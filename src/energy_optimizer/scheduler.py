@@ -44,6 +44,15 @@ def build_scheduler(service: Service) -> AsyncIOScheduler:
         except Exception:  # pragma: no cover - defensive
             logger.exception("run_optimise job failed")
 
+    async def _bootstrap() -> None:
+        try:
+            await service.bootstrap()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("bootstrap job failed")
+
+    # One-shot backfill at startup (no trigger => runs once, immediately) so backtests and
+    # the price chart have history right away rather than only after live collection.
+    scheduler.add_job(_bootstrap, id="bootstrap", max_instances=1)
     scheduler.add_job(_collect, IntervalTrigger(minutes=1), id="collect", max_instances=1)
     scheduler.add_job(_prices, IntervalTrigger(minutes=15), id="prices", max_instances=1)
     scheduler.add_job(

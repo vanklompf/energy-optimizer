@@ -14,16 +14,30 @@ import logging
 import uuid
 from dataclasses import asdict
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from .config import Settings
 from .explain import classify_next_action
-from .ha_client import HaClient
+from .forecast.load import LoadForecaster, LoadSample
+from .forecast.pv import PvForecaster
+from .ha_client import (
+    ENTITY_BATTERY_POWER,
+    ENTITY_CONSUMED_POWER,
+    ENTITY_GRID_EXPORT_POWER,
+    ENTITY_GRID_IMPORT_POWER,
+    ENTITY_PV_POWER,
+    ENTITY_SOC,
+    HaClient,
+    HaState,
+    _split_battery_power,
+)
 from .mqtt_publish import MqttConfig, MqttPublisher, RecommendationState
 from .optimiser import IntervalInput, OptimiserParams, optimise
 from .pstryk_client import PstrykClient
 from .safety import CONTROL_ENABLED, SafetyInputs, Status, evaluate
 from .store import Forecast, PlanStep, Price, Run, Store, Telemetry, utcnow
+
+LOAD_LOOKBACK_DAYS = 28
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +144,74 @@ class Service:
         logger.info("Refreshed %d price frames", count)
         return count
 
+    async def bootstrap(self) -> None:
+        """One-shot startup backfill so backtests and the price chart have history
+        immediately instead of only after hours/days of live collection."""
+        days = self.settings.pstryk_history_bootstrap_days
+        if days > 0:
+            try:
+                await self.refresh_prices(history_days=days)
+            except Exception:  # pragma: no cover - network dependent
+                logger.exception("price history bootstrap failed")
+        try:
+            await self.bootstrap_telemetry_history(days)
+        except Exception:  # pragma: no cover - network dependent
+            logger.exception("telemetry history bootstrap failed")
+
+    async def bootstrap_telemetry_history(self, days: int) -> int:
+        """Backfill hourly telemetry from the Home Assistant recorder so backtests have real
+        PV/load history. Idempotent: skipped when telemetry already reaches back far enough."""
+        s = self.settings
+        if not s.ha_token or days <= 0:
+            return 0
+        now = utcnow()
+        start = now - dt.timedelta(days=days)
+        with self.store.session() as session:
+            earliest = session.execute(
+                select(Telemetry.ts).order_by(Telemetry.ts).limit(1)
+            ).scalar_one_or_none()
+        if earliest is not None and _aware(earliest) <= start + dt.timedelta(hours=1):
+            logger.info("Telemetry history already present; skipping bootstrap")
+            return 0
+        entities = {
+            "soc_pct": ENTITY_SOC,
+            "pv_kw": ENTITY_PV_POWER,
+            "load_kw": ENTITY_CONSUMED_POWER,
+            "grid_import_kw": ENTITY_GRID_IMPORT_POWER,
+            "grid_export_kw": ENTITY_GRID_EXPORT_POWER,
+            "batt_power_kw": ENTITY_BATTERY_POWER,
+        }
+        histories: dict[str, dict[dt.datetime, float]] = {}
+        async with HaClient(s.ha_url, s.ha_token, verify_ssl=s.ha_verify_ssl) as ha:
+            for field, eid in entities.items():
+                try:
+                    states = await ha.get_history(eid, start, now)
+                except Exception:  # pragma: no cover - network dependent
+                    logger.warning("history fetch failed for %s", eid, exc_info=True)
+                    states = []
+                histories[field] = _hourly_mean_states(states)
+        hours = sorted({h for m in histories.values() for h in m})
+        count = 0
+        with self.store.session() as session:
+            for hour in hours:
+                charge_kw, discharge_kw = _split_battery_power(histories["batt_power_kw"].get(hour))
+                session.merge(
+                    Telemetry(
+                        ts=hour,
+                        soc_pct=histories["soc_pct"].get(hour),
+                        pv_kw=histories["pv_kw"].get(hour),
+                        load_kw=histories["load_kw"].get(hour),
+                        grid_import_kw=histories["grid_import_kw"].get(hour),
+                        grid_export_kw=histories["grid_export_kw"].get(hour),
+                        batt_charge_kw=charge_kw,
+                        batt_discharge_kw=discharge_kw,
+                        stale=False,
+                    )
+                )
+                count += 1
+        logger.info("Bootstrapped %d hours of telemetry history", count)
+        return count
+
     async def run_optimise(self) -> str:
         """Build inputs, solve, evaluate safety, persist an audit record, publish MQTT."""
         s = self.settings
@@ -142,9 +224,10 @@ class Service:
         have_current_price = self._have_current_price(prices, now)
         known_hours = self._known_price_hours(prices, now)
 
-        intervals = self._build_intervals(prices, now, run_id)
-        have_pv = any(f.kind == "pv" for f in self._forecasts_for(run_id))
-        have_load = any(f.kind == "load" for f in self._forecasts_for(run_id))
+        pv_map, load_map, pv_conf, load_conf = await self._forecast_maps_live(now, prices)
+        intervals = self._build_intervals(prices, pv_map, load_map)
+        have_pv = bool(pv_map)
+        have_load = bool(load_map)
 
         safety = evaluate(
             SafetyInputs(
@@ -187,6 +270,29 @@ class Service:
         )
 
         with self.store.session() as session:
+            # Only the latest run's forecasts are ever read back; replace them each run so
+            # the audit table stays bounded instead of growing every 15 minutes.
+            session.execute(delete(Forecast))
+            for hour, energy in _hourly_from_map(pv_map).items():
+                session.add(
+                    Forecast(
+                        run_id=run_id,
+                        interval_start=hour,
+                        kind="pv",
+                        value=energy,
+                        confidence=pv_conf or "low_confidence",
+                    )
+                )
+            for hour, energy in _hourly_from_map(load_map).items():
+                session.add(
+                    Forecast(
+                        run_id=run_id,
+                        interval_start=hour,
+                        kind="load",
+                        value=energy,
+                        confidence=load_conf or "low_confidence",
+                    )
+                )
             session.add(
                 Run(
                     run_id=run_id,
@@ -300,18 +406,34 @@ class Service:
                 expected = expected + dt.timedelta(hours=1)
         return hours
 
+    def _interval_grid(self, prices: list[Price]) -> list[tuple[dt.datetime, float]]:
+        """The (interval_start, dt_hours) grid the optimiser runs on: hourly prices expanded
+        into aligned sub-hour steps. Forecasts are computed on exactly this grid."""
+        step_h = self.settings.step_hours
+        substeps = max(1, int(round(1.0 / step_h)))
+        grid: list[tuple[dt.datetime, float]] = []
+        for p in sorted(prices, key=lambda x: x.interval_start):
+            if p.buy_gross is None:
+                continue
+            hour_start = _aware(p.interval_start)
+            for k in range(substeps):
+                grid.append((hour_start + dt.timedelta(hours=step_h * k), step_h))
+        return grid
+
     def _build_intervals(
-        self, prices: list[Price], now: dt.datetime, run_id: str
+        self,
+        prices: list[Price],
+        pv_map: dict[dt.datetime, float],
+        load_map: dict[dt.datetime, float],
     ) -> list[IntervalInput]:
         """Expand hourly prices to aligned sub-hour steps; attach PV/load forecasts if present."""
         step_h = self.settings.step_hours
-        pv_map, load_map = self._forecast_maps(run_id)
+        substeps = max(1, int(round(1.0 / step_h)))
         intervals: list[IntervalInput] = []
         for p in sorted(prices, key=lambda x: x.interval_start):
             if p.buy_gross is None:
                 continue
             hour_start = _aware(p.interval_start)
-            substeps = max(1, int(round(1.0 / step_h)))
             for k in range(substeps):
                 start = hour_start + dt.timedelta(hours=step_h * k)
                 intervals.append(
@@ -327,24 +449,73 @@ class Service:
                 )
         return intervals
 
-    def _forecasts_for(self, run_id: str) -> list[Forecast]:
-        with self.store.session() as session:
-            rows = (
-                session.execute(select(Forecast).where(Forecast.run_id == run_id)).scalars().all()
-            )
-        return list(rows)
+    async def _forecast_maps_live(
+        self, now: dt.datetime, prices: list[Price]
+    ) -> tuple[dict[dt.datetime, float], dict[dt.datetime, float], str | None, str | None]:
+        """Compute PV and load forecasts on the optimiser's interval grid (in-memory).
 
-    def _forecast_maps(
-        self, run_id: str
-    ) -> tuple[dict[dt.datetime, float], dict[dt.datetime, float]]:
-        pv: dict[dt.datetime, float] = {}
-        load: dict[dt.datetime, float] = {}
-        for f in self._forecasts_for(run_id):
-            if f.kind == "pv":
-                pv[_aware(f.interval_start)] = f.value
-            elif f.kind == "load":
-                load[_aware(f.interval_start)] = f.value
-        return pv, load
+        PV comes from the configured provider (Forecast.Solar); load from the rolling
+        hour-of-day/weekday median of stored telemetry. Both return empty when their
+        inputs are unavailable so safety can flag the run low-confidence.
+        """
+        grid = self._interval_grid(prices)
+        pv_map, pv_conf = await self._pv_forecast_map(grid)
+        load_map, load_conf = self._load_forecast_map(now, grid)
+        return pv_map, load_map, pv_conf, load_conf
+
+    async def _pv_forecast_map(
+        self, grid: list[tuple[dt.datetime, float]]
+    ) -> tuple[dict[dt.datetime, float], str | None]:
+        s = self.settings
+        if s.pv_forecast_provider == "none" or not s.pv_planes or not grid:
+            return {}, None
+        try:
+            async with PvForecaster(
+                s.pv_lat,
+                s.pv_lon,
+                s.pv_planes,
+                provider=s.pv_forecast_provider,
+                solcast_api_key=s.solcast_api_key,
+            ) as pvf:
+                points = await pvf.forecast()
+        except Exception:  # pragma: no cover - network dependent
+            logger.warning("PV forecast failed", exc_info=True)
+            return {}, None
+        if not points:
+            return {}, None
+        hourly = {_aware(p.interval_start): p.energy_kwh for p in points}
+        conf = "ok" if all(p.confidence == "ok" for p in points) else "low_confidence"
+        # Distribute each hour's energy across its sub-hour steps proportionally to dt.
+        out: dict[dt.datetime, float] = {}
+        for start, dt_hours in grid:
+            hour = start.replace(minute=0, second=0, microsecond=0)
+            energy = hourly.get(hour)
+            if energy is not None:
+                out[start] = energy * dt_hours
+        return out, conf
+
+    def _load_forecast_map(
+        self, now: dt.datetime, grid: list[tuple[dt.datetime, float]]
+    ) -> tuple[dict[dt.datetime, float], str | None]:
+        samples = self._load_samples(now)
+        if not samples or not grid:
+            return {}, None
+        points = LoadForecaster(tz=self.settings.tz, lookback_days=LOAD_LOOKBACK_DAYS).forecast(
+            samples, grid
+        )
+        out = {_aware(p.interval_start): p.load_kwh for p in points}
+        conf = "ok" if all(p.confidence == "ok" for p in points) else "low_confidence"
+        return out, conf
+
+    def _load_samples(self, now: dt.datetime) -> list[LoadSample]:
+        lookback = now - dt.timedelta(days=LOAD_LOOKBACK_DAYS)
+        with self.store.session() as session:
+            rows = session.execute(
+                select(Telemetry.ts, Telemetry.load_kw)
+                .where(Telemetry.ts >= lookback)
+                .where(Telemetry.load_kw.is_not(None))
+            ).all()
+        return [LoadSample(ts=_aware(ts), load_kw=load_kw) for ts, load_kw in rows]
 
     def _solver_input_snapshot(
         self, intervals: list[IntervalInput], soc_start_kwh: float, params: OptimiserParams
@@ -377,6 +548,29 @@ class Service:
             )
         except Exception as exc:  # pragma: no cover - network dependent
             logger.warning("MQTT publish failed: %s", exc)
+
+
+def _hourly_from_map(values: dict[dt.datetime, float]) -> dict[dt.datetime, float]:
+    """Aggregate a sub-hour-step map into hourly sums for compact forecast persistence."""
+    out: dict[dt.datetime, float] = {}
+    for ts, value in values.items():
+        hour = _aware(ts).replace(minute=0, second=0, microsecond=0)
+        out[hour] = out.get(hour, 0.0) + value
+    return out
+
+
+def _hourly_mean_states(states: list[HaState]) -> dict[dt.datetime, float]:
+    """Mean of numeric recorder states bucketed by UTC hour (mirrors routes aggregation)."""
+    buckets: dict[dt.datetime, list[float]] = {}
+    for st in states:
+        if st.last_updated is None:
+            continue
+        value = st.as_float()
+        if value is None:
+            continue
+        hour = _aware(st.last_updated).replace(minute=0, second=0, microsecond=0)
+        buckets.setdefault(hour, []).append(value)
+    return {hour: sum(vals) / len(vals) for hour, vals in buckets.items()}
 
 
 def _aware(value: dt.datetime) -> dt.datetime:
