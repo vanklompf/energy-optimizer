@@ -259,6 +259,88 @@ def get_savings(request: Request) -> dict:
     }
 
 
+@router.get("/comparison/hourly")
+def get_hourly_comparison(request: Request, hours: int = 48) -> dict:
+    """Hour-by-hour comparison of what actually happened vs what the perfect-foresight
+    optimiser would have done over the same recorded PV/load/prices. Focused on battery
+    charge/discharge timing rather than aggregate savings."""
+    store = _store(request)
+    settings = _settings(request)
+    hours = max(1, min(hours, 720))
+    now = dt.datetime.now(tz=dt.UTC)
+    floor = now.replace(minute=0, second=0, microsecond=0)
+    start = floor - dt.timedelta(hours=hours)
+
+    series = _load_series(store, start, now)
+    if not series:
+        return {"now": _iso(now), "tz": settings.tz, "points": []}
+
+    battery = _battery_params(settings, {})
+    soc_start = _soc_start_kwh(store, start, settings)
+    opt = optimise(_series_to_intervals(series), soc_start, _optimiser_params(settings, {}))
+    opt_by_start = {s.interval_start: s for s in opt.steps} if opt.status == "optimal" else {}
+
+    # Actual hourly SoC (mean of telemetry within the hour), keyed by hour ISO.
+    soc_by_hour = _actual_soc_by_hour(store, start, now)
+
+    points: list[dict] = []
+    for s in series:
+        step = opt_by_start.get(s.interval_start)
+        actual_charge = s.measured_charge_kwh or 0.0
+        actual_discharge = s.measured_discharge_kwh or 0.0
+        opt_charge = (
+            step.pv_to_battery_kwh + step.grid_to_battery_kwh if step else None
+        )
+        opt_discharge = (
+            step.battery_to_load_kwh + step.battery_to_grid_kwh if step else None
+        )
+        points.append(
+            {
+                "interval_start": s.interval_start,
+                "buy_price": round(s.buy_price, 4),
+                "sell_price": round(s.sell_price, 4),
+                "actual_charge_kwh": round(actual_charge, 3),
+                "actual_discharge_kwh": round(actual_discharge, 3),
+                "optimiser_charge_kwh": (
+                    round(opt_charge, 3) if opt_charge is not None else None
+                ),
+                "optimiser_discharge_kwh": (
+                    round(opt_discharge, 3) if opt_discharge is not None else None
+                ),
+                "actual_soc_pct": soc_by_hour.get(s.interval_start),
+                "optimiser_soc_pct": round(step.soc_pct_end, 1) if step else None,
+            }
+        )
+    return {
+        "now": _iso(now),
+        "tz": settings.tz,
+        "optimiser_status": opt.status,
+        "points": points,
+    }
+
+
+def _actual_soc_by_hour(
+    store: Store, start: dt.datetime, end: dt.datetime
+) -> dict[str, float]:
+    with store.session() as session:
+        telem = (
+            session.execute(
+                select(Telemetry)
+                .where(Telemetry.ts >= start)
+                .where(Telemetry.ts < end)
+                .order_by(Telemetry.ts)
+            )
+            .scalars()
+            .all()
+        )
+    buckets = _hourly_telemetry(telem)
+    return {
+        hour.isoformat(): round(vals["soc"], 1)
+        for hour, vals in buckets.items()
+        if "soc" in vals
+    }
+
+
 # --- serialisation helpers -------------------------------------------------
 def _telemetry_dict(t: Telemetry | None) -> dict | None:
     if t is None:
@@ -395,6 +477,7 @@ def _hourly_telemetry(telem: list[Telemetry]) -> dict[dt.datetime, dict[str, flo
             ("grid_export", t.grid_export_kw),
             ("charge", t.batt_charge_kw),
             ("discharge", t.batt_discharge_kw),
+            ("soc", t.soc_pct),
         ):
             if val is not None:
                 b.setdefault(key, []).append(val)

@@ -107,6 +107,25 @@ export interface SavingsResponse {
   week: SavingsWindow;
 }
 
+export interface HourlyComparisonPoint {
+  interval_start: string;
+  buy_price: number;
+  sell_price: number;
+  actual_charge_kwh: number;
+  actual_discharge_kwh: number;
+  optimiser_charge_kwh: number | null;
+  optimiser_discharge_kwh: number | null;
+  actual_soc_pct: number | null;
+  optimiser_soc_pct: number | null;
+}
+
+export interface HourlyComparisonResponse {
+  now: string;
+  tz: string;
+  optimiser_status?: string;
+  points: HourlyComparisonPoint[];
+}
+
 async function getJSON<T>(url: string): Promise<T> {
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`${url} -> ${resp.status}`);
@@ -119,6 +138,8 @@ export const api = {
   prices: (pastHours = 12, futureHours = 24) =>
     getJSON<PricesResponse>(`/api/prices?past_hours=${pastHours}&future_hours=${futureHours}`),
   savings: () => getJSON<SavingsResponse>("/api/savings"),
+  hourlyComparison: (hours = 48) =>
+    getJSON<HourlyComparisonResponse>(`/api/comparison/hourly?hours=${hours}`),
   dailyReports: () => getJSON<{ reports: Record<string, unknown>[] }>("/api/reports/daily"),
   backtest: async (body: {
     start: string;

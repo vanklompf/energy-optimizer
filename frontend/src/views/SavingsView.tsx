@@ -1,12 +1,127 @@
 import { useState } from "react";
 import ReactECharts from "echarts-for-react";
-import { api, BacktestResponse } from "../api";
+import { api, BacktestResponse, HourlyComparisonPoint } from "../api";
+import { usePolling } from "../hooks";
+
+const TEXT_COLOR = "#dcdfe4";
+const AXIS_COLOR = "#8a909c";
+const INACTIVE_COLOR = "#6b7280";
+const SPLIT_COLOR = "#ffffff10";
 
 function isoDaysAgo(days: number): string {
   const d = new Date();
   d.setUTCDate(d.getUTCDate() - days);
   d.setUTCHours(0, 0, 0, 0);
   return d.toISOString();
+}
+
+// Charge shown as positive bars, discharge as negative, so battery action reads at a glance.
+function comparisonChartOption(points: HourlyComparisonPoint[]) {
+  const x = points.map((p) => p.interval_start.slice(5, 16).replace("T", " "));
+  const actualCharge = points.map((p) => +p.actual_charge_kwh.toFixed(3));
+  const actualDischarge = points.map((p) => -+p.actual_discharge_kwh.toFixed(3));
+  const optCharge = points.map((p) =>
+    p.optimiser_charge_kwh === null ? null : +p.optimiser_charge_kwh.toFixed(3)
+  );
+  const optDischarge = points.map((p) =>
+    p.optimiser_discharge_kwh === null ? null : -+p.optimiser_discharge_kwh.toFixed(3)
+  );
+  const buy = points.map((p) => +p.buy_price.toFixed(3));
+  const actualSoc = points.map((p) => p.actual_soc_pct);
+  const optSoc = points.map((p) => p.optimiser_soc_pct);
+
+  return {
+    tooltip: { trigger: "axis" },
+    legend: {
+      data: [
+        "Actual charge",
+        "Actual discharge",
+        "Optimiser charge",
+        "Optimiser discharge",
+        "Buy price",
+        "Actual SoC",
+        "Optimiser SoC",
+      ],
+      selected: { "Actual SoC": false, "Optimiser SoC": false },
+      textStyle: { color: TEXT_COLOR },
+      inactiveColor: INACTIVE_COLOR,
+      top: 0,
+      type: "scroll",
+    },
+    grid: { left: 52, right: 56, top: 56, bottom: 60 },
+    xAxis: {
+      type: "category",
+      data: x,
+      axisLabel: { color: AXIS_COLOR, rotate: 45, fontSize: 9 },
+      axisLine: { lineStyle: { color: "#ffffff22" } },
+    },
+    yAxis: [
+      {
+        type: "value",
+        name: "kWh  (charge + / discharge −)",
+        nameTextStyle: { color: AXIS_COLOR },
+        axisLabel: { color: AXIS_COLOR },
+        splitLine: { lineStyle: { color: SPLIT_COLOR } },
+      },
+      {
+        type: "value",
+        name: "PLN/kWh · SoC %",
+        position: "right",
+        nameTextStyle: { color: AXIS_COLOR },
+        axisLabel: { color: AXIS_COLOR },
+        splitLine: { show: false },
+      },
+    ],
+    dataZoom: [{ type: "inside" }, { type: "slider", height: 16, bottom: 8 }],
+    series: [
+      { name: "Actual charge", type: "bar", stack: "actual", data: actualCharge, itemStyle: { color: "#61afef" } },
+      { name: "Actual discharge", type: "bar", stack: "actual", data: actualDischarge, itemStyle: { color: "#c678dd" } },
+      { name: "Optimiser charge", type: "bar", stack: "optimiser", data: optCharge, itemStyle: { color: "#98c379" } },
+      { name: "Optimiser discharge", type: "bar", stack: "optimiser", data: optDischarge, itemStyle: { color: "#e5c07b" } },
+      { name: "Buy price", type: "line", yAxisIndex: 1, data: buy, step: "middle", showSymbol: false, lineStyle: { width: 1.5, color: "#e06c75", type: "dashed" } },
+      { name: "Actual SoC", type: "line", yAxisIndex: 1, data: actualSoc, smooth: true, showSymbol: false, connectNulls: true, lineStyle: { width: 2, color: "#56b6c2" } },
+      { name: "Optimiser SoC", type: "line", yAxisIndex: 1, data: optSoc, smooth: true, showSymbol: false, connectNulls: true, lineStyle: { width: 2, color: "#d19a66", type: "dashed" } },
+    ],
+  };
+}
+
+function ComparisonChart() {
+  const [hours, setHours] = useState(48);
+  const { data, error, loading } = usePolling(() => api.hourlyComparison(hours), 300000);
+  const points = data?.points ?? [];
+  const infeasible = data?.optimiser_status && data.optimiser_status !== "optimal";
+
+  return (
+    <div className="grid-single" style={{ marginBottom: 16 }}>
+      <section className="panel">
+        <h2>
+          Charge / discharge — actual vs optimiser{" "}
+          <span className="muted">(hourly)</span>
+        </h2>
+        <div className="controls">
+          <label>
+            Range
+            <select value={hours} onChange={(e) => setHours(Number(e.target.value))}>
+              <option value={24}>24 h</option>
+              <option value={48}>48 h</option>
+              <option value={72}>72 h</option>
+              <option value={168}>7 days</option>
+              <option value={336}>14 days</option>
+            </select>
+          </label>
+        </div>
+        {error && <div className="badge badge-block">{error}</div>}
+        {infeasible && (
+          <div className="badge badge-warn">optimiser: {data?.optimiser_status}</div>
+        )}
+        {points.length > 0 ? (
+          <ReactECharts option={comparisonChartOption(points)} style={{ height: 420 }} notMerge />
+        ) : (
+          <p className="muted">{loading ? "Loading…" : "No history yet."}</p>
+        )}
+      </section>
+    </div>
+  );
 }
 
 export default function SavingsView() {
@@ -49,7 +164,9 @@ export default function SavingsView() {
   };
 
   return (
-    <div className="grid-single">
+    <>
+      <ComparisonChart />
+      <div className="grid-single">
       <section className="panel">
         <h2>Backtest / counterfactuals</h2>
         <div className="controls">
@@ -95,6 +212,7 @@ export default function SavingsView() {
           </>
         )}
       </section>
-    </div>
+      </div>
+    </>
   );
 }
