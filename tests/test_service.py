@@ -309,17 +309,49 @@ async def test_run_optimise_adds_shadow_vehicle_slots_while_relay_control_is_dis
         "ha_token",
         "context_raises",
         "force_off",
+        "expected_readbacks",
         "expected_desired_on",
         "reason_fragment",
     ),
     [
-        (["on"], False, False, "token", False, False, True, "selected current charging slot"),
-        (["off", "off"], False, False, "token", False, False, False, "forced OFF confirmed"),
-        (["off"], True, False, "token", False, False, False, "forced OFF confirmed"),
-        (["off"], False, True, "token", False, False, False, "forced OFF confirmed"),
-        ([], False, False, None, False, False, False, "credential unavailable"),
-        ([], False, False, "token", True, False, False, "control channel unavailable"),
-        (["off"], False, False, "token", False, True, False, "pipeline failure"),
+        (["on"], False, False, "token", False, False, 1, True, "selected current charging slot"),
+        (
+            ["off", "on"],
+            False,
+            False,
+            "token",
+            False,
+            False,
+            2,
+            True,
+            "selected current charging slot",
+        ),
+        (
+            ["off", "off", "off", "off"],
+            False,
+            False,
+            "token",
+            False,
+            False,
+            4,
+            False,
+            "forced OFF confirmed",
+        ),
+        (["off"], True, False, "token", False, False, 1, False, "forced OFF confirmed"),
+        (
+            ["off", "off", "off"],
+            False,
+            True,
+            "token",
+            False,
+            False,
+            4,
+            False,
+            "forced OFF confirmed",
+        ),
+        ([], False, False, None, False, False, 0, False, "credential unavailable"),
+        ([], False, False, "token", True, False, 0, False, "control channel unavailable"),
+        (["off"], False, False, "token", False, True, 1, False, "pipeline failure"),
     ],
 )
 async def test_control_ev_charging_verifies_shelly_actuation_and_fails_safe(
@@ -330,6 +362,7 @@ async def test_control_ev_charging_verifies_shelly_actuation_and_fails_safe(
     ha_token,
     context_raises,
     force_off,
+    expected_readbacks,
     expected_desired_on,
     reason_fragment,
 ) -> None:
@@ -408,30 +441,33 @@ async def test_control_ev_charging_verifies_shelly_actuation_and_fails_safe(
 
     nonlocal_on_readback_raises = [on_readback_raises]
     monkeypatch.setattr("energy_optimizer.service.HaClient", FakeHaClient)
+    monkeypatch.setattr("energy_optimizer.service.EV_RELAY_VERIFY_DELAY_SECONDS", 0)
 
     await service.control_ev_charging(now=now, force_off=force_off)
 
     expected_calls: list[tuple] = []
     if ha_token and not context_raises and force_off:
-        expected_calls.extend(
-            [
-                ("switch", "turn_off", {"entity_id": settings.ev_switch_entity}),
-                ("get_state", settings.ev_switch_entity),
-            ]
+        expected_calls.append(
+            ("switch", "turn_off", {"entity_id": settings.ev_switch_entity})
         )
     elif ha_token and not context_raises:
         expected_calls.append(
             ("switch", "turn_on", {"entity_id": settings.ev_switch_entity})
         )
-        if not turn_on_raises:
-            expected_calls.append(("get_state", settings.ev_switch_entity))
+        normal_readbacks = 0 if turn_on_raises else expected_readbacks
         if not expected_desired_on:
-            expected_calls.extend(
-                [
-                    ("switch", "turn_off", {"entity_id": settings.ev_switch_entity}),
-                    ("get_state", settings.ev_switch_entity),
-                ]
+            normal_readbacks = max(0, normal_readbacks - 1)
+        expected_calls.extend(
+            [("get_state", settings.ev_switch_entity)] * normal_readbacks
+        )
+        if not expected_desired_on:
+            expected_calls.append(
+                ("switch", "turn_off", {"entity_id": settings.ev_switch_entity})
             )
+    expected_calls.extend(
+        [("get_state", settings.ev_switch_entity)]
+        * (expected_readbacks - sum(call[0] == "get_state" for call in expected_calls))
+    )
     assert calls == expected_calls
     with store.session() as session:
         control = session.get(EvControlStatus, "current")
@@ -506,6 +542,7 @@ async def test_control_ev_charging_immediate_override_ignores_deferred_plan(monk
             return HaState(entity_id, "on", now, {}, last_changed=now)
 
     monkeypatch.setattr("energy_optimizer.service.HaClient", FakeHaClient)
+    monkeypatch.setattr("energy_optimizer.service.EV_RELAY_VERIFY_DELAY_SECONDS", 0)
 
     await service.control_ev_charging(now=now)
 

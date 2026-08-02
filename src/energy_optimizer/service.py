@@ -7,6 +7,7 @@ record including an immutable, hashed ``solver_input`` snapshot.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import hashlib
 import json
@@ -51,6 +52,8 @@ from .store import (
 )
 
 LOAD_LOOKBACK_DAYS = 28
+EV_RELAY_VERIFY_ATTEMPTS = 3
+EV_RELAY_VERIFY_DELAY_SECONDS = 1.0
 
 logger = logging.getLogger(__name__)
 
@@ -799,8 +802,7 @@ async def _apply_ev_relay_decision(
 
     try:
         await ha.call_service("switch", decision.action, {"entity_id": entity_id})
-        confirmed = _state_bool(await ha.get_state(entity_id))
-        if confirmed is decision.desired_on:
+        if await _verify_ev_relay_state(ha, entity_id, decision.desired_on):
             return decision
         failure = f"{decision.action} actuation verification failed"
     except Exception as exc:  # timeout may follow a successful physical action
@@ -820,14 +822,8 @@ async def _force_ev_relay_off(
         logger.exception("EV emergency turn_off service call failed")
         errors.append(f"turn_off error {type(exc).__name__}")
 
-    off_confirmed: bool | None = None
-    try:
-        off_confirmed = _state_bool(await ha.get_state(entity_id))
-    except Exception as exc:
-        logger.exception("EV emergency OFF readback failed")
-        errors.append(f"OFF readback error {type(exc).__name__}")
-
-    if off_confirmed is False:
+    off_confirmed = await _verify_ev_relay_state(ha, entity_id, False)
+    if off_confirmed:
         suffix = "forced OFF confirmed"
     else:
         suffix = "forced OFF could not be confirmed"
@@ -836,6 +832,31 @@ async def _force_ev_relay_off(
     alarm = f"CRITICAL: {failure}; {suffix}"
     logger.error("EV charger actuation alarm: %s", alarm)
     return EvControlDecision(False, "turn_off", alarm)
+
+
+async def _verify_ev_relay_state(ha: HaClient, entity_id: str, expected_on: bool) -> bool:
+    """Allow HA time to observe the relay, retrying stale or failed readbacks."""
+    for attempt in range(1, EV_RELAY_VERIFY_ATTEMPTS + 1):
+        await asyncio.sleep(EV_RELAY_VERIFY_DELAY_SECONDS)
+        try:
+            actual = _state_bool(await ha.get_state(entity_id))
+        except Exception as exc:
+            logger.warning(
+                "EV relay readback failed (attempt %d/%d): %s",
+                attempt,
+                EV_RELAY_VERIFY_ATTEMPTS,
+                exc,
+            )
+            continue
+        if actual is expected_on:
+            return True
+        logger.warning(
+            "EV relay state not yet %s (attempt %d/%d)",
+            "ON" if expected_on else "OFF",
+            attempt,
+            EV_RELAY_VERIFY_ATTEMPTS,
+        )
+    return False
 
 
 def _apply_ev_shortfall_warning(
