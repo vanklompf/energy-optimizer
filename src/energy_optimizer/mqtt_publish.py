@@ -89,8 +89,8 @@ class MqttPublisher:
         }
 
     def connect(self) -> None:
-        client = mqtt.Client(
-            mqtt.CallbackAPIVersion.VERSION2,
+        client = mqtt.Client(  # type: ignore[misc]
+            mqtt.CallbackAPIVersion.VERSION2,  # type: ignore[attr-defined]
             client_id=self._cfg.client_id,
         )
         if self._cfg.username:

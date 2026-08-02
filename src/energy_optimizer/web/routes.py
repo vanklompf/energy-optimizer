@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Sequence
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Request
@@ -275,7 +276,6 @@ def get_hourly_comparison(request: Request, hours: int = 48) -> dict:
     if not series:
         return {"now": _iso(now), "tz": settings.tz, "points": []}
 
-    battery = _battery_params(settings, {})
     soc_start = _soc_start_kwh(store, start, settings)
     opt = optimise(_series_to_intervals(series), soc_start, _optimiser_params(settings, {}))
     opt_by_start = {s.interval_start: s for s in opt.steps} if opt.status == "optimal" else {}
@@ -465,7 +465,7 @@ def _load_series(store: Store, start: dt.datetime, end: dt.datetime) -> list[Ser
     return series
 
 
-def _hourly_telemetry(telem: list[Telemetry]) -> dict[dt.datetime, dict[str, float]]:
+def _hourly_telemetry(telem: Sequence[Telemetry]) -> dict[dt.datetime, dict[str, float]]:
     buckets: dict[dt.datetime, dict[str, list[float]]] = {}
     for t in telem:
         hour = _aware(t.ts).replace(minute=0, second=0, microsecond=0)
