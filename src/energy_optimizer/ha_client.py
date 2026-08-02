@@ -42,6 +42,7 @@ class HaState:
     state: str
     last_updated: dt.datetime | None
     attributes: dict[str, Any]
+    last_changed: dt.datetime | None = None
 
     def as_float(self) -> float | None:
         if self.state in _UNAVAILABLE:
@@ -164,6 +165,16 @@ class HaClient:
         )
         return build_snapshot(states, now)
 
+    async def call_service(self, domain: str, service: str, data: dict[str, Any]) -> None:
+        """Call a Home Assistant service and raise ``HaError`` on failure."""
+        client = self._require_client()
+        url = f"{self._base_url}/api/services/{domain}/{service}"
+        try:
+            response = await client.post(url, headers=self._headers(), json=data)
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise HaError(f"HA service {domain}.{service} failed") from exc
+
     def _require_client(self) -> httpx.AsyncClient:
         if self._client is None:
             raise HaError("HaClient used outside of an async context manager")
@@ -242,19 +253,24 @@ def _is_stale(
 
 
 def _parse_state(payload: dict[str, Any]) -> HaState:
-    last_updated = payload.get("last_updated") or payload.get("last_changed")
-    ts: dt.datetime | None = None
-    if isinstance(last_updated, str):
-        try:
-            ts = dt.datetime.fromisoformat(last_updated.replace("Z", "+00:00"))
-        except ValueError:
-            ts = None
+    last_changed = _parse_ha_timestamp(payload.get("last_changed"))
+    last_updated = _parse_ha_timestamp(payload.get("last_updated")) or last_changed
     return HaState(
         entity_id=payload.get("entity_id", ""),
         state=payload.get("state", ""),
-        last_updated=ts,
+        last_updated=last_updated,
         attributes=payload.get("attributes", {}) or {},
+        last_changed=last_changed,
     )
+
+
+def _parse_ha_timestamp(value: object) -> dt.datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def _to_iso(value: dt.datetime) -> str:

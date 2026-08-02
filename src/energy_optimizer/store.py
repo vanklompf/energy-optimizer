@@ -50,6 +50,20 @@ class Telemetry(Base):
     stale: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class EvTelemetry(Base):
+    __tablename__ = "ev_telemetry"
+
+    ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    soc_pct: Mapped[float | None] = mapped_column(Float)
+    charging_status: Mapped[str | None] = mapped_column(String(32))
+    charging_active: Mapped[bool | None] = mapped_column(Boolean)
+    switch_on: Mapped[bool | None] = mapped_column(Boolean)
+    switch_changed: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    power_kw: Mapped[float | None] = mapped_column(Float)
+    fault: Mapped[bool] = mapped_column(Boolean, default=False)
+    stale: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class Price(Base):
     __tablename__ = "prices"
 
@@ -114,6 +128,26 @@ class PlanStep(Base):
     curtail_kwh: Mapped[float] = mapped_column(Float, default=0.0)
     soc_pct_end: Mapped[float] = mapped_column(Float, default=0.0)
     marginal_value: Mapped[float | None] = mapped_column(Float)
+
+
+class EvPlanStep(Base):
+    __tablename__ = "ev_plan_steps"
+
+    run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    interval_start: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    charge_kwh: Mapped[float] = mapped_column(Float, default=0.0)
+    planned_on: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class EvControlStatus(Base):
+    __tablename__ = "ev_control_status"
+
+    key: Mapped[str] = mapped_column(String(16), primary_key=True, default="current")
+    ts: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
+    desired_on: Mapped[bool] = mapped_column(Boolean)
+    planned_on: Mapped[bool | None] = mapped_column(Boolean)
+    action: Mapped[str] = mapped_column(String(16))
+    reason: Mapped[str] = mapped_column(SAText)
 
 
 class DailyReport(Base):

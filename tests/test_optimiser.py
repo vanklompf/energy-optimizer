@@ -106,3 +106,56 @@ def test_soc_respects_bounds() -> None:
     for s in result.steps:
         assert s.soc_kwh_end >= params.soc_min_kwh - 1e-6
         assert s.soc_kwh_end <= params.soc_max_kwh + 1e-6
+
+
+def test_ev_charging_is_shifted_to_solar_surplus() -> None:
+    intervals = [
+        IntervalInput(
+            interval_start=f"2026-07-12T{12 + h:02d}:00:00+00:00",
+            dt_hours=1.0,
+            pv_energy_kwh=0.0 if h == 0 else 4.0,
+            load_energy_kwh=1.0,
+            buy_price=1.0,
+            sell_price=0.0,
+            ev_available=True,
+        )
+        for h in range(2)
+    ]
+    params = make_params(
+        ev_charge_power_kw=2.0,
+        ev_target_slots=1,
+    )
+
+    result = optimise(intervals, 5.0, params)
+
+    assert result.status == "optimal"
+    assert result.steps[0].ev_charge_kwh == 0.0
+    assert result.steps[1].ev_charge_kwh == 2.0
+    assert result.steps[1].pv_to_load_kwh == 3.0
+
+
+def test_ev_minimum_charge_is_met_before_departure_deadline() -> None:
+    intervals = [
+        IntervalInput(
+            interval_start=f"2026-07-13T0{h}:00:00+00:00",
+            dt_hours=1.0,
+            pv_energy_kwh=0.0,
+            load_energy_kwh=0.0,
+            buy_price=2.0 if h == 0 else 0.2,
+            sell_price=0.0,
+            ev_available=True,
+            ev_required_soon=(h == 0),
+        )
+        for h in range(2)
+    ]
+    params = make_params(
+        ev_charge_power_kw=2.0,
+        ev_target_slots=1,
+        ev_minimum_slots=1,
+    )
+
+    result = optimise(intervals, 5.0, params)
+
+    assert result.status == "optimal"
+    assert result.steps[0].ev_charge_kwh == 2.0
+    assert result.steps[1].ev_charge_kwh == 0.0

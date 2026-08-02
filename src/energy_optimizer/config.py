@@ -91,6 +91,39 @@ class Settings(BaseSettings):
     optimise_horizon_hours: int = 48
     step_minutes: int = 15
 
+    # --- EV / PHEV flexible load and Home Assistant relay control ---
+    # Control stays opt-in. Override entity IDs in deployment config for the real site.
+    ev_control_enabled: bool = False
+    ev_switch_entity: str = "switch.ev_charger"
+    ev_power_entity: str = "sensor.ev_charger_power"
+    ev_soc_entity: str = "sensor.ev_state_of_charge"
+    ev_charging_status_entity: str = "sensor.ev_charging_status"
+    ev_charging_active_entity: str = "binary_sensor.ev_charging_active"
+    ev_charge_to_100_entity: str = "input_boolean.ev_charge_to_100_once"
+    ev_unplugged_status: str = "3"
+    ev_start_charging_statuses: list[str] = Field(default_factory=lambda: ["2"])
+    ev_active_charging_statuses: list[str] = Field(
+        default_factory=lambda: ["0", "1", "2", "5", "6", "9", "10", "11", "12", "13", "14", "15"]
+    )
+    ev_fault_entities: list[str] = Field(
+        default_factory=lambda: [
+            "binary_sensor.ev_charger_overheating",
+            "binary_sensor.ev_charger_overpowering",
+            "binary_sensor.ev_charger_overcurrent",
+            "binary_sensor.ev_charger_overvoltage",
+        ]
+    )
+    ev_capacity_kwh: float = 10.9
+    ev_charge_power_kw: float = 1.8
+    ev_charge_efficiency: float = 0.90
+    ev_minimum_target_soc_pct: float = 50.0
+    ev_target_soc_pct: float = 50.0
+    ev_departure_hour: int = 9
+    ev_min_on_minutes: int = 15
+    ev_min_off_minutes: int = 5
+    ev_power_start_grace_minutes: int = 5
+    ev_min_charging_power_kw: float = 0.1
+
     # --- PV forecast ---
     pv_lat: float = 51.9194
     pv_lon: float = 19.1451

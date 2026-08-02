@@ -32,3 +32,25 @@ def test_pv_planes_from_json_env(monkeypatch) -> None:
     assert isinstance(s.pv_planes[0], PvPlane)
     assert s.pv_planes[0].peak_kwp == 4.0
     assert s.pv_planes[1].azimuth == 45
+
+
+def test_ev_control_settings_have_safe_homelab_defaults() -> None:
+    s = Settings(db=":memory:")
+    assert s.ev_control_enabled is False
+    assert s.ev_switch_entity == "switch.ev_charger"
+    assert s.ev_soc_entity == "sensor.ev_state_of_charge"
+    assert s.ev_charging_status_entity == "sensor.ev_charging_status"
+    assert s.ev_charge_to_100_entity == "input_boolean.ev_charge_to_100_once"
+    assert s.ev_unplugged_status == "3"
+    assert s.ev_start_charging_statuses == ["2"]
+    assert "0" in s.ev_active_charging_statuses
+    assert "16" not in s.ev_active_charging_statuses
+    assert s.ev_capacity_kwh == 10.9
+    assert s.ev_charge_power_kw == 1.8
+    assert s.ev_minimum_target_soc_pct == 50.0
+    assert s.ev_target_soc_pct == 50.0
+    assert s.ev_departure_hour == 9
+    assert s.ev_min_on_minutes == 15
+    assert s.ev_min_off_minutes == 5
+    assert s.ev_power_start_grace_minutes == 5
+    assert s.ev_min_charging_power_kw == 0.1

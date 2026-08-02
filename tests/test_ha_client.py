@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import datetime as dt
 
+import httpx
+import respx
+
 from energy_optimizer.ha_client import (
     ENTITY_BATTERY_POWER,
     ENTITY_CONSUMED_POWER,
@@ -10,7 +13,9 @@ from energy_optimizer.ha_client import (
     ENTITY_GRID_IMPORT_POWER,
     ENTITY_PV_POWER,
     ENTITY_SOC,
+    HaClient,
     HaState,
+    _parse_state,
     _split_battery_power,
     build_snapshot,
 )
@@ -29,6 +34,21 @@ def test_split_battery_power_sign_convention() -> None:
     assert _split_battery_power(3.0) == (3.0, 0.0)  # >0 charging
     assert _split_battery_power(-2.5) == (0.0, 2.5)  # <0 discharging
     assert _split_battery_power(None) == (None, None)
+
+
+def test_parse_state_preserves_last_changed_separately_from_last_updated() -> None:
+    state = _parse_state(
+        {
+            "entity_id": "switch.garage",
+            "state": "on",
+            "last_changed": "2026-08-02T10:00:00Z",
+            "last_updated": "2026-08-02T10:05:00Z",
+            "attributes": {"power": 1800},
+        }
+    )
+
+    assert state.last_changed == dt.datetime(2026, 8, 2, 10, 0, tzinfo=dt.UTC)
+    assert state.last_updated == dt.datetime(2026, 8, 2, 10, 5, tzinfo=dt.UTC)
 
 
 def test_snapshot_fresh_is_not_stale() -> None:
@@ -98,3 +118,17 @@ def test_snapshot_missing_soc_is_stale() -> None:
     snap = build_snapshot(states, now)
     assert snap.stale is True
     assert snap.soc_pct is None
+
+
+@respx.mock
+async def test_call_service_posts_to_home_assistant() -> None:
+    route = respx.post("http://ha.local:8123/api/services/switch/turn_on").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    async with HaClient("http://ha.local:8123", "secret") as client:
+        await client.call_service("switch", "turn_on", {"entity_id": "switch.garage"})
+
+    request = route.calls.last.request
+    assert request.headers["Authorization"] == "Bearer secret"
+    assert request.content == b'{"entity_id":"switch.garage"}'

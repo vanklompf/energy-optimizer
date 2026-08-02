@@ -12,6 +12,7 @@ kills the scheduler.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -25,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 def build_scheduler(service: Service) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=service.settings.tz)
+    ev_pipeline_lock = asyncio.Lock()
 
     async def _collect() -> None:
         try:
@@ -38,22 +40,69 @@ def build_scheduler(service: Service) -> AsyncIOScheduler:
         except Exception:  # pragma: no cover - defensive
             logger.exception("refresh_prices job failed")
 
+    async def _ev_control() -> None:
+        async with ev_pipeline_lock:
+            failed = False
+            try:
+                await service.collect_ev_telemetry()
+            except Exception:  # pragma: no cover
+                failed = True
+                logger.exception("EV telemetry collection failed; attempting fail-safe control")
+            try:
+                if failed:
+                    await service.control_ev_charging(force_off=True)
+                else:
+                    await service.control_ev_charging()
+            except Exception:  # pragma: no cover
+                logger.exception("EV control job failed")
+
     async def _optimise() -> None:
-        try:
-            await service.run_optimise()
-        except Exception:  # pragma: no cover - defensive
-            logger.exception("run_optimise job failed")
+        async with ev_pipeline_lock:
+            failed = False
+            try:
+                await service.collect_ev_telemetry()
+                await service.run_optimise()
+            except Exception:  # pragma: no cover
+                failed = True
+                logger.exception("run_optimise job failed; attempting fail-safe control")
+            try:
+                if failed:
+                    await service.control_ev_charging(force_off=True)
+                else:
+                    await service.control_ev_charging()
+            except Exception:  # pragma: no cover
+                logger.exception("post-optimise EV control failed")
 
     async def _bootstrap() -> None:
-        try:
-            await service.bootstrap()
-        except Exception:  # pragma: no cover - defensive
-            logger.exception("bootstrap job failed")
+        async with ev_pipeline_lock:
+            failed = False
+            try:
+                await service.bootstrap()
+                await service.collect_telemetry()
+                await service.collect_ev_telemetry()
+                await service.run_optimise()
+            except Exception:  # pragma: no cover
+                failed = True
+                logger.exception("bootstrap job failed; attempting fail-safe control")
+            try:
+                if failed:
+                    await service.control_ev_charging(force_off=True)
+                else:
+                    await service.control_ev_charging()
+            except Exception:  # pragma: no cover
+                logger.exception("post-bootstrap EV control failed")
 
     # One-shot backfill at startup (no trigger => runs once, immediately) so backtests and
     # the price chart have history right away rather than only after live collection.
     scheduler.add_job(_bootstrap, id="bootstrap", max_instances=1)
     scheduler.add_job(_collect, IntervalTrigger(minutes=1), id="collect", max_instances=1)
+    scheduler.add_job(
+        _ev_control,
+        IntervalTrigger(minutes=1),
+        id="ev_control",
+        max_instances=1,
+        coalesce=True,
+    )
     scheduler.add_job(_prices, IntervalTrigger(minutes=15), id="prices", max_instances=1)
     scheduler.add_job(
         _optimise,
