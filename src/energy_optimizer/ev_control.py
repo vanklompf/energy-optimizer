@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from .config import Settings
+from .ev import EV_FULL_TARGET_SOC_PCT
 
 ControlAction = Literal["turn_on", "turn_off", "none"]
 
@@ -34,7 +35,6 @@ def decide_ev_control(
     *,
     planned_on: bool | None,
     now: dt.datetime,
-    target_soc_pct: float | None = None,
     force_charge: bool = False,
 ) -> EvControlDecision:
     """Choose one idempotent relay action.
@@ -48,7 +48,6 @@ def decide_ev_control(
         return EvControlDecision(False, "turn_off", "charger switch state unavailable; forcing OFF")
 
     forced_off_reason: str | None = None
-    effective_target_soc_pct = target_soc_pct or settings.ev_target_soc_pct
     if live.fault:
         forced_off_reason = "charger protection fault active"
     elif live.charging_status is None or live.soc_pct is None:
@@ -61,7 +60,7 @@ def decide_ev_control(
         else settings.ev_start_charging_statuses
     ):
         forced_off_reason = "vehicle charging status not safe for relay control"
-    elif live.soc_pct >= effective_target_soc_pct:
+    elif live.soc_pct >= EV_FULL_TARGET_SOC_PCT:
         forced_off_reason = "vehicle target SoC reached"
     elif planned_on is None and not force_charge:
         forced_off_reason = "current optimiser plan unavailable"
@@ -84,7 +83,7 @@ def decide_ev_control(
     if planned_on:
         if live.switch_on:
             reason = (
-                "one-shot charge-to-100 active"
+                "immediate charging override active"
                 if force_charge
                 else "planned charging slot active"
             )
@@ -92,7 +91,7 @@ def decide_ev_control(
         if _age_minutes(live.switch_last_changed, now) < settings.ev_min_off_minutes:
             return EvControlDecision(True, "none", "waiting for minimum off time")
         reason = (
-            "one-shot charge-to-100 requested"
+            "immediate charging override requested"
             if force_charge
             else "optimiser selected current charging slot"
         )

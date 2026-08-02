@@ -239,7 +239,6 @@ async def test_run_optimise_adds_shadow_vehicle_slots_while_relay_control_is_dis
     settings = _settings().model_copy(
         update={
             "ev_control_enabled": False,
-            "ev_target_soc_pct": 100.0,
             "ev_minimum_target_soc_pct": 75.0,
             "ev_charge_power_kw": 1.8,
             "ev_capacity_kwh": 10.9,
@@ -442,7 +441,7 @@ async def test_control_ev_charging_verifies_shelly_actuation_and_fails_safe(
     assert reason_fragment in control.reason
 
 
-async def test_control_ev_charging_one_shot_override_ignores_deferred_plan(monkeypatch) -> None:
+async def test_control_ev_charging_immediate_override_ignores_deferred_plan(monkeypatch) -> None:
     settings = _settings().model_copy(update={"ha_token": "token", "ev_control_enabled": True})
     store = Store(":memory:")
     store.create_all()
@@ -518,4 +517,4 @@ async def test_control_ev_charging_one_shot_override_ignores_deferred_plan(monke
         control = session.get(EvControlStatus, "current")
     assert control is not None
     assert control.desired_on is True
-    assert "one-shot" in control.reason
+    assert "immediate charging override" in control.reason

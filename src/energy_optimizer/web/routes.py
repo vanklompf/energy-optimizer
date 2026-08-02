@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import select
 
 from ..config import Settings
+from ..ev import EV_FULL_TARGET_SOC_PCT
 from ..optimiser import IntervalInput, optimise
 from ..safety import CONTROL_ENABLED
 from ..simulator import (
@@ -397,9 +398,9 @@ def _ev_control_dict(
 ) -> dict:
     return {
         "enabled": settings.ev_control_enabled,
-        "target_soc_pct": settings.ev_target_soc_pct,
+        "target_soc_pct": EV_FULL_TARGET_SOC_PCT,
         "override_active": override_active,
-        "effective_target_soc_pct": 100.0 if override_active else settings.ev_target_soc_pct,
+        "effective_target_soc_pct": EV_FULL_TARGET_SOC_PCT,
         "minimum_target_soc_pct": settings.ev_minimum_target_soc_pct,
         "departure_hour": settings.ev_departure_hour,
         "ts": _iso(control.ts) if control else None,

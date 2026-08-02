@@ -48,7 +48,6 @@ def test_ev_control_settings_have_safe_homelab_defaults() -> None:
     assert s.ev_capacity_kwh == 10.9
     assert s.ev_charge_power_kw == 1.8
     assert s.ev_minimum_target_soc_pct == 50.0
-    assert s.ev_target_soc_pct == 50.0
     assert s.ev_departure_hour == 9
     assert s.ev_min_on_minutes == 15
     assert s.ev_min_off_minutes == 5

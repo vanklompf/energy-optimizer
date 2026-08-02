@@ -9,6 +9,8 @@ from zoneinfo import ZoneInfo
 
 from .config import Settings
 
+EV_FULL_TARGET_SOC_PCT = 100.0
+
 
 @dataclass(frozen=True, slots=True)
 class EvRequirements:
@@ -54,7 +56,7 @@ def build_ev_requirements(
 
     available = len(interval_starts)
     available_soon = sum(1 for start in interval_starts if start < departure_at)
-    target_required = slots_for(settings.ev_target_soc_pct)
+    target_required = slots_for(EV_FULL_TARGET_SOC_PCT)
     minimum_required = slots_for(settings.ev_minimum_target_soc_pct)
     target_slots = min(target_required, available)
     minimum_slots = min(minimum_required, available_soon, target_slots)

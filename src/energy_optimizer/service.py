@@ -17,7 +17,7 @@ from dataclasses import asdict
 from sqlalchemy import delete, select
 
 from .config import Settings
-from .ev import EvRequirements, build_ev_requirements
+from .ev import EV_FULL_TARGET_SOC_PCT, EvRequirements, build_ev_requirements
 from .ev_control import EvControlDecision, EvLiveState, decide_ev_control
 from .explain import classify_next_action
 from .forecast.load import LoadForecaster, LoadSample
@@ -214,7 +214,6 @@ class Service:
                 live,
                 planned_on=planned_on,
                 now=now,
-                target_soc_pct=100.0 if self.ev_charge_to_100_active else None,
                 force_charge=self.ev_charge_to_100_active,
             )
         )
@@ -387,7 +386,7 @@ class Service:
             and not ev_live.stale
             and not ev_live.fault
             and ev_live.soc_pct is not None
-            and ev_live.soc_pct < s.ev_target_soc_pct
+            and ev_live.soc_pct < EV_FULL_TARGET_SOC_PCT
             and ev_live.charging_status
             in (
                 s.ev_active_charging_statuses

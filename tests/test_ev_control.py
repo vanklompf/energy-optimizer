@@ -68,25 +68,27 @@ def test_controller_fails_safe_off_when_plan_is_missing() -> None:
 
 def test_controller_stops_immediately_at_target() -> None:
     now = dt.datetime(2026, 8, 2, 12, 0, tzinfo=dt.UTC)
-    live = _state(now, switch_on=True, soc_pct=50.0, switch_last_changed=now)
-    decision = decide_ev_control(_settings(), live, planned_on=True, now=now)
+    live = _state(now, switch_on=True, soc_pct=100.0, switch_last_changed=now)
+    decision = decide_ev_control(
+        _settings(), live, planned_on=True, now=now, force_charge=True
+    )
     assert decision.action == "turn_off"
+    assert "target SoC reached" in decision.reason
 
 
-def test_one_shot_override_forces_charging_to_100_ignoring_plan() -> None:
+def test_immediate_override_forces_charging_ignoring_plan() -> None:
     now = dt.datetime(2026, 8, 2, 12, 0, tzinfo=dt.UTC)
     decision = decide_ev_control(
         _settings(),
         _state(now, soc_pct=83.0),
         planned_on=False,
         now=now,
-        target_soc_pct=100.0,
         force_charge=True,
     )
 
     assert decision.desired_on is True
     assert decision.action == "turn_on"
-    assert "one-shot" in decision.reason
+    assert "immediate charging override" in decision.reason
 
 
 @pytest.mark.parametrize("status", ["3", "4", "16", "99", "malformed"])

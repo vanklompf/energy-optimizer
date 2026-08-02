@@ -15,7 +15,6 @@ def test_ev_requirements_split_minimum_departure_and_full_target() -> None:
         ev_charge_power_kw=1.8,
         ev_charge_efficiency=0.90,
         ev_minimum_target_soc_pct=75,
-        ev_target_soc_pct=100,
         ev_departure_hour=7,
     )
     now = dt.datetime(2026, 8, 2, 18, 0, tzinfo=dt.UTC)  # 20:00 Warsaw
@@ -34,7 +33,7 @@ def test_ev_requirements_are_zero_at_target() -> None:
     now = dt.datetime(2026, 8, 2, 12, 0, tzinfo=dt.UTC)
     starts = [now]
 
-    req = build_ev_requirements(50.0, now, starts, settings)
+    req = build_ev_requirements(100.0, now, starts, settings)
 
     assert req.minimum_slots == 0
     assert req.target_slots == 0
@@ -49,7 +48,6 @@ def test_ev_requirements_report_departure_shortfall_and_use_every_available_slot
         ev_charge_power_kw=1.8,
         ev_charge_efficiency=0.90,
         ev_minimum_target_soc_pct=50,
-        ev_target_soc_pct=50,
         ev_departure_hour=9,
     )
     now = dt.datetime(2026, 8, 3, 6, 30, tzinfo=dt.UTC)  # 08:30 Warsaw
@@ -59,14 +57,13 @@ def test_ev_requirements_report_departure_shortfall_and_use_every_available_slot
 
     assert req.minimum_slots == 2
     assert req.minimum_shortfall_slots == 7
-    assert req.target_shortfall_slots == 7
+    assert req.target_shortfall_slots == 20
 
 
 def test_ev_requirements_report_full_shortfall_when_no_slots_are_actionable() -> None:
     settings = Settings(
         db=":memory:",
         ev_minimum_target_soc_pct=50,
-        ev_target_soc_pct=50,
     )
     now = dt.datetime(2026, 8, 3, 5, 0, tzinfo=dt.UTC)
 
