@@ -20,7 +20,17 @@ from ..simulator import (
     value_actual,
     value_optimiser_plan,
 )
-from ..store import DailyReport, PlanStep, Price, Run, Store, Telemetry
+from ..store import (
+    DailyReport,
+    EvControlStatus,
+    EvPlanStep,
+    EvTelemetry,
+    PlanStep,
+    Price,
+    Run,
+    Store,
+    Telemetry,
+)
 from .schemas import BacktestRequest, BacktestResponse, PolicyResult
 
 router = APIRouter(prefix="/api", tags=["api"])
@@ -50,6 +60,10 @@ def get_status(request: Request) -> dict:
         last_run = session.execute(
             select(Run).order_by(Run.ts.desc()).limit(1)
         ).scalar_one_or_none()
+        ev = session.execute(
+            select(EvTelemetry).order_by(EvTelemetry.ts.desc()).limit(1)
+        ).scalar_one_or_none()
+        ev_control = session.get(EvControlStatus, "current")
     return {
         "mode": settings.mode,
         "control_enabled": CONTROL_ENABLED,
@@ -57,6 +71,12 @@ def get_status(request: Request) -> dict:
         "telemetry": _telemetry_dict(telem),
         "current_price": _price_dict(price),
         "last_run": _run_dict(last_run),
+        "ev": _ev_dict(ev, settings),
+        "ev_control": _ev_control_dict(
+            ev_control,
+            settings,
+            override_active=request.app.state.service.ev_charge_to_100_active,
+        ),
     }
 
 
@@ -104,8 +124,19 @@ def get_plan(request: Request) -> dict:
             .scalars()
             .all()
         )
+        ev_steps = (
+            session.execute(
+                select(EvPlanStep).where(EvPlanStep.run_id == last_run.run_id)
+            )
+            .scalars()
+            .all()
+        )
+        ev_by_start = {_aware(step.interval_start): step for step in ev_steps}
         run_dict = _run_dict(last_run)
-        step_dicts = [_plan_step_dict(s) for s in steps]
+        step_dicts = [
+            _plan_step_dict(step, ev_by_start.get(_aware(step.interval_start)))
+            for step in steps
+        ]
     return {"run": run_dict, "steps": step_dicts}
 
 
@@ -342,6 +373,43 @@ def _actual_soc_by_hour(
 
 
 # --- serialisation helpers -------------------------------------------------
+def _ev_dict(ev: EvTelemetry | None, settings: Settings) -> dict | None:
+    if ev is None:
+        return None
+    return {
+        "ts": _iso(ev.ts),
+        "soc_pct": ev.soc_pct,
+        "charging_status": ev.charging_status,
+        "charging_active": ev.charging_active,
+        "plugged_in": (
+            ev.charging_status is not None
+            and ev.charging_status != settings.ev_unplugged_status
+        ),
+        "switch_on": ev.switch_on,
+        "power_kw": ev.power_kw,
+        "fault": ev.fault,
+        "stale": ev.stale,
+    }
+
+
+def _ev_control_dict(
+    control: EvControlStatus | None, settings: Settings, *, override_active: bool = False
+) -> dict:
+    return {
+        "enabled": settings.ev_control_enabled,
+        "target_soc_pct": settings.ev_target_soc_pct,
+        "override_active": override_active,
+        "effective_target_soc_pct": 100.0 if override_active else settings.ev_target_soc_pct,
+        "minimum_target_soc_pct": settings.ev_minimum_target_soc_pct,
+        "departure_hour": settings.ev_departure_hour,
+        "ts": _iso(control.ts) if control else None,
+        "desired_on": control.desired_on if control else False,
+        "planned_on": control.planned_on if control else None,
+        "action": control.action if control else "none",
+        "reason": control.reason if control else "no control decision yet",
+    }
+
+
 def _telemetry_dict(t: Telemetry | None) -> dict | None:
     if t is None:
         return None
@@ -390,7 +458,7 @@ def _run_dict(r: Run | None) -> dict | None:
     }
 
 
-def _plan_step_dict(s: PlanStep) -> dict:
+def _plan_step_dict(s: PlanStep, ev: EvPlanStep | None = None) -> dict:
     return {
         "interval_start": _iso(s.interval_start),
         "dt_hours": s.dt_hours,
@@ -404,6 +472,8 @@ def _plan_step_dict(s: PlanStep) -> dict:
         "curtail_kwh": s.curtail_kwh,
         "soc_pct_end": s.soc_pct_end,
         "marginal_value": s.marginal_value,
+        "ev_charge_kwh": ev.charge_kwh if ev else 0.0,
+        "ev_planned_on": ev.planned_on if ev else False,
     }
 
 

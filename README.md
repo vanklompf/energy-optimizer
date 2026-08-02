@@ -1,10 +1,10 @@
 # energy-optimizer
 
-Solar + battery optimisation app for a Sigen PV/battery system on Pstryk dynamic pricing.
-Runs **dry-run first**: it collects telemetry (Home Assistant) and prices (Pstryk), plans
-battery/grid flows with a duration-aware explicit-flow MILP, and publishes *recommendations*
-to Home Assistant over MQTT. It never controls hardware in the MVP (`control_enabled` is
-hardcoded off).
+Solar + battery + flexible-load optimisation app for a Sigen PV/battery system on Pstryk
+dynamic pricing. Stationary Sigen control remains **dry-run only**: the app collects telemetry,
+plans battery/grid flows with a duration-aware explicit-flow MILP, and publishes recommendations
+to Home Assistant. An independent opt-in controller can switch a fixed-power EV/PHEV charger
+through Home Assistant while retaining fail-safe OFF behavior and anti-cycling delays.
 
 See [`DESIGN.md`](./DESIGN.md) for the full design.
 
@@ -74,6 +74,11 @@ All configuration is via environment variables (prefix `EO_`) or the `.env` file
 [`.env.example`](./.env.example) for the full list with defaults and comments. Required
 before real use: `EO_HA_TOKEN`, `EO_PSTRYK_API_KEY`, MQTT credentials, and the PV-plane /
 site grid / inverter limits.
+
+EV control is disabled by default. When enabled, the optimiser guarantees the configured minimum
+vehicle SoC by the next departure hour, then shifts the remaining charge toward forecast solar or
+the cheapest grid intervals in the rolling horizon. It follows fixed 15-minute charging slots,
+forces the relay off for unplugged/unavailable/fault states, and respects minimum on/off times.
 
 ## Deployment
 

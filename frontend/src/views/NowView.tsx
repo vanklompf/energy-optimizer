@@ -77,11 +77,12 @@ function planChartOption(steps: PlanStep[]) {
   const gridExport = steps.map((s) => +(s.pv_to_grid_kwh + s.battery_to_grid_kwh).toFixed(3));
   const battCharge = steps.map((s) => +(s.pv_to_battery_kwh + s.grid_to_battery_kwh).toFixed(3));
   const battDischarge = steps.map((s) => +(s.battery_to_load_kwh + s.battery_to_grid_kwh).toFixed(3));
+  const evCharge = steps.map((s) => +s.ev_charge_kwh.toFixed(3));
 
   return {
     tooltip: { trigger: "axis" },
     legend: {
-      data: ["SoC %", "Grid import", "Grid export", "Charge", "Discharge"],
+      data: ["SoC %", "Grid import", "Grid export", "Charge", "Discharge", "Car charge"],
       textStyle: { color: TEXT_COLOR },
       inactiveColor: INACTIVE_COLOR,
     },
@@ -112,6 +113,7 @@ function planChartOption(steps: PlanStep[]) {
       { name: "Grid export", type: "bar", stack: "grid", data: gridExport.map((v) => -v), itemStyle: { color: "#98c379" } },
       { name: "Charge", type: "bar", stack: "batt", data: battCharge, itemStyle: { color: "#61afef" } },
       { name: "Discharge", type: "bar", stack: "batt", data: battDischarge.map((v) => -v), itemStyle: { color: "#c678dd" } },
+      { name: "Car charge", type: "bar", data: evCharge, itemStyle: { color: "#56b6c2" } },
       { name: "SoC %", type: "line", yAxisIndex: 1, data: soc, smooth: true, symbol: "none", lineStyle: { width: 2, color: "#e5c07b" } },
     ],
   };
@@ -163,6 +165,8 @@ export default function NowView() {
   const t = data.telemetry;
   const price = data.current_price;
   const run = data.last_run;
+  const ev = data.ev;
+  const evControl = data.ev_control;
 
   return (
     <>
@@ -182,6 +186,22 @@ export default function NowView() {
             <li><span>Grid export</span><b>{fmt(t?.grid_export_kw, " kW")}</b></li>
             <li><span>EMS mode</span><b>{t?.ems_mode ?? "—"}</b></li>
           </ul>
+        </section>
+
+        <section className="panel">
+          <h2>Mercedes charging</h2>
+          {ev?.fault && <div className="badge badge-block" style={{ marginBottom: 10 }}>Shelly protection fault</div>}
+          {ev?.stale && <div className="badge badge-warn" style={{ marginBottom: 10 }}>vehicle telemetry stale</div>}
+          <ul className="metrics">
+            <li><span>Car SoC</span><b>{fmt(ev?.soc_pct, " %", 0)}</b></li>
+            <li><span>Connected</span><b>{ev ? (ev.plugged_in ? "yes" : "no") : "—"}</b></li>
+            <li><span>Charging</span><b>{ev?.charging_active ? "active" : "idle"}</b></li>
+            <li><span>Garage relay</span><b>{ev?.switch_on == null ? "unknown" : ev.switch_on ? "on" : "off"}</b></li>
+            <li><span>Charge power</span><b>{fmt(ev?.power_kw, " kW")}</b></li>
+            <li><span>Control</span><b>{evControl.enabled ? "automatic" : "disabled"}</b></li>
+            <li><span>Targets</span><b>{evControl.minimum_target_soc_pct.toFixed(0)}% by {String(evControl.departure_hour).padStart(2, "0")}:00 / {evControl.target_soc_pct.toFixed(0)}%</b></li>
+          </ul>
+          <p className="reason">{evControl.reason}</p>
         </section>
 
         <section className="panel">

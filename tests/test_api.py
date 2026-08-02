@@ -6,7 +6,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from energy_optimizer.config import Settings
-from energy_optimizer.store import Price, Telemetry
+from energy_optimizer.store import (
+    EvControlStatus,
+    EvPlanStep,
+    EvTelemetry,
+    PlanStep,
+    Price,
+    Run,
+    Telemetry,
+)
 from energy_optimizer.web import create_app
 
 
@@ -30,12 +38,82 @@ def test_status_empty(client: TestClient) -> None:
     assert body["mode"] == "dry_run"
     assert body["control_enabled"] is False
     assert body["telemetry"] is None
+    assert body["ev"] is None
+    assert body["ev_control"]["enabled"] is False
+
+
+def test_status_exposes_vehicle_and_control_state(client: TestClient) -> None:
+    store = client.app.state.store
+    client.app.state.service.ev_charge_to_100_active = True
+    now = dt.datetime.now(tz=dt.UTC)
+    with store.session() as session:
+        session.add(
+            EvTelemetry(
+                ts=now,
+                soc_pct=83.0,
+                charging_status="2",
+                charging_active=False,
+                switch_on=False,
+                switch_changed=now,
+                power_kw=0.0,
+                fault=False,
+                stale=False,
+            )
+        )
+        session.add(
+            EvControlStatus(
+                key="current",
+                ts=now,
+                desired_on=False,
+                planned_on=False,
+                action="none",
+                reason="optimiser deferred charging",
+            )
+        )
+
+    body = client.get("/api/status").json()
+
+    assert body["ev"]["soc_pct"] == 83.0
+    assert body["ev"]["plugged_in"] is True
+    assert body["ev_control"]["override_active"] is True
+    assert body["ev_control"]["effective_target_soc_pct"] == 100.0
+    assert body["ev_control"]["reason"] == "optimiser deferred charging"
 
 
 def test_plan_empty(client: TestClient) -> None:
     resp = client.get("/api/plan")
     assert resp.status_code == 200
     assert resp.json() == {"run": None, "steps": []}
+
+
+def test_plan_includes_ev_charging_energy(client: TestClient) -> None:
+    store = client.app.state.store
+    now = dt.datetime.now(tz=dt.UTC).replace(second=0, microsecond=0)
+    with store.session() as session:
+        session.add(
+            Run(
+                run_id="r1",
+                ts=now,
+                mode="dry_run",
+                horizon_hours=48,
+                known_price_hours=24,
+                status="ok",
+            )
+        )
+        session.add(PlanStep(run_id="r1", interval_start=now, dt_hours=0.25))
+        session.add(
+            EvPlanStep(
+                run_id="r1",
+                interval_start=now,
+                charge_kwh=0.45,
+                planned_on=True,
+            )
+        )
+
+    body = client.get("/api/plan").json()
+
+    assert body["steps"][0]["ev_charge_kwh"] == 0.45
+    assert body["steps"][0]["ev_planned_on"] is True
 
 
 def _seed(app_store, base: dt.datetime) -> None:

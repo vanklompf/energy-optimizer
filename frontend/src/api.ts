@@ -41,6 +41,32 @@ export interface StatusResponse {
   telemetry: Telemetry | null;
   current_price: PriceNow | null;
   last_run: RunSummary | null;
+  ev: EvTelemetry | null;
+  ev_control: EvControl;
+}
+
+export interface EvTelemetry {
+  ts: string;
+  soc_pct: number | null;
+  charging_status: string | null;
+  charging_active: boolean | null;
+  plugged_in: boolean;
+  switch_on: boolean | null;
+  power_kw: number | null;
+  fault: boolean;
+  stale: boolean;
+}
+
+export interface EvControl {
+  enabled: boolean;
+  target_soc_pct: number;
+  minimum_target_soc_pct: number;
+  departure_hour: number;
+  ts: string | null;
+  desired_on: boolean;
+  planned_on: boolean | null;
+  action: string;
+  reason: string;
 }
 
 export interface PricePoint {
@@ -72,6 +98,8 @@ export interface PlanStep {
   curtail_kwh: number;
   soc_pct_end: number;
   marginal_value: number | null;
+  ev_charge_kwh: number;
+  ev_planned_on: boolean;
 }
 
 export interface PlanResponse {
