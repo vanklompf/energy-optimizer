@@ -74,9 +74,10 @@ class Settings(BaseSettings):
     battery_round_trip_efficiency: float = 0.90
     degradation_cost_pln_per_kwh: float = 0.05
 
-    site_import_limit_kw: float = 14.0
-    site_export_limit_kw: float = 14.0
-    inverter_limit_kw: float = 12.0
+    # Sigen Hybrid 6.0 TP2: 16 A grid breaker @ 400 V 3-phase, 6600 VA AC, 6.0 kW nominal
+    site_import_limit_kw: float = 11.0
+    site_export_limit_kw: float = 6.6
+    inverter_limit_kw: float = 6.0
 
     # --- Pricing model ---
     import_price_adjustment_pln_kwh: float = 0.0
