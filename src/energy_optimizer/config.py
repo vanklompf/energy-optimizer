@@ -118,7 +118,7 @@ class Settings(BaseSettings):
     ev_charge_efficiency: float = 0.90
     ev_minimum_target_soc_pct: float = 50.0
     ev_departure_hour: int = 9
-    ev_min_on_minutes: int = 15
+    ev_min_on_minutes: int = 5
     ev_min_off_minutes: int = 5
     ev_power_start_grace_minutes: int = 5
     ev_min_charging_power_kw: float = 0.1
