@@ -202,6 +202,16 @@ export default function NowView() {
             <li><span>Targets</span><b>{evControl.minimum_target_soc_pct.toFixed(0)}% by {String(evControl.departure_hour).padStart(2, "0")}:00 / {evControl.target_soc_pct.toFixed(0)}%</b></li>
           </ul>
           <p className="reason">{evControl.reason}</p>
+          <p className="muted">
+            <b>Relay confirmation:</b> after each command PvOpti waits {evControl.relay_settle_seconds}s,
+            then checks every {evControl.relay_verify_interval_seconds}s for up to {evControl.relay_verify_timeout_seconds}s.
+            This grace period is intentional because the garage Shelly has weak coverage. An unconfirmed activation
+            is forced off and retried no sooner than {evControl.relay_failure_backoff_minutes} minutes later.
+          </p>
+          <p className="muted">
+            <b>Opportunistic policy:</b> {evControl.policy_explanation} Only {Math.round(evControl.forecast_surplus_factor * 100)}%
+            of predicted same-day surplus is counted; stationary-battery reserve is {evControl.battery_reserve_pct.toFixed(0)}% and its later-fill target is {evControl.battery_full_target_pct.toFixed(0)}%.
+          </p>
         </section>
 
         <section className="panel">

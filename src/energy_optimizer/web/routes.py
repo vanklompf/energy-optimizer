@@ -403,6 +403,21 @@ def _ev_control_dict(
         "effective_target_soc_pct": EV_FULL_TARGET_SOC_PCT,
         "minimum_target_soc_pct": settings.ev_minimum_target_soc_pct,
         "departure_hour": settings.ev_departure_hour,
+        "relay_settle_seconds": settings.ev_relay_settle_seconds,
+        "relay_verify_interval_seconds": settings.ev_relay_verify_interval_seconds,
+        "relay_verify_timeout_seconds": settings.ev_relay_verify_timeout_seconds,
+        "relay_failure_backoff_minutes": settings.ev_relay_failure_backoff_minutes,
+        "opportunistic_grid_allowed": False,
+        "forecast_surplus_factor": settings.ev_forecast_surplus_factor,
+        "battery_reserve_pct": settings.battery_soc_min_pct,
+        "battery_full_target_pct": settings.ev_battery_full_soc_pct,
+        "policy_explanation": (
+            "After the guaranteed departure minimum, the Mercedes is prioritised over "
+            "charging the stationary battery. Forecast-backed charging may start before "
+            "live PV surplus arrives only when the same forecast still fills the house "
+            f"battery to {settings.ev_battery_full_soc_pct:.0f}% later. The battery reserve "
+            "is protected and normal opportunistic charging never uses grid energy."
+        ),
         "ts": _iso(control.ts) if control else None,
         "desired_on": control.desired_on if control else False,
         "planned_on": control.planned_on if control else None,

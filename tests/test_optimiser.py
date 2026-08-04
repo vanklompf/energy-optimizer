@@ -126,7 +126,7 @@ def test_ev_charging_is_shifted_to_solar_surplus() -> None:
         ev_target_slots=1,
     )
 
-    result = optimise(intervals, 5.0, params)
+    result = optimise(intervals, 2.0, params)
 
     assert result.status == "optimal"
     assert result.steps[0].ev_charge_kwh == 0.0
@@ -159,3 +159,55 @@ def test_ev_minimum_charge_is_met_before_departure_deadline() -> None:
     assert result.status == "optimal"
     assert result.steps[0].ev_charge_kwh == 2.0
     assert result.steps[1].ev_charge_kwh == 0.0
+
+
+def test_opportunistic_ev_starts_early_from_battery_without_incremental_grid() -> None:
+    intervals = [
+        IntervalInput(
+            interval_start=f"2026-08-03T{10 + h:02d}:00:00+00:00",
+            dt_hours=1.0,
+            pv_energy_kwh=0.0 if h == 0 else 4.0,
+            load_energy_kwh=0.5,
+            buy_price=0.0,
+            sell_price=0.0,
+            ev_available=True,
+        )
+        for h in range(2)
+    ]
+    params = make_params(
+        ev_charge_power_kw=2.0,
+        ev_target_slots=1,
+        ev_minimum_slots=0,
+    )
+
+    result = optimise(intervals, 5.0, params)
+
+    assert result.status == "optimal"
+    assert result.steps[0].ev_charge_kwh == 2.0
+    assert result.steps[0].grid_import_kwh <= 1e-6
+    assert result.steps[0].battery_to_load_kwh > 0
+
+
+def test_guaranteed_ev_minimum_may_use_grid() -> None:
+    interval = IntervalInput(
+        interval_start="2026-08-03T06:00:00+00:00",
+        dt_hours=1.0,
+        pv_energy_kwh=0.0,
+        load_energy_kwh=0.5,
+        buy_price=1.0,
+        sell_price=0.0,
+        ev_available=True,
+        ev_required_soon=True,
+    )
+    params = make_params(
+        soc_min_kwh=2.0,
+        ev_charge_power_kw=2.0,
+        ev_target_slots=1,
+        ev_minimum_slots=1,
+    )
+
+    result = optimise([interval], 2.0, params)
+
+    assert result.status == "optimal"
+    assert result.steps[0].ev_charge_kwh == 2.0
+    assert result.steps[0].grid_to_load_kwh == 2.5

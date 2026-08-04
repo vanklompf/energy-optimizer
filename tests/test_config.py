@@ -53,3 +53,8 @@ def test_ev_control_settings_have_safe_homelab_defaults() -> None:
     assert s.ev_min_off_minutes == 5
     assert s.ev_power_start_grace_minutes == 5
     assert s.ev_min_charging_power_kw == 0.1
+    assert s.ev_relay_settle_seconds == 5.0
+    assert s.ev_relay_verify_interval_seconds == 2.0
+    assert s.ev_relay_verify_timeout_seconds == 30.0
+    assert s.ev_relay_failure_backoff_minutes == 30
+    assert s.ev_forecast_surplus_factor == 0.8

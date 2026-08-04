@@ -122,6 +122,16 @@ class Settings(BaseSettings):
     ev_min_off_minutes: int = 5
     ev_power_start_grace_minutes: int = 5
     ev_min_charging_power_kw: float = 0.1
+    # Shelly relay state can propagate slowly through weak garage Wi-Fi.
+    ev_relay_settle_seconds: float = Field(default=5.0, ge=0, le=60)
+    ev_relay_verify_interval_seconds: float = Field(default=2.0, gt=0, le=30)
+    ev_relay_verify_timeout_seconds: float = Field(default=30.0, ge=1, le=120)
+    ev_relay_failure_backoff_minutes: int = Field(default=30, ge=1, le=1440)
+    # Only this conservative fraction of same-day forecast surplus backs optional EV energy.
+    ev_forecast_surplus_factor: float = Field(default=0.8, ge=0, le=1)
+    # Opportunistic EV charging requires the house battery to still be projected to
+    # reach this SoC by the end of the current optimisation horizon.
+    ev_battery_full_soc_pct: float = Field(default=95.0, ge=50.0, le=100.0)
 
     # --- PV forecast ---
     pv_lat: float = 51.9194

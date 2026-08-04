@@ -1,116 +1,71 @@
 # energy-optimizer
 
-Solar + battery + flexible-load optimisation app for a Sigen PV/battery system on Pstryk
-dynamic pricing. Stationary Sigen control remains **dry-run only**: the app collects telemetry,
-plans battery/grid flows with a duration-aware explicit-flow MILP, and publishes recommendations
-to Home Assistant. An independent opt-in controller can switch a fixed-power EV/PHEV charger
-through Home Assistant while retaining fail-safe OFF behavior and anti-cycling delays.
+Solar + battery + optional EV/PHEV optimisation for a Sigen system on Pstryk dynamic
+pricing. Sigen control stays **dry-run only** (recommendations via MQTT). An opt-in
+controller can switch a fixed-power charger through Home Assistant with fail-safe OFF
+and anti-cycling delays.
 
-See [`DESIGN.md`](./DESIGN.md) for the full design.
+See [`DESIGN.md`](./DESIGN.md) for the design. Config reference: [`.env.example`](./.env.example).
 
 ## Docker-first
 
-This app is **only ever run in Docker** — there is no supported host-Python workflow. All
-common tasks are wrapped in the `Makefile` and the two compose files:
+Run only in Docker. Common tasks are in the `Makefile` and compose files:
 
-- `compose.yml` — production-style run (dry_run).
-- `compose.dev.yml` — hot-reloading dev server + a container for tests/lint.
+- `compose.yml` — production-style run
+- `compose.dev.yml` — hot-reload API + tests/lint
 
-The image is multi-stage (`Dockerfile`) with targets `frontend`, `python-base`, `dev` and
-`runtime`. The SPA is built inside the image; there is no separate frontend server in
-production.
-
-## Run it
+Multi-stage `Dockerfile` targets: `frontend`, `python-base`, `dev`, `runtime`. The SPA
+is baked into the runtime image.
 
 ```bash
-cp .env.example .env        # then fill in HA token, Pstryk key, MQTT creds, PV/site limits
+cp .env.example .env   # HA token, Pstryk key, MQTT, PV/site limits
 docker compose up -d --build
 ```
 
-- SPA + dashboards: <http://localhost:8320/>
-- Liveness (used by the Docker healthcheck): <http://localhost:8320/healthz>
-- REST API: under <http://localhost:8320/api/>
+| URL | Purpose |
+|---|---|
+| http://localhost:8320/ | SPA |
+| http://localhost:8320/healthz | Liveness |
+| http://localhost:8320/api/ | REST |
 
-State (the SQLite DB) is persisted to `./data` (mounted at `/data`).
+SQLite state lives in `./data` → `/data`.
 
 ```bash
-docker compose logs -f      # tail logs
-docker compose down         # stop
+docker compose logs -f
+docker compose down
 ```
 
 ## Develop
 
 ```bash
-cp .env.example .env
-docker compose -f compose.dev.yml up --build     # hot-reloading API on :8320
-```
-
-Source is bind-mounted, so edits reload automatically. For the SPA dev server with live
-proxy to the backend:
-
-```bash
-docker compose -f compose.dev.yml --profile frontend up frontend   # Vite on :5173
-```
-
-### Tests, lint, type-check (all in Docker)
-
-```bash
-make test        # pytest inside the dev image
+docker compose -f compose.dev.yml up --build              # API :8320
+docker compose -f compose.dev.yml --profile frontend up frontend  # Vite :5173
+make test        # pytest
 make lint        # ruff
 make typecheck   # mypy
-make shell       # a shell in the dev image
-```
-
-Equivalently, without make:
-
-```bash
-docker compose -f compose.dev.yml run --rm --no-deps app pytest -q
-docker compose -f compose.dev.yml run --rm --no-deps app ruff check src tests
+make shell
 ```
 
 ## Configuration
 
-All configuration is via environment variables (prefix `EO_`) or the `.env` file. See
-[`.env.example`](./.env.example) for the full list with defaults and comments. Required
-before real use: `EO_HA_TOKEN`, `EO_PSTRYK_API_KEY`, MQTT credentials, and the PV-plane /
-site grid / inverter limits.
+All settings use the `EO_` env prefix (see `.env.example`). Required for real use:
+`EO_HA_TOKEN`, `EO_PSTRYK_API_KEY`, MQTT credentials, PV planes, and site/inverter limits.
 
-EV control is disabled by default. When enabled, the optimiser guarantees the configured minimum
-vehicle SoC by the next departure hour, then shifts the remaining charge toward forecast solar or
-the cheapest grid intervals in the rolling horizon. It follows fixed 15-minute charging slots,
-forces the relay off for unplugged/unavailable/fault states, and respects minimum on/off times.
+EV control (`EO_EV_CONTROL_ENABLED`) is off by default. When on, the optimiser guarantees
+`EO_EV_MINIMUM_TARGET_SOC_PCT` by `EO_EV_DEPARTURE_HOUR`, then prefers solar/cheap grid
+slots. Relay OFF for unplugged/unavailable/fault; `EO_EV_CHARGE_TO_100_ENTITY` forces
+immediate full charge when ON.
 
 ## Deployment
 
-Production deployment is via the ansible-nas `energy_optimizer` role, which pulls the image
-from GHCR (no local build). Tagged releases are published automatically by GitHub Actions
-(see [basen](https://github.com/vanklompf/basen) for the same pattern):
+ansible-nas role `energy_optimizer` (GHCR pull or local build from this tree). Tag push
+publishes to GHCR:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-This builds and pushes to GHCR with tags `latest` and `v0.1.0`:
-
-- `ghcr.io/vanklompf/energy-optimizer:latest`
-- `ghcr.io/vanklompf/energy-optimizer:v0.1.0`
-
-To run a GHCR image with compose directly:
-
-```bash
+git tag v0.1.0 && git push origin v0.1.0
+# ghcr.io/vanklompf/energy-optimizer:latest and :v0.1.0
 EO_IMAGE=ghcr.io/vanklompf/energy-optimizer:latest docker compose up -d
 ```
-
-## Status
-
-Early development. Implemented so far:
-
-- Phase 1 (data spine): config, SQLite store, Pstryk unified-metrics client, HA client,
-  collector scheduler jobs, `/api/status`, `/healthz`.
-- Phase 2 (optimiser + simulator): explicit-flow duration-aware MILP (HiGHS via PuLP),
-  baseline policies, replay simulator, accounting, `POST /api/backtest`.
-- Scaffolding for forecasts, safety, explainability, MQTT publishing and the SPA.
 
 ## License
 

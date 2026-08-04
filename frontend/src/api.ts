@@ -62,6 +62,15 @@ export interface EvControl {
   target_soc_pct: number;
   minimum_target_soc_pct: number;
   departure_hour: number;
+  relay_settle_seconds: number;
+  relay_verify_interval_seconds: number;
+  relay_verify_timeout_seconds: number;
+  relay_failure_backoff_minutes: number;
+  opportunistic_grid_allowed: boolean;
+  forecast_surplus_factor: number;
+  battery_reserve_pct: number;
+  battery_full_target_pct: number;
+  policy_explanation: string;
   ts: string | null;
   desired_on: boolean;
   planned_on: boolean | null;

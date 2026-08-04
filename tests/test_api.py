@@ -40,6 +40,12 @@ def test_status_empty(client: TestClient) -> None:
     assert body["telemetry"] is None
     assert body["ev"] is None
     assert body["ev_control"]["enabled"] is False
+    assert body["ev_control"]["relay_settle_seconds"] == 5.0
+    assert body["ev_control"]["relay_verify_timeout_seconds"] == 30.0
+    assert body["ev_control"]["relay_failure_backoff_minutes"] == 30
+    assert body["ev_control"]["opportunistic_grid_allowed"] is False
+    assert body["ev_control"]["forecast_surplus_factor"] == 0.8
+    assert "battery above reserve" in body["ev_control"]["policy_explanation"]
 
 
 def test_status_exposes_vehicle_and_control_state(client: TestClient) -> None:

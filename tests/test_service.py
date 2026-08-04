@@ -7,15 +7,18 @@ from sqlalchemy import select
 
 from energy_optimizer.config import Settings
 from energy_optimizer.ev import EvRequirements
+from energy_optimizer.ev_control import EvControlDecision
 from energy_optimizer.ha_client import HaState
 from energy_optimizer.safety import SafetyReport, Status
 from energy_optimizer.service import (
     Service,
+    _apply_ev_relay_decision,
     _apply_ev_shortfall_warning,
     _ev_fault_status,
     _ev_live_state,
     _hourly_from_map,
     _hourly_mean_states,
+    _relay_failure_backoff_decision,
 )
 from energy_optimizer.store import (
     EvControlStatus,
@@ -30,6 +33,10 @@ from energy_optimizer.store import (
 )
 
 
+async def _no_sleep(_seconds: float) -> None:
+    return None
+
+
 def _settings() -> Settings:
     # pv_forecast_provider="none" keeps the optimiser path fully offline (no Forecast.Solar).
     return Settings(
@@ -40,6 +47,9 @@ def _settings() -> Settings:
         pv_forecast_provider="none",
         pv_planes=[],
         battery_capacity_kwh=10.0,
+        ev_relay_settle_seconds=0,
+        ev_relay_verify_interval_seconds=1,
+        ev_relay_verify_timeout_seconds=2,
         battery_max_charge_kw=5.0,
         battery_max_discharge_kw=5.0,
         battery_soc_min_pct=20.0,
@@ -235,7 +245,9 @@ async def test_collect_ev_telemetry_persists_vehicle_and_charger_state(monkeypat
     assert service.ev_charge_to_100_active is True
 
 
-async def test_run_optimise_adds_shadow_vehicle_slots_while_relay_control_is_disabled() -> None:
+async def test_run_optimise_adds_shadow_vehicle_slots_while_relay_control_is_disabled(
+    monkeypatch,
+) -> None:
     settings = _settings().model_copy(
         update={
             "ev_control_enabled": False,
@@ -248,6 +260,17 @@ async def test_run_optimise_adds_shadow_vehicle_slots_while_relay_control_is_dis
     store = Store(":memory:")
     store.create_all()
     service = Service(settings, store)
+
+    async def forecast_with_surplus(forecast_now, forecast_prices):
+        starts = [start for start, _ in service._interval_grid(forecast_prices, forecast_now)]
+        return (
+            {start: 1.0 for start in starts},
+            {start: 0.1 for start in starts},
+            "ok",
+            "ok",
+        )
+
+    monkeypatch.setattr(service, "_forecast_maps_live", forecast_with_surplus)
     now = utcnow()
     floor = now.replace(minute=0, second=0, microsecond=0)
     with store.session() as session:
@@ -299,6 +322,7 @@ async def test_run_optimise_adds_shadow_vehicle_slots_while_relay_control_is_dis
         )
     assert sum(step.charge_kwh for step in ev_steps) >= 10.9 * 0.10 / 0.9
     assert any(step.planned_on for step in ev_steps)
+    assert min(ev_steps, key=lambda step: step.interval_start).planned_on is True
 
 
 @pytest.mark.parametrize(
@@ -441,7 +465,7 @@ async def test_control_ev_charging_verifies_shelly_actuation_and_fails_safe(
 
     nonlocal_on_readback_raises = [on_readback_raises]
     monkeypatch.setattr("energy_optimizer.service.HaClient", FakeHaClient)
-    monkeypatch.setattr("energy_optimizer.service.EV_RELAY_VERIFY_DELAY_SECONDS", 0)
+    monkeypatch.setattr("energy_optimizer.service.asyncio.sleep", _no_sleep)
 
     await service.control_ev_charging(now=now, force_off=force_off)
 
@@ -542,7 +566,7 @@ async def test_control_ev_charging_immediate_override_ignores_deferred_plan(monk
             return HaState(entity_id, "on", now, {}, last_changed=now)
 
     monkeypatch.setattr("energy_optimizer.service.HaClient", FakeHaClient)
-    monkeypatch.setattr("energy_optimizer.service.EV_RELAY_VERIFY_DELAY_SECONDS", 0)
+    monkeypatch.setattr("energy_optimizer.service.asyncio.sleep", _no_sleep)
 
     await service.control_ev_charging(now=now)
 
@@ -555,3 +579,80 @@ async def test_control_ev_charging_immediate_override_ignores_deferred_plan(monk
     assert control is not None
     assert control.desired_on is True
     assert "immediate charging override" in control.reason
+
+
+async def test_relay_waits_for_settle_period_then_polls_until_confirmation(monkeypatch) -> None:
+    now = utcnow()
+    sleeps: list[float] = []
+    calls: list[tuple] = []
+    states = ["off", "on"]
+
+    class FakeHaClient:
+        async def call_service(self, domain, action, data) -> None:
+            calls.append((domain, action, data))
+
+        async def get_state(self, entity_id):
+            calls.append(("get_state", entity_id))
+            return HaState(entity_id, states.pop(0), now, {}, last_changed=now)
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("energy_optimizer.service.asyncio.sleep", fake_sleep)
+    decision = EvControlDecision(True, "turn_on", "forecast-backed opportunistic charging")
+
+    result = await _apply_ev_relay_decision(
+        FakeHaClient(),
+        "switch.garage",
+        decision,
+        settle_seconds=5.0,
+        verify_interval_seconds=2.0,
+        verify_timeout_seconds=30.0,
+    )
+
+    assert result == decision
+    assert sleeps == [5.0, 2.0]
+    assert calls == [
+        ("switch", "turn_on", {"entity_id": "switch.garage"}),
+        ("get_state", "switch.garage"),
+        ("get_state", "switch.garage"),
+    ]
+
+
+def test_confirmed_fallback_off_suppresses_relay_retry_during_backoff() -> None:
+    now = utcnow()
+    previous = EvControlStatus(
+        key="current",
+        ts=now - dt.timedelta(minutes=10),
+        desired_on=False,
+        planned_on=True,
+        action="turn_off",
+        reason="CRITICAL: turn_on verification failed; forced OFF confirmed",
+    )
+    candidate = EvControlDecision(True, "turn_on", "optimiser selected current charging slot")
+
+    decision = _relay_failure_backoff_decision(candidate, previous, now, 30)
+
+    assert decision.desired_on is False
+    assert decision.action == "none"
+    assert "relay retry backoff" in decision.reason
+    assert "20 minutes" in decision.reason
+
+
+def test_unconfirmed_fallback_keeps_requesting_fail_safe_off_during_backoff() -> None:
+    now = utcnow()
+    previous = EvControlStatus(
+        key="current",
+        ts=now - dt.timedelta(minutes=10),
+        desired_on=False,
+        planned_on=True,
+        action="turn_off",
+        reason="CRITICAL: turn_on verification failed; forced OFF could not be confirmed",
+    )
+    candidate = EvControlDecision(True, "turn_on", "optimiser selected current charging slot")
+
+    decision = _relay_failure_backoff_decision(candidate, previous, now, 30)
+
+    assert decision.desired_on is False
+    assert decision.action == "turn_off"
+    assert "physical OFF remains unconfirmed" in decision.reason

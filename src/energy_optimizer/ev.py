@@ -21,11 +21,36 @@ class EvRequirements:
     target_shortfall_slots: int = 0
 
 
+def same_day_forecast_surplus_kwh(
+    now: dt.datetime,
+    pv_by_start: dict[dt.datetime, float],
+    load_by_start: dict[dt.datetime, float],
+    *,
+    tz: str,
+    factor: float,
+) -> float:
+    """Return conservative future PV surplus remaining in the current local day."""
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=dt.UTC)
+    zone = ZoneInfo(tz)
+    today = now.astimezone(zone).date()
+    total = 0.0
+    for start, pv_kwh in pv_by_start.items():
+        aware_start = start if start.tzinfo else start.replace(tzinfo=dt.UTC)
+        if aware_start < now or aware_start.astimezone(zone).date() != today:
+            continue
+        total += max(0.0, pv_kwh - load_by_start.get(start, 0.0))
+    return total * max(0.0, min(1.0, factor))
+
+
 def build_ev_requirements(
     soc_pct: float,
     now: dt.datetime,
     interval_starts: list[dt.datetime],
     settings: Settings,
+    *,
+    forecast_surplus_kwh: float | None = None,
+    max_opportunistic_slots: int | None = None,
 ) -> EvRequirements:
     """Convert vehicle SoC targets into fixed-power charging slots.
 
@@ -58,12 +83,19 @@ def build_ev_requirements(
     available_soon = sum(1 for start in interval_starts if start < departure_at)
     target_required = slots_for(EV_FULL_TARGET_SOC_PCT)
     minimum_required = slots_for(settings.ev_minimum_target_soc_pct)
-    target_slots = min(target_required, available)
-    minimum_slots = min(minimum_required, available_soon, target_slots)
+    guaranteed_slots = min(minimum_required, available_soon)
+    if forecast_surplus_kwh is None:
+        target_slots = min(target_required, available)
+    else:
+        opportunistic_slots = max(0, math.floor(forecast_surplus_kwh / slot_kwh + 1e-12))
+        if max_opportunistic_slots is not None:
+            opportunistic_slots = min(opportunistic_slots, max(0, max_opportunistic_slots))
+        target_slots = min(target_required, available, guaranteed_slots + opportunistic_slots)
+    minimum_slots = min(guaranteed_slots, target_slots)
     return EvRequirements(
         departure_at,
         minimum_slots,
         target_slots,
         minimum_shortfall_slots=max(0, minimum_required - available_soon),
-        target_shortfall_slots=max(0, target_required - available),
+        target_shortfall_slots=max(0, target_required - target_slots),
     )

@@ -12,13 +12,20 @@ import datetime as dt
 import hashlib
 import json
 import logging
+import math
 import uuid
 from dataclasses import asdict
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, select
 
 from .config import Settings
-from .ev import EV_FULL_TARGET_SOC_PCT, EvRequirements, build_ev_requirements
+from .ev import (
+    EV_FULL_TARGET_SOC_PCT,
+    EvRequirements,
+    build_ev_requirements,
+    same_day_forecast_surplus_kwh,
+)
 from .ev_control import EvControlDecision, EvLiveState, decide_ev_control
 from .explain import classify_next_action
 from .forecast.load import LoadForecaster, LoadSample
@@ -52,12 +59,10 @@ from .store import (
 )
 
 LOAD_LOOKBACK_DAYS = 28
-EV_RELAY_VERIFY_ATTEMPTS = 3
-EV_RELAY_VERIFY_DELAY_SECONDS = 1.0
 
 logger = logging.getLogger(__name__)
 
-SOLVER_INPUT_SCHEMA = "1"
+SOLVER_INPUT_SCHEMA = "2"
 
 
 class Service:
@@ -191,7 +196,9 @@ class Service:
         now = now or utcnow()
         ev = self._latest_ev_telemetry()
         planned_on: bool | None = None
+        previous_control: EvControlStatus | None = None
         with self.store.session() as session:
+            previous_control = session.get(EvControlStatus, "current")
             run = session.execute(select(Run).order_by(Run.ts.desc()).limit(1)).scalar_one_or_none()
             if run is not None and (now - _aware(run.ts)).total_seconds() <= 30 * 60:
                 step = session.execute(
@@ -220,6 +227,12 @@ class Service:
                 force_charge=self.ev_charge_to_100_active,
             )
         )
+        decision = _relay_failure_backoff_decision(
+            decision,
+            previous_control,
+            now,
+            s.ev_relay_failure_backoff_minutes,
+        )
         if decision.action != "none":
             if not s.ha_token:
                 decision = EvControlDecision(
@@ -234,7 +247,12 @@ class Service:
                         s.ha_url, s.ha_token, verify_ssl=s.ha_verify_ssl
                     ) as ha:
                         decision = await _apply_ev_relay_decision(
-                            ha, s.ev_switch_entity, decision
+                            ha,
+                            s.ev_switch_entity,
+                            decision,
+                            settle_seconds=s.ev_relay_settle_seconds,
+                            verify_interval_seconds=s.ev_relay_verify_interval_seconds,
+                            verify_timeout_seconds=s.ev_relay_verify_timeout_seconds,
                         )
                 except Exception as exc:
                     logger.exception("EV Home Assistant control channel unavailable")
@@ -245,10 +263,17 @@ class Service:
                         f"({type(exc).__name__}); OFF could not be confirmed",
                     )
         with self.store.session() as session:
+            status_ts = (
+                previous_control.ts
+                if previous_control is not None
+                and decision.action == "none"
+                and "relay retry backoff" in decision.reason
+                else now
+            )
             session.merge(
                 EvControlStatus(
                     key="current",
-                    ts=now,
+                    ts=status_ts,
                     desired_on=decision.desired_on,
                     planned_on=planned_on,
                     action=decision.action,
@@ -375,6 +400,22 @@ class Service:
         known_hours = self._known_price_hours(prices, now)
 
         pv_map, load_map, pv_conf, load_conf = await self._forecast_maps_live(now, prices)
+        forecast_surplus_kwh = same_day_forecast_surplus_kwh(
+            now,
+            pv_map,
+            load_map,
+            tz=s.tz,
+            factor=s.ev_forecast_surplus_factor,
+        )
+        battery_target_kwh = s.battery_capacity_kwh * s.ev_battery_full_soc_pct / 100.0
+        battery_fill_input_kwh = max(
+            0.0,
+            battery_target_kwh
+            - ((soc_start_pct or s.battery_soc_min_pct) / 100.0 * s.battery_capacity_kwh),
+        ) / max(s.eta_charge, 1e-6)
+        # Optional EV energy is backed only by surplus left after the
+        # stationary battery's projected path to its full target.
+        ev_forecast_surplus_kwh = max(0.0, forecast_surplus_kwh - battery_fill_input_kwh)
         ev_live = self._latest_ev_telemetry()
         ev_row_fresh = bool(
             ev_live is not None
@@ -397,13 +438,23 @@ class Service:
                 else s.ev_start_charging_statuses
             )
         )
-        interval_starts = [start for start, _ in self._interval_grid(prices, now)]
+        candidate_intervals = self._build_intervals(
+            prices,
+            pv_map,
+            load_map,
+            now=now,
+            ev_available=ev_available,
+        )
+        interval_starts = [dt.datetime.fromisoformat(i.interval_start) for i in candidate_intervals]
+        max_opportunistic_slots = sum(i.ev_opportunistic_allowed for i in candidate_intervals)
         ev_requirements = (
             build_ev_requirements(
                 ev_live.soc_pct,
                 now,
                 interval_starts if ev_available else [],
                 s,
+                forecast_surplus_kwh=ev_forecast_surplus_kwh,
+                max_opportunistic_slots=max_opportunistic_slots,
             )
             if ev_soc_trustworthy and ev_live is not None and ev_live.soc_pct is not None
             else EvRequirements(now, 0, 0)
@@ -559,6 +610,7 @@ class Service:
             ev_charge_power_kw=s.ev_charge_power_kw if ev else 0.0,
             ev_target_slots=ev.target_slots if ev else 0,
             ev_minimum_slots=ev.minimum_slots if ev else 0,
+            ev_opportunistic_terminal_soc_kwh=s.battery_capacity_kwh * s.ev_battery_full_soc_pct / 100.0,
         )
 
     # --- helpers -----------------------------------------------------------
@@ -670,6 +722,14 @@ class Service:
                         ev_available=ev_available,
                         ev_required_soon=bool(
                             ev_available and ev_departure_at and start < ev_departure_at
+                        ),
+                        ev_opportunistic_allowed=bool(
+                            p.is_expensive is not True
+                            and (
+                                now is None
+                                or start.astimezone(ZoneInfo(self.settings.tz)).date()
+                                == now.astimezone(ZoneInfo(self.settings.tz)).date()
+                            )
                         ),
                     )
                 )
@@ -793,8 +853,50 @@ def _ev_live_state(ev: EvTelemetry | None, now: dt.datetime) -> EvLiveState:
     )
 
 
+def _relay_failure_backoff_decision(
+    candidate: EvControlDecision,
+    previous: EvControlStatus | None,
+    now: dt.datetime,
+    backoff_minutes: int,
+) -> EvControlDecision:
+    """Prevent repeated ON pulses after an ambiguous activation attempt."""
+    if not candidate.desired_on or previous is None:
+        return candidate
+    previous_reason = previous.reason or ""
+    previous_was_failed_on = (
+        ("CRITICAL:" in previous_reason and "turn_on" in previous_reason)
+        or "relay retry backoff" in previous_reason
+    )
+    if not previous_was_failed_on:
+        return candidate
+    elapsed = max(0.0, (now - _aware(previous.ts)).total_seconds())
+    remaining_seconds = backoff_minutes * 60 - elapsed
+    if remaining_seconds <= 0:
+        return candidate
+    remaining_minutes = max(1, math.ceil(remaining_seconds / 60))
+    if "could not be confirmed" in previous_reason:
+        return EvControlDecision(
+            False,
+            "turn_off",
+            "CRITICAL: relay retry backoff active and physical OFF remains unconfirmed; "
+            f"forcing OFF ({remaining_minutes} minutes remaining)",
+        )
+    return EvControlDecision(
+        False,
+        "none",
+        "relay retry backoff after turn_on verification failure; "
+        f"OFF was confirmed, retry allowed in {remaining_minutes} minutes",
+    )
+
+
 async def _apply_ev_relay_decision(
-    ha: HaClient, entity_id: str, decision: EvControlDecision
+    ha: HaClient,
+    entity_id: str,
+    decision: EvControlDecision,
+    *,
+    settle_seconds: float = 5.0,
+    verify_interval_seconds: float = 2.0,
+    verify_timeout_seconds: float = 30.0,
 ) -> EvControlDecision:
     """Actuate and verify a relay decision; every ambiguous outcome forces OFF."""
     if decision.action == "none":
@@ -802,18 +904,38 @@ async def _apply_ev_relay_decision(
 
     try:
         await ha.call_service("switch", decision.action, {"entity_id": entity_id})
-        if await _verify_ev_relay_state(ha, entity_id, decision.desired_on):
+        if await _verify_ev_relay_state(
+            ha,
+            entity_id,
+            decision.desired_on,
+            settle_seconds=settle_seconds,
+            interval_seconds=verify_interval_seconds,
+            timeout_seconds=verify_timeout_seconds,
+        ):
             return decision
         failure = f"{decision.action} actuation verification failed"
     except Exception as exc:  # timeout may follow a successful physical action
         logger.exception("EV relay %s outcome is ambiguous", decision.action)
         failure = f"{decision.action} outcome ambiguous ({type(exc).__name__})"
 
-    return await _force_ev_relay_off(ha, entity_id, failure)
+    return await _force_ev_relay_off(
+        ha,
+        entity_id,
+        failure,
+        settle_seconds=settle_seconds,
+        verify_interval_seconds=verify_interval_seconds,
+        verify_timeout_seconds=verify_timeout_seconds,
+    )
 
 
 async def _force_ev_relay_off(
-    ha: HaClient, entity_id: str, failure: str
+    ha: HaClient,
+    entity_id: str,
+    failure: str,
+    *,
+    settle_seconds: float,
+    verify_interval_seconds: float,
+    verify_timeout_seconds: float,
 ) -> EvControlDecision:
     errors: list[str] = []
     try:
@@ -822,7 +944,14 @@ async def _force_ev_relay_off(
         logger.exception("EV emergency turn_off service call failed")
         errors.append(f"turn_off error {type(exc).__name__}")
 
-    off_confirmed = await _verify_ev_relay_state(ha, entity_id, False)
+    off_confirmed = await _verify_ev_relay_state(
+        ha,
+        entity_id,
+        False,
+        settle_seconds=settle_seconds,
+        interval_seconds=verify_interval_seconds,
+        timeout_seconds=verify_timeout_seconds,
+    )
     if off_confirmed:
         suffix = "forced OFF confirmed"
     else:
@@ -834,17 +963,26 @@ async def _force_ev_relay_off(
     return EvControlDecision(False, "turn_off", alarm)
 
 
-async def _verify_ev_relay_state(ha: HaClient, entity_id: str, expected_on: bool) -> bool:
+async def _verify_ev_relay_state(
+    ha: HaClient,
+    entity_id: str,
+    expected_on: bool,
+    *,
+    settle_seconds: float,
+    interval_seconds: float,
+    timeout_seconds: float,
+) -> bool:
     """Allow HA time to observe the relay, retrying stale or failed readbacks."""
-    for attempt in range(1, EV_RELAY_VERIFY_ATTEMPTS + 1):
-        await asyncio.sleep(EV_RELAY_VERIFY_DELAY_SECONDS)
+    attempts = max(1, int((timeout_seconds - settle_seconds) // interval_seconds) + 1)
+    for attempt in range(1, attempts + 1):
+        await asyncio.sleep(settle_seconds if attempt == 1 else interval_seconds)
         try:
             actual = _state_bool(await ha.get_state(entity_id))
         except Exception as exc:
             logger.warning(
                 "EV relay readback failed (attempt %d/%d): %s",
                 attempt,
-                EV_RELAY_VERIFY_ATTEMPTS,
+                attempts,
                 exc,
             )
             continue
@@ -854,7 +992,7 @@ async def _verify_ev_relay_state(ha: HaClient, entity_id: str, expected_on: bool
             "EV relay state not yet %s (attempt %d/%d)",
             "ON" if expected_on else "OFF",
             attempt,
-            EV_RELAY_VERIFY_ATTEMPTS,
+            attempts,
         )
     return False
 

@@ -35,6 +35,7 @@ class IntervalInput:
     price_is_real: bool = True  # False for padded/forecast prices
     ev_available: bool = False
     ev_required_soon: bool = False
+    ev_opportunistic_allowed: bool = True
 
 
 @dataclass(slots=True)
@@ -58,6 +59,8 @@ class OptimiserParams:
     ev_charge_power_kw: float = 0.0
     ev_target_slots: int = 0
     ev_minimum_slots: int = 0
+    ev_early_start_value_pln_per_hour: float = 10.0
+    ev_opportunistic_terminal_soc_kwh: float = 0.0
 
 
 @dataclass(slots=True)
@@ -77,6 +80,8 @@ class PlanStepResult:
     soc_kwh_end: float
     soc_pct_end: float
     ev_charge_kwh: float = 0.0
+    ev_minimum_charge_kwh: float = 0.0
+    ev_opportunistic_charge_kwh: float = 0.0
     marginal_value: float | None = None
 
 
@@ -112,7 +117,8 @@ def optimise(
     grid_to_load, grid_to_batt, batt_to_load, batt_to_grid = [], [], [], []
     grid_import, grid_export = [], []
     soc = []  # soc[i] = SoC at END of interval i
-    is_charging, is_importing, is_ev_charging = [], [], []
+    is_charging, is_importing = [], []
+    is_ev_minimum, is_ev_opportunistic = [], []
 
     for i, itv in enumerate(intervals):
         pv_to_load.append(var("pv_to_load", i))
@@ -134,10 +140,25 @@ def optimise(
         )
         is_charging.append(pulp.LpVariable(f"is_charging_{i}", cat="Binary"))
         is_importing.append(pulp.LpVariable(f"is_importing_{i}", cat="Binary"))
-        is_ev_charging.append(
+        is_ev_minimum.append(
             pulp.LpVariable(f"is_ev_charging_{i}", cat="Binary")
-            if itv.ev_available and params.ev_charge_power_kw > 0
+            if (
+                itv.ev_available
+                and itv.ev_required_soon
+                and params.ev_charge_power_kw > 0
+                and params.ev_minimum_slots > 0
+            )
             else _zero(i, "ev")
+        )
+        is_ev_opportunistic.append(
+            pulp.LpVariable(f"is_ev_opportunistic_{i}", cat="Binary")
+            if (
+                itv.ev_available
+                and itv.ev_opportunistic_allowed
+                and params.ev_charge_power_kw > 0
+                and params.ev_target_slots > params.ev_minimum_slots
+            )
+            else _zero(i, "ev_opp")
         )
 
     # Objective: import cost - export revenue + degradation on battery-side throughput.
@@ -148,6 +169,13 @@ def optimise(
         obj_terms.append(-grid_export[i] * itv.sell_price)
         throughput = pv_to_batt[i] + grid_to_batt[i] + batt_to_load[i] + batt_to_grid[i]
         obj_terms.append(throughput * params.degradation_cost_pln_per_kwh)
+        # User preference: once forecast-backed, opportunistic EV energy is front-loaded.
+        obj_terms.append(
+            is_ev_opportunistic[i]
+            * i
+            * itv.dt_hours
+            * params.ev_early_start_value_pln_per_hour
+        )
     if params.terminal_soc_salvage_pln_kwh and not params.preserve_terminal_soc:
         obj_terms.append(-soc[n - 1] * params.terminal_soc_salvage_pln_kwh)
     prob += pulp.lpSum(obj_terms)
@@ -163,8 +191,18 @@ def optimise(
         prob += (
             pv_to_load[i] + grid_to_load[i] + batt_to_load[i] * params.eta_discharge
             == itv.load_energy_kwh
-            + is_ev_charging[i] * params.ev_charge_power_kw * itv.dt_hours
+            + (is_ev_minimum[i] + is_ev_opportunistic[i])
+            * params.ev_charge_power_kw
+            * itv.dt_hours
         ), f"load_supply_{i}"
+        prob += is_ev_minimum[i] + is_ev_opportunistic[i] <= 1, f"ev_mode_{i}"
+        # Guaranteed pre-departure energy may use grid. During a normal opportunistic
+        # slot the complete site import must be zero: PV plus stationary battery above
+        # reserve must cover both the house and EV.
+        prob += (
+            grid_import[i]
+            <= params.site_import_limit_kw * itv.dt_hours * (1 - is_ev_opportunistic[i])
+        ), f"ev_no_grid_import_{i}"
         # Grid import/export composition.
         prob += (
             grid_import[i] == grid_to_load[i] + grid_to_batt[i] / params.eta_charge
@@ -201,14 +239,19 @@ def optimise(
     if params.preserve_terminal_soc:
         prob += soc[n - 1] >= soc_start_kwh, "terminal_preserve"
 
-    prob += pulp.lpSum(is_ev_charging) == params.ev_target_slots, "ev_target_slots"
-    if params.ev_minimum_slots:
-        prob += (
-            pulp.lpSum(
-                is_ev_charging[i] for i, itv in enumerate(intervals) if itv.ev_required_soon
-            )
-            >= params.ev_minimum_slots
-        ), "ev_minimum_slots"
+    prob += pulp.lpSum(is_ev_minimum) == params.ev_minimum_slots, "ev_minimum_slots"
+    prob += (
+        pulp.lpSum(is_ev_opportunistic)
+        == max(0, params.ev_target_slots - params.ev_minimum_slots)
+    ), "ev_opportunistic_slots"
+
+    # Forecast-backed opportunistic charging is permitted only when the same plan
+    # still fills the stationary battery to its configured target. Do not let the
+    # solver satisfy that terminal condition by importing energy into the battery.
+    if params.ev_opportunistic_terminal_soc_kwh > 0 and params.ev_target_slots > params.ev_minimum_slots:
+        prob += soc[n - 1] >= params.ev_opportunistic_terminal_soc_kwh, "ev_battery_filled_later"
+        for i in range(n):
+            prob += grid_to_batt[i] == 0, f"ev_no_grid_battery_recovery_{i}"
 
     chosen_solver = solver or _default_solver(msg=msg)
     try:
@@ -250,7 +293,15 @@ def optimise(
                 soc_pct_end=100.0 * soc_end / params.battery_capacity_kwh
                 if params.battery_capacity_kwh
                 else 0.0,
-                ev_charge_kwh=_val(is_ev_charging[i]) * params.ev_charge_power_kw * itv.dt_hours,
+                ev_charge_kwh=(_val(is_ev_minimum[i]) + _val(is_ev_opportunistic[i]))
+                * params.ev_charge_power_kw
+                * itv.dt_hours,
+                ev_minimum_charge_kwh=_val(is_ev_minimum[i])
+                * params.ev_charge_power_kw
+                * itv.dt_hours,
+                ev_opportunistic_charge_kwh=_val(is_ev_opportunistic[i])
+                * params.ev_charge_power_kw
+                * itv.dt_hours,
             )
         )
 
