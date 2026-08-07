@@ -5,6 +5,14 @@ pricing. Sigen control stays **dry-run only** (recommendations via MQTT). An opt
 controller can switch a fixed-power charger through Home Assistant with fail-safe OFF
 and anti-cycling delays.
 
+Settled Pstryk meter values are the sole source for billed import/export, savings,
+backtests, and historical load calibration. PvOpti deliberately does not fall back to
+Sigen grid counters when Pstryk has not settled an interval. Sigen remains in use only
+for live behind-the-meter power, PV, battery, and SoC telemetry needed by the controller.
+Counterfactuals require contiguous hourly settlement and price data plus coverage-checked,
+time-integrated PV and battery telemetry; incomplete hours are reported instead of being
+zero-filled or compressed out of time.
+
 See [`DESIGN.md`](./DESIGN.md) for the design. Config reference: [`.env.example`](./.env.example).
 
 ## Docker-first

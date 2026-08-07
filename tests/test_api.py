@@ -4,6 +4,7 @@ import datetime as dt
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import delete
 
 from energy_optimizer.config import Settings
 from energy_optimizer.store import (
@@ -12,6 +13,7 @@ from energy_optimizer.store import (
     EvTelemetry,
     PlanStep,
     Price,
+    PstrykMeterInterval,
     Run,
     Telemetry,
 )
@@ -45,7 +47,34 @@ def test_status_empty(client: TestClient) -> None:
     assert body["ev_control"]["relay_failure_backoff_minutes"] == 30
     assert body["ev_control"]["opportunistic_grid_allowed"] is False
     assert body["ev_control"]["forecast_surplus_factor"] == 0.8
-    assert "battery above reserve" in body["ev_control"]["policy_explanation"]
+    assert "battery reserve is protected" in body["ev_control"]["policy_explanation"]
+    assert body["billing_meter"] is None
+
+
+def test_status_exposes_latest_pstryk_billing_interval(client: TestClient) -> None:
+    store = client.app.state.store
+    start = dt.datetime.now(tz=dt.UTC).replace(minute=0, second=0, microsecond=0) - dt.timedelta(
+        hours=1
+    )
+    with store.session() as session:
+        session.add(
+            PstrykMeterInterval(
+                interval_start=start,
+                interval_end=start + dt.timedelta(hours=1),
+                import_kwh=0.053,
+                export_kwh=0.149,
+                balance_kwh=-0.096,
+                source="pstryk",
+            )
+        )
+
+    meter = client.get("/api/status").json()["billing_meter"]
+
+    assert meter["source"] == "pstryk"
+    assert meter["interval_start"] == start.isoformat()
+    assert meter["import_kwh"] == 0.053
+    assert meter["export_kwh"] == 0.149
+    assert meter["settled"] is True
 
 
 def test_status_exposes_vehicle_and_control_state(client: TestClient) -> None:
@@ -122,7 +151,7 @@ def test_plan_includes_ev_charging_energy(client: TestClient) -> None:
     assert body["steps"][0]["ev_planned_on"] is True
 
 
-def _seed(app_store, base: dt.datetime) -> None:
+def _seed(app_store, base: dt.datetime, *, include_meter: bool = True) -> None:
     with app_store.session() as session:
         for h in range(6):
             ts = base + dt.timedelta(hours=h)
@@ -136,19 +165,31 @@ def _seed(app_store, base: dt.datetime) -> None:
                     source="api",
                 )
             )
-            session.add(
-                Telemetry(
-                    ts=ts,
-                    soc_pct=50.0,
-                    pv_kw=0.0,
-                    load_kw=1.0,
-                    grid_import_kw=1.0,
-                    grid_export_kw=0.0,
-                    batt_charge_kw=0.0,
-                    batt_discharge_kw=0.0,
-                    stale=False,
+            for minute in (0, 15, 30, 45):
+                session.add(
+                    Telemetry(
+                        ts=ts + dt.timedelta(minutes=minute),
+                        soc_pct=50.0,
+                        pv_kw=0.0,
+                        load_kw=1.0,
+                        grid_import_kw=1.0,
+                        grid_export_kw=0.0,
+                        batt_charge_kw=0.0,
+                        batt_discharge_kw=0.0,
+                        stale=False,
+                    )
                 )
-            )
+            if include_meter:
+                session.add(
+                    PstrykMeterInterval(
+                        interval_start=ts,
+                        interval_end=ts + dt.timedelta(hours=1),
+                        import_kwh=1.0,
+                        export_kwh=0.0,
+                        balance_kwh=1.0,
+                        source="pstryk",
+                    )
+                )
 
 
 def test_backtest_returns_comparison(client: TestClient, settings: Settings) -> None:
@@ -166,10 +207,161 @@ def test_backtest_returns_comparison(client: TestClient, settings: Settings) -> 
     assert resp.status_code == 200
     body = resp.json()
     assert body["intervals"] == 6
+    assert body["settled_start"] == base.isoformat()
+    assert body["settled_end"] == (base + dt.timedelta(hours=6)).isoformat()
     policies = {r["policy"] for r in body["results"]}
     assert "optimiser" in policies
     assert "self_consumption" in policies
-    assert "actual_sigen" in policies
+    assert "actual_pstryk" in policies
+
+
+def test_backtest_uses_pstryk_meter_as_authoritative_actual(client: TestClient) -> None:
+    store = client.app.state.store
+    base = dt.datetime(2026, 8, 7, 7, 0, tzinfo=dt.UTC)
+    _seed(store, base, include_meter=False)
+    with store.session() as session:
+        for h in range(6):
+            ts = base + dt.timedelta(hours=h)
+            session.add(
+                PstrykMeterInterval(
+                    interval_start=ts,
+                    interval_end=ts + dt.timedelta(hours=1),
+                    import_kwh=0.1,
+                    export_kwh=0.2,
+                    balance_kwh=-0.1,
+                    source="pstryk",
+                )
+            )
+
+    body = client.post(
+        "/api/backtest",
+        json={
+            "start": base.isoformat(),
+            "end": (base + dt.timedelta(hours=6)).isoformat(),
+            "policies": [],
+        },
+    ).json()
+
+    actual = next(result for result in body["results"] if result["policy"] == "actual_pstryk")
+    assert actual["import_kwh"] == 0.6
+    assert actual["export_kwh"] == 1.2
+
+
+def test_backtest_refuses_unsettled_range_instead_of_using_sigen(client: TestClient) -> None:
+    store = client.app.state.store
+    base = dt.datetime(2026, 8, 6, 0, 0, tzinfo=dt.UTC)
+    _seed(store, base, include_meter=False)
+
+    response = client.post(
+        "/api/backtest",
+        json={
+            "start": base.isoformat(),
+            "end": (base + dt.timedelta(hours=6)).isoformat(),
+            "policies": [],
+        },
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "no settled Pstryk meter data in range"
+
+
+def test_backtest_rejects_incomplete_live_telemetry(client: TestClient) -> None:
+    store = client.app.state.store
+    base = dt.datetime(2026, 8, 5, 0, 0, tzinfo=dt.UTC)
+    _seed(store, base)
+    with store.session() as session:
+        session.execute(delete(Telemetry).where(Telemetry.ts > base))
+
+    response = client.post(
+        "/api/backtest",
+        json={"start": base.isoformat(), "end": (base + dt.timedelta(hours=6)).isoformat()},
+    )
+
+    assert response.status_code == 422
+    assert "incomplete live telemetry" in response.json()["detail"]
+
+
+def test_backtest_rejects_internal_settlement_gap(client: TestClient) -> None:
+    store = client.app.state.store
+    base = dt.datetime(2026, 8, 4, 0, 0, tzinfo=dt.UTC)
+    _seed(store, base)
+    with store.session() as session:
+        session.execute(
+            delete(PstrykMeterInterval).where(
+                PstrykMeterInterval.interval_start == base + dt.timedelta(hours=2)
+            )
+        )
+
+    response = client.post(
+        "/api/backtest",
+        json={"start": base.isoformat(), "end": (base + dt.timedelta(hours=6)).isoformat()},
+    )
+
+    assert response.status_code == 422
+    assert "settlement gap" in response.json()["detail"]
+
+
+def test_backtest_rejects_missing_leading_or_trailing_settlement(client: TestClient) -> None:
+    store = client.app.state.store
+    base = dt.datetime(2026, 8, 3, 0, 0, tzinfo=dt.UTC)
+    _seed(store, base)
+
+    leading = client.post(
+        "/api/backtest",
+        json={
+            "start": (base - dt.timedelta(hours=1)).isoformat(),
+            "end": (base + dt.timedelta(hours=6)).isoformat(),
+        },
+    )
+    trailing = client.post(
+        "/api/backtest",
+        json={
+            "start": base.isoformat(),
+            "end": (base + dt.timedelta(hours=7)).isoformat(),
+        },
+    )
+
+    assert leading.status_code == 422
+    assert "missing leading settlement" in leading.json()["detail"]
+    assert trailing.status_code == 422
+    assert "missing trailing settlement" in trailing.json()["detail"]
+
+
+def test_backtest_rejects_missing_sell_price_and_boundary_soc(client: TestClient) -> None:
+    store = client.app.state.store
+    base = dt.datetime(2026, 8, 2, 0, 0, tzinfo=dt.UTC)
+    _seed(store, base)
+    with store.session() as session:
+        price = session.get(Price, base)
+        assert price is not None
+        price.sell_gross = None
+
+    missing_price = client.post(
+        "/api/backtest",
+        json={"start": base.isoformat(), "end": (base + dt.timedelta(hours=6)).isoformat()},
+    )
+    assert missing_price.status_code == 422
+    assert "missing settled price" in missing_price.json()["detail"]
+
+    with store.session() as session:
+        price = session.get(Price, base)
+        assert price is not None
+        price.sell_gross = 0.1
+        first_hour = (
+            session.query(Telemetry)
+            .filter(Telemetry.ts >= base)
+            .filter(Telemetry.ts < base + dt.timedelta(hours=1))
+            .all()
+        )
+        for row in first_hour:
+            row.soc_pct = None
+
+    missing_soc = client.post(
+        "/api/backtest",
+        json={"start": base.isoformat(), "end": (base + dt.timedelta(hours=6)).isoformat()},
+    )
+    assert missing_soc.status_code == 422
+    assert "missing fresh battery SoC" in missing_soc.json()["detail"]
 
 
 def test_backtest_no_data_404(client: TestClient) -> None:
@@ -183,7 +375,7 @@ def test_backtest_no_data_404(client: TestClient) -> None:
 def _seed_hours(app_store, end: dt.datetime, hours: int) -> None:
     with app_store.session() as session:
         for h in range(hours):
-            ts = end - dt.timedelta(hours=h)
+            ts = end - dt.timedelta(hours=h + 1)
             buy = 0.2 if ts.hour < 6 else 2.0
             session.add(
                 Price(
@@ -194,17 +386,28 @@ def _seed_hours(app_store, end: dt.datetime, hours: int) -> None:
                     source="api",
                 )
             )
+            for minute in (0, 15, 30, 45):
+                session.add(
+                    Telemetry(
+                        ts=ts + dt.timedelta(minutes=minute),
+                        soc_pct=50.0,
+                        pv_kw=0.0,
+                        load_kw=1.0,
+                        grid_import_kw=1.0,
+                        grid_export_kw=0.0,
+                        batt_charge_kw=0.0,
+                        batt_discharge_kw=0.0,
+                        stale=False,
+                    )
+                )
             session.add(
-                Telemetry(
-                    ts=ts,
-                    soc_pct=50.0,
-                    pv_kw=0.0,
-                    load_kw=1.0,
-                    grid_import_kw=1.0,
-                    grid_export_kw=0.0,
-                    batt_charge_kw=0.0,
-                    batt_discharge_kw=0.0,
-                    stale=False,
+                PstrykMeterInterval(
+                    interval_start=ts,
+                    interval_end=ts + dt.timedelta(hours=1),
+                    import_kwh=1.0,
+                    export_kwh=0.0,
+                    balance_kwh=1.0,
+                    source="pstryk",
                 )
             )
 

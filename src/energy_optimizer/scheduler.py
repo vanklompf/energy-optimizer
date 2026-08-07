@@ -2,7 +2,7 @@
 
 Jobs (single Uvicorn process to avoid duplicate jobs):
 - collect telemetry: every 1 minute
-- refresh prices: every 15 minutes
+- refresh Pstryk prices and settled meter values: every 15 minutes
 - optimise: every 15 minutes (aligned)
 - daily report: 00:15 local
 
@@ -38,7 +38,11 @@ def build_scheduler(service: Service) -> AsyncIOScheduler:
         try:
             await service.refresh_prices()
         except Exception:  # pragma: no cover - defensive
-            logger.exception("refresh_prices job failed")
+            logger.exception("Pstryk price refresh job failed")
+        try:
+            await service.refresh_meter_values()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("Pstryk meter refresh job failed")
 
     async def _ev_control() -> None:
         async with ev_pipeline_lock:
@@ -112,7 +116,5 @@ def build_scheduler(service: Service) -> AsyncIOScheduler:
         coalesce=True,
     )
     # Daily report placeholder job runs at 00:15 local; report generation is Phase 4.
-    scheduler.add_job(
-        _optimise, CronTrigger(hour=0, minute=15), id="daily_report", max_instances=1
-    )
+    scheduler.add_job(_optimise, CronTrigger(hour=0, minute=15), id="daily_report", max_instances=1)
     return scheduler

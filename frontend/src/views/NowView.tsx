@@ -164,6 +164,7 @@ export default function NowView() {
 
   const t = data.telemetry;
   const price = data.current_price;
+  const meter = data.billing_meter;
   const run = data.last_run;
   const ev = data.ev;
   const evControl = data.ev_control;
@@ -182,8 +183,8 @@ export default function NowView() {
             <li><span>Battery discharge</span><b>{fmt(t?.batt_discharge_kw, " kW")}</b></li>
             <li><span>PV</span><b>{fmt(t?.pv_kw, " kW")}</b></li>
             <li><span>Load</span><b>{fmt(t?.load_kw, " kW")}</b></li>
-            <li><span>Grid import</span><b>{fmt(t?.grid_import_kw, " kW")}</b></li>
-            <li><span>Grid export</span><b>{fmt(t?.grid_export_kw, " kW")}</b></li>
+            <li><span>Grid import (live inverter)</span><b>{fmt(t?.grid_import_kw, " kW")}</b></li>
+            <li><span>Grid export (live inverter)</span><b>{fmt(t?.grid_export_kw, " kW")}</b></li>
             <li><span>EMS mode</span><b>{t?.ems_mode ?? "—"}</b></li>
           </ul>
         </section>
@@ -215,6 +216,18 @@ export default function NowView() {
         </section>
 
         <section className="panel">
+          <h2>Pstryk billing meter</h2>
+          <ul className="metrics">
+            <li><span>Latest settled hour</span><b>{meter ? new Date(meter.interval_start).toLocaleString() : "—"}</b></li>
+            <li><span>Imported</span><b>{fmt(meter?.import_kwh, " kWh", 3)}</b></li>
+            <li><span>Exported</span><b>{fmt(meter?.export_kwh, " kWh", 3)}</b></li>
+            <li><span>Net balance</span><b>{fmt(meter?.balance_kwh, " kWh", 3)}</b></li>
+            <li><span>Source</span><b>{meter?.source ?? "waiting for settled data"}</b></li>
+          </ul>
+          <p className="muted">Billing, savings, backtests, and load calibration use only settled Pstryk meter data. Inverter grid readings are retained solely for live control.</p>
+        </section>
+
+        <section className="panel">
           <h2>Price now</h2>
           <ul className="metrics">
             <li><span>Buy</span><b>{fmt(price?.buy_gross, " PLN/kWh", 3)}</b></li>
@@ -238,10 +251,10 @@ export default function NowView() {
               <ul className="metrics">
                 <li><span>Expected value</span><b>{fmt(run.objective_pln ? -run.objective_pln : null, " PLN")}</b></li>
                 <li><span>Known prices</span><b>{fmt(run.known_price_hours, " h", 0)}</b></li>
-                <li title="Realised: measured cost minus optimiser cost over recorded data">
+                <li title="Realised: Pstryk-settled cost minus optimiser cost over the same settled intervals">
                   <span>Saved today</span><b>{fmt(savings?.day.savings_pln, " PLN")}</b>
                 </li>
-                <li title="Realised: measured cost minus optimiser cost over recorded data">
+                <li title="Realised: Pstryk-settled cost minus optimiser cost over the same settled intervals">
                   <span>Saved 7 days</span><b>{fmt(savings?.week.savings_pln, " PLN")}</b>
                 </li>
               </ul>

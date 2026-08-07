@@ -9,6 +9,7 @@ import respx
 from energy_optimizer.pstryk_client import (
     PstrykClient,
     _parse_frames,
+    _parse_meter_frames,
     known_price_horizon_hours,
 )
 
@@ -43,6 +44,96 @@ SAMPLE = {
     ],
     "summary": {},
 }
+
+METER_SAMPLE = {
+    "frames": [
+        {
+            "start": "2026-08-07T07:00:00Z",
+            "end": "2026-08-07T08:00:00Z",
+            "metrics": {
+                "meter_values": {
+                    "energy_active_import_register": 0.053,
+                    "energy_active_export_register": 0.149,
+                    "energy_balance": -0.096,
+                }
+            },
+        },
+        {
+            "start": "2026-08-07T08:00:00Z",
+            "end": "2026-08-07T09:00:00Z",
+            "metrics": {
+                "meter_values": {
+                    "energy_active_import_register": None,
+                    "energy_active_export_register": None,
+                    "energy_balance": None,
+                }
+            },
+        },
+    ],
+    "summary": {},
+}
+
+
+def test_parse_meter_frames_keeps_settled_energy_and_ignores_unavailable_hours() -> None:
+    frames = _parse_meter_frames(METER_SAMPLE)
+
+    assert len(frames) == 1
+    assert frames[0].interval_start == dt.datetime(2026, 8, 7, 7, 0, tzinfo=dt.UTC)
+    assert frames[0].interval_end == dt.datetime(2026, 8, 7, 8, 0, tzinfo=dt.UTC)
+    assert frames[0].import_kwh == 0.053
+    assert frames[0].export_kwh == 0.149
+    assert frames[0].balance_kwh == -0.096
+
+
+def test_parse_meter_frames_discards_interval_that_has_not_ended() -> None:
+    data = {
+        "frames": [
+            {
+                "start": "2026-08-07T20:00:00Z",
+                "end": "2026-08-07T21:00:00Z",
+                "metrics": {
+                    "meter_values": {
+                        "energy_active_import_register": 0.1,
+                        "energy_active_export_register": 0.0,
+                    }
+                },
+            }
+        ]
+    }
+
+    frames = _parse_meter_frames(
+        data, settled_before=dt.datetime(2026, 8, 7, 20, 30, tzinfo=dt.UTC)
+    )
+
+    assert frames == []
+
+
+def test_parse_meter_frames_rejects_live_non_hourly_and_invalid_energy() -> None:
+    base = {
+        "start": "2026-08-07T07:00:00Z",
+        "end": "2026-08-07T08:00:00Z",
+        "metrics": {
+            "meter_values": {
+                "energy_active_import_register": 0.1,
+                "energy_active_export_register": 0.2,
+                "energy_balance": -0.1,
+            }
+        },
+    }
+    live = {**base, "is_live": True}
+    non_hourly = {**base, "end": "2026-08-07T07:30:00Z"}
+    invalid = {
+        **base,
+        "metrics": {
+            "meter_values": {
+                "energy_active_import_register": -0.1,
+                "energy_active_export_register": 0.2,
+                "energy_balance": -0.3,
+            }
+        },
+    }
+
+    assert _parse_meter_frames({"frames": [live, non_hourly, invalid]}) == []
 
 
 def test_parse_frames_prefers_full_price() -> None:
@@ -99,6 +190,23 @@ async def test_fetch_pricing_sends_raw_auth_header() -> None:
     request = route.calls.last.request
     assert request.headers["Authorization"] == "secret-key"  # no Bearer prefix
     assert "Bearer" not in request.headers["Authorization"]
+
+
+@respx.mock
+async def test_fetch_meter_values_requests_authoritative_hourly_registers() -> None:
+    route = respx.get("https://api.pstryk.pl/integrations/meter-data/unified-metrics/").mock(
+        return_value=httpx.Response(200, json=METER_SAMPLE)
+    )
+    async with PstrykClient("secret-key") as client:
+        frames = await client.fetch_meter_values(
+            dt.datetime(2026, 8, 7, tzinfo=dt.UTC),
+            dt.datetime(2026, 8, 8, tzinfo=dt.UTC),
+        )
+
+    assert len(frames) == 1
+    request = route.calls.last.request
+    assert request.url.params["metrics"] == "meter_values"
+    assert request.url.params["resolution"] == "hour"
 
 
 @respx.mock

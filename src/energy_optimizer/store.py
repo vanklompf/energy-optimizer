@@ -83,6 +83,21 @@ class Price(Base):
     fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class PstrykMeterInterval(Base):
+    """Settled energy measured by Pstryk's billing meter for one interval."""
+
+    __tablename__ = "pstryk_meter_intervals"
+
+    interval_start: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
+    interval_end: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
+    import_kwh: Mapped[float] = mapped_column(Float)
+    export_kwh: Mapped[float] = mapped_column(Float)
+    balance_kwh: Mapped[float | None] = mapped_column(Float)
+    resolution: Mapped[str] = mapped_column(String(16), default="hour")
+    source: Mapped[str] = mapped_column(String(16), default="pstryk")
+    fetched_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class Forecast(Base):
     __tablename__ = "forecasts"
 

@@ -248,8 +248,14 @@ def optimise(
     # Forecast-backed opportunistic charging is permitted only when the same plan
     # still fills the stationary battery to its configured target. Do not let the
     # solver satisfy that terminal condition by importing energy into the battery.
-    if params.ev_opportunistic_terminal_soc_kwh > 0 and params.ev_target_slots > params.ev_minimum_slots:
-        prob += soc[n - 1] >= params.ev_opportunistic_terminal_soc_kwh, "ev_battery_filled_later"
+    if (
+        params.ev_opportunistic_terminal_soc_kwh > 0
+        and params.ev_target_slots > params.ev_minimum_slots
+    ):
+        prob += (
+            soc[n - 1] >= params.ev_opportunistic_terminal_soc_kwh,
+            "ev_battery_filled_later",
+        )
         for i in range(n):
             prob += grid_to_batt[i] == 0, f"ev_no_grid_battery_recovery_{i}"
 

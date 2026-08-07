@@ -52,11 +52,13 @@ from .store import (
     Forecast,
     PlanStep,
     Price,
+    PstrykMeterInterval,
     Run,
     Store,
     Telemetry,
     utcnow,
 )
+from .telemetry_energy import complete_hourly_energy
 
 LOAD_LOOKBACK_DAYS = 28
 
@@ -157,9 +159,7 @@ class Service:
         switch_on = _state_bool(switch)
         soc_pct = soc.as_float() if soc else None
         charging_status = (
-            status.state
-            if status and status.state not in {"unknown", "unavailable"}
-            else None
+            status.state if status and status.state not in {"unknown", "unavailable"} else None
         )
         power_w = power.as_float() if power else None
         row = EvTelemetry(
@@ -171,10 +171,7 @@ class Service:
             switch_changed=switch.last_changed if switch else None,
             power_kw=power_w / 1000.0 if power_w is not None else None,
             fault=fault,
-            stale=fault_stale
-            or soc_pct is None
-            or charging_status is None
-            or switch_on is None,
+            stale=fault_stale or soc_pct is None or charging_status is None or switch_on is None,
         )
         with self.store.session() as session:
             session.add(row)
@@ -243,9 +240,7 @@ class Service:
                 logger.error("EV charger actuation alarm: %s", decision.reason)
             else:
                 try:
-                    async with HaClient(
-                        s.ha_url, s.ha_token, verify_ssl=s.ha_verify_ssl
-                    ) as ha:
+                    async with HaClient(s.ha_url, s.ha_token, verify_ssl=s.ha_verify_ssl) as ha:
                         decision = await _apply_ev_relay_decision(
                             ha,
                             s.ev_switch_entity,
@@ -319,6 +314,46 @@ class Service:
         logger.info("Refreshed %d price frames", count)
         return count
 
+    async def refresh_meter_values(self, days_back: int = 7) -> int:
+        """Reconcile complete Pstryk billing intervals in the refreshed window."""
+        s = self.settings
+        if not s.pstryk_api_key:
+            logger.debug("No Pstryk key configured; skipping meter refresh")
+            return 0
+        now = utcnow()
+        end = now.replace(minute=0, second=0, microsecond=0) + dt.timedelta(hours=1)
+        start = end - dt.timedelta(days=max(1, days_back))
+        async with PstrykClient(s.pstryk_api_key, s.pstryk_base_url) as client:
+            frames = await client.fetch_meter_values(start, end, resolution="hour")
+        fetched_at = utcnow()
+        accepted_starts = [frame.interval_start for frame in frames]
+        with self.store.session() as session:
+            stale_rows = (
+                delete(PstrykMeterInterval)
+                .where(PstrykMeterInterval.interval_start >= start)
+                .where(PstrykMeterInterval.interval_end <= now)
+            )
+            if accepted_starts:
+                stale_rows = stale_rows.where(
+                    PstrykMeterInterval.interval_start.not_in(accepted_starts)
+                )
+            session.execute(stale_rows)
+            for frame in frames:
+                session.merge(
+                    PstrykMeterInterval(
+                        interval_start=frame.interval_start,
+                        interval_end=frame.interval_end,
+                        import_kwh=frame.import_kwh,
+                        export_kwh=frame.export_kwh,
+                        balance_kwh=frame.balance_kwh,
+                        resolution="hour",
+                        source="pstryk",
+                        fetched_at=fetched_at,
+                    )
+                )
+        logger.info("Refreshed %d authoritative Pstryk meter intervals", len(frames))
+        return len(frames)
+
     async def bootstrap(self) -> None:
         """One-shot startup backfill so backtests and the price chart have history
         immediately instead of only after hours/days of live collection."""
@@ -328,6 +363,10 @@ class Service:
                 await self.refresh_prices(history_days=days)
             except Exception:  # pragma: no cover - network dependent
                 logger.exception("price history bootstrap failed")
+            try:
+                await self.refresh_meter_values(days_back=days)
+            except Exception:  # pragma: no cover - network dependent
+                logger.exception("Pstryk meter history bootstrap failed")
         try:
             await self.bootstrap_telemetry_history(days)
         except Exception:  # pragma: no cover - network dependent
@@ -340,13 +379,21 @@ class Service:
         if not s.ha_token or days <= 0:
             return 0
         now = utcnow()
-        start = now - dt.timedelta(days=days)
+        start = (now - dt.timedelta(days=days)).replace(minute=0, second=0, microsecond=0)
+        completed_end = now.replace(minute=0, second=0, microsecond=0)
         with self.store.session() as session:
-            earliest = session.execute(
-                select(Telemetry.ts).order_by(Telemetry.ts).limit(1)
-            ).scalar_one_or_none()
-        if earliest is not None and _aware(earliest) <= start + dt.timedelta(hours=1):
-            logger.info("Telemetry history already present; skipping bootstrap")
+            probe = (
+                session.execute(
+                    select(Telemetry.ts)
+                    .where(Telemetry.ts >= start)
+                    .where(Telemetry.ts < start + dt.timedelta(hours=1))
+                    .limit(4)
+                )
+                .scalars()
+                .all()
+            )
+        if len(probe) >= 4:
+            logger.info("Coverage-capable telemetry history already present; skipping bootstrap")
             return 0
         entities = {
             "soc_pct": ENTITY_SOC,
@@ -360,31 +407,34 @@ class Service:
         async with HaClient(s.ha_url, s.ha_token, verify_ssl=s.ha_verify_ssl) as ha:
             for field, eid in entities.items():
                 try:
-                    states = await ha.get_history(eid, start, now)
+                    states = await ha.get_history(eid, start, completed_end)
                 except Exception:  # pragma: no cover - network dependent
                     logger.warning("history fetch failed for %s", eid, exc_info=True)
                     states = []
-                histories[field] = _hourly_mean_states(states)
-        hours = sorted({h for m in histories.values() for h in m})
+                histories[field] = _regular_state_samples(states, start, completed_end)
+
+        ticks = sorted({tick for samples in histories.values() for tick in samples})
         count = 0
         with self.store.session() as session:
-            for hour in hours:
-                charge_kw, discharge_kw = _split_battery_power(histories["batt_power_kw"].get(hour))
+            for tick in ticks:
+                charge_kw, discharge_kw = _split_battery_power(
+                    histories["batt_power_kw"].get(tick)
+                )
                 session.merge(
                     Telemetry(
-                        ts=hour,
-                        soc_pct=histories["soc_pct"].get(hour),
-                        pv_kw=histories["pv_kw"].get(hour),
-                        load_kw=histories["load_kw"].get(hour),
-                        grid_import_kw=histories["grid_import_kw"].get(hour),
-                        grid_export_kw=histories["grid_export_kw"].get(hour),
+                        ts=tick,
+                        soc_pct=histories["soc_pct"].get(tick),
+                        pv_kw=histories["pv_kw"].get(tick),
+                        load_kw=histories["load_kw"].get(tick),
+                        grid_import_kw=histories["grid_import_kw"].get(tick),
+                        grid_export_kw=histories["grid_export_kw"].get(tick),
                         batt_charge_kw=charge_kw,
                         batt_discharge_kw=discharge_kw,
                         stale=False,
                     )
                 )
                 count += 1
-        logger.info("Bootstrapped %d hours of telemetry history", count)
+        logger.info("Bootstrapped %d five-minute telemetry samples", count)
         return count
 
     async def run_optimise(self) -> str:
@@ -418,8 +468,7 @@ class Service:
         ev_forecast_surplus_kwh = max(0.0, forecast_surplus_kwh - battery_fill_input_kwh)
         ev_live = self._latest_ev_telemetry()
         ev_row_fresh = bool(
-            ev_live is not None
-            and (now - _aware(ev_live.ts)).total_seconds() <= 10 * 60
+            ev_live is not None and (now - _aware(ev_live.ts)).total_seconds() <= 10 * 60
         )
         ev_soc_trustworthy = bool(
             ev_row_fresh and ev_live is not None and ev_live.soc_pct is not None
@@ -433,9 +482,7 @@ class Service:
             and ev_live.soc_pct < EV_FULL_TARGET_SOC_PCT
             and ev_live.charging_status
             in (
-                s.ev_active_charging_statuses
-                if ev_live.switch_on
-                else s.ev_start_charging_statuses
+                s.ev_active_charging_statuses if ev_live.switch_on else s.ev_start_charging_statuses
             )
         )
         candidate_intervals = self._build_intervals(
@@ -610,7 +657,9 @@ class Service:
             ev_charge_power_kw=s.ev_charge_power_kw if ev else 0.0,
             ev_target_slots=ev.target_slots if ev else 0,
             ev_minimum_slots=ev.minimum_slots if ev else 0,
-            ev_opportunistic_terminal_soc_kwh=s.battery_capacity_kwh * s.ev_battery_full_soc_pct / 100.0,
+            ev_opportunistic_terminal_soc_kwh=(
+                s.battery_capacity_kwh * s.ev_battery_full_soc_pct / 100.0
+            ),
         )
 
     # --- helpers -----------------------------------------------------------
@@ -794,14 +843,49 @@ class Service:
         return out, conf
 
     def _load_samples(self, now: dt.datetime) -> list[LoadSample]:
+        """Hourly load history, reconciled to Pstryk's settlement boundary when available."""
         lookback = now - dt.timedelta(days=LOAD_LOOKBACK_DAYS)
         with self.store.session() as session:
-            rows = session.execute(
-                select(Telemetry.ts, Telemetry.load_kw)
-                .where(Telemetry.ts >= lookback)
-                .where(Telemetry.load_kw.is_not(None))
-            ).all()
-        return [LoadSample(ts=_aware(ts), load_kw=load_kw) for ts, load_kw in rows]
+            rows = (
+                session.execute(
+                    select(Telemetry).where(Telemetry.ts >= lookback).order_by(Telemetry.ts)
+                )
+                .scalars()
+                .all()
+            )
+            meter_rows = (
+                session.execute(
+                    select(PstrykMeterInterval)
+                    .where(PstrykMeterInterval.interval_start >= lookback)
+                    .where(PstrykMeterInterval.interval_start < now)
+                )
+                .scalars()
+                .all()
+            )
+        meter_by_hour = {
+            _aware(row.interval_start).replace(minute=0, second=0, microsecond=0): row
+            for row in meter_rows
+        }
+        energy_by_hour = complete_hourly_energy(rows)
+
+        samples: list[LoadSample] = []
+        for hour, energy in sorted(energy_by_hour.items()):
+            meter = meter_by_hour.get(hour)
+            if meter is None:
+                continue
+
+            # Settlement-boundary balance. Pstryk import/export replace Sigen's grid
+            # channels; Sigen remains the source for covered PV and battery energy.
+            corrected_load = max(
+                0.0,
+                energy["pv"]
+                + meter.import_kwh
+                + energy["discharge"]
+                - meter.export_kwh
+                - energy["charge"],
+            )
+            samples.append(LoadSample(ts=hour, load_kw=corrected_load))
+        return samples
 
     def _solver_input_snapshot(
         self, intervals: list[IntervalInput], soc_start_kwh: float, params: OptimiserParams
@@ -814,7 +898,10 @@ class Service:
         }
 
     def _publish_recommendation(
-        self, decision, status: Status, objective: float | None  # noqa: ANN001
+        self,
+        decision,
+        status: Status,
+        objective: float | None,  # noqa: ANN001
     ) -> None:
         if self._mqtt is None:
             return
@@ -864,9 +951,8 @@ def _relay_failure_backoff_decision(
         return candidate
     previous_reason = previous.reason or ""
     previous_was_failed_on = (
-        ("CRITICAL:" in previous_reason and "turn_on" in previous_reason)
-        or "relay retry backoff" in previous_reason
-    )
+        "CRITICAL:" in previous_reason and "turn_on" in previous_reason
+    ) or "relay retry backoff" in previous_reason
     if not previous_was_failed_on:
         return candidate
     elapsed = max(0.0, (now - _aware(previous.ts)).total_seconds())
@@ -1021,18 +1107,34 @@ def _hourly_from_map(values: dict[dt.datetime, float]) -> dict[dt.datetime, floa
     return out
 
 
-def _hourly_mean_states(states: list[HaState]) -> dict[dt.datetime, float]:
-    """Mean of numeric recorder states bucketed by UTC hour (mirrors routes aggregation)."""
-    buckets: dict[dt.datetime, list[float]] = {}
-    for st in states:
-        if st.last_updated is None:
-            continue
-        value = st.as_float()
-        if value is None:
-            continue
-        hour = _aware(st.last_updated).replace(minute=0, second=0, microsecond=0)
-        buckets.setdefault(hour, []).append(value)
-    return {hour: sum(vals) / len(vals) for hour, vals in buckets.items()}
+def _regular_state_samples(
+    states: list[HaState], start: dt.datetime, end: dt.datetime
+) -> dict[dt.datetime, float]:
+    """Resample recorder states every five minutes using time-correct hold semantics."""
+    points = sorted(
+        (
+            (_aware(timestamp), state.as_float())
+            for state in states
+            if (timestamp := state.last_updated) is not None
+        ),
+        key=lambda item: item[0],
+    )
+    if not points:
+        return {}
+
+    samples: dict[dt.datetime, float] = {}
+    tick = _aware(start)
+    end = _aware(end)
+    index = 0
+    current: float | None = None
+    while tick < end:
+        while index < len(points) and points[index][0] <= tick:
+            current = points[index][1]
+            index += 1
+        if current is not None:
+            samples[tick] = current
+        tick += dt.timedelta(minutes=5)
+    return samples
 
 
 def _next_interval_start(value: dt.datetime, step_minutes: int) -> dt.datetime:

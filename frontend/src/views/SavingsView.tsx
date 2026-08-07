@@ -111,6 +111,9 @@ function ComparisonChart() {
           </label>
         </div>
         {error && <div className="badge badge-block">{error}</div>}
+        {data && data.data_status !== "complete" && (
+          <div className="badge badge-warn">{data.data_status}</div>
+        )}
         {infeasible && (
           <div className="badge badge-warn">optimiser: {data?.optimiser_status}</div>
         )}
@@ -185,7 +188,10 @@ export default function SavingsView() {
         {error && <div className="badge badge-block">{error}</div>}
         {result && (
           <>
-            <p className="muted">{result.intervals} intervals valued</p>
+            <p className="muted">
+              {result.intervals} settled intervals valued · {new Date(result.settled_start).toLocaleString()}–
+              {new Date(result.settled_end).toLocaleString()}
+            </p>
             <ReactECharts option={chart} style={{ height: 320 }} notMerge />
             <table className="table">
               <thead>

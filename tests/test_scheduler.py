@@ -44,6 +44,9 @@ async def test_startup_and_optimise_refresh_ev_before_planning_and_control() -> 
         async def refresh_prices(self):
             calls.append("prices")
 
+        async def refresh_meter_values(self):
+            calls.append("meter")
+
     scheduler = build_scheduler(FakeService())  # type: ignore[arg-type]
 
     await scheduler.get_job("bootstrap").func()
@@ -52,6 +55,30 @@ async def test_startup_and_optimise_refresh_ev_before_planning_and_control() -> 
     calls.clear()
     await scheduler.get_job("optimise").func()
     assert calls == ["ev", "optimise", "control"]
+
+    calls.clear()
+    await scheduler.get_job("prices").func()
+    assert calls == ["prices", "meter"]
+
+
+async def test_meter_refresh_runs_even_when_price_refresh_fails() -> None:
+    calls: list[str] = []
+
+    class FakeService:
+        settings = Settings(db=":memory:", mqtt_enabled=False)
+
+        async def refresh_prices(self):
+            calls.append("prices")
+            raise RuntimeError("pricing unavailable")
+
+        async def refresh_meter_values(self):
+            calls.append("meter")
+
+    scheduler = build_scheduler(FakeService())  # type: ignore[arg-type]
+
+    await scheduler.get_job("prices").func()
+
+    assert calls == ["prices", "meter"]
 
 
 async def test_ev_control_waits_for_in_progress_optimisation_pipeline() -> None:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import Sequence
+import math
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Request
@@ -28,10 +28,12 @@ from ..store import (
     EvTelemetry,
     PlanStep,
     Price,
+    PstrykMeterInterval,
     Run,
     Store,
     Telemetry,
 )
+from ..telemetry_energy import complete_hourly_energy
 from .schemas import BacktestRequest, BacktestResponse, PolicyResult
 
 router = APIRouter(prefix="/api", tags=["api"])
@@ -65,12 +67,16 @@ def get_status(request: Request) -> dict:
             select(EvTelemetry).order_by(EvTelemetry.ts.desc()).limit(1)
         ).scalar_one_or_none()
         ev_control = session.get(EvControlStatus, "current")
+        billing_meter = session.execute(
+            select(PstrykMeterInterval).order_by(PstrykMeterInterval.interval_start.desc()).limit(1)
+        ).scalar_one_or_none()
     return {
         "mode": settings.mode,
         "control_enabled": CONTROL_ENABLED,
         "now": now.isoformat(),
         "telemetry": _telemetry_dict(telem),
         "current_price": _price_dict(price),
+        "billing_meter": _billing_meter_dict(billing_meter),
         "last_run": _run_dict(last_run),
         "ev": _ev_dict(ev, settings),
         "ev_control": _ev_control_dict(
@@ -126,17 +132,14 @@ def get_plan(request: Request) -> dict:
             .all()
         )
         ev_steps = (
-            session.execute(
-                select(EvPlanStep).where(EvPlanStep.run_id == last_run.run_id)
-            )
+            session.execute(select(EvPlanStep).where(EvPlanStep.run_id == last_run.run_id))
             .scalars()
             .all()
         )
         ev_by_start = {_aware(step.interval_start): step for step in ev_steps}
         run_dict = _run_dict(last_run)
         step_dicts = [
-            _plan_step_dict(step, ev_by_start.get(_aware(step.interval_start)))
-            for step in steps
+            _plan_step_dict(step, ev_by_start.get(_aware(step.interval_start))) for step in steps
         ]
     return {"run": run_dict, "steps": step_dicts}
 
@@ -184,19 +187,28 @@ def post_backtest(request: Request, body: BacktestRequest) -> BacktestResponse:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="invalid start/end") from exc
 
-    series = _load_series(store, start, end)
+    try:
+        series = _load_series(store, start, end)
+    except IncompleteSeriesError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     if not series:
-        raise HTTPException(status_code=404, detail="no data in range")
+        raise HTTPException(status_code=404, detail="no settled Pstryk meter data in range")
 
     battery = _battery_params(settings, body.battery_overrides)
-    soc_start = _soc_start_kwh(store, start, settings)
+    settled_start = _parse_dt(series[0].interval_start)
+    settled_end = _parse_dt(series[-1].interval_start) + dt.timedelta(hours=1)
+    try:
+        soc_start = _soc_start_kwh(store, settled_start, settings)
+    except IncompleteSeriesError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     results: list[PolicyResult] = []
 
-    # Actual (measured) valuation, if telemetry has flows.
+    # Actual valuation is exclusively the Pstryk settlement meter. Unsettled/missing
+    # hours are omitted rather than silently replaced with inverter telemetry.
     actual = value_actual(series, battery)
     if actual.cost is not None:
-        results.append(_policy_result("actual_sigen", actual.cost))
+        results.append(_policy_result("actual_pstryk", actual.cost))
 
     for name in body.policies:
         try:
@@ -215,7 +227,12 @@ def post_backtest(request: Request, body: BacktestRequest) -> BacktestResponse:
         results.append(_policy_result("optimiser", cost))
 
     return BacktestResponse(
-        start=body.start, end=body.end, intervals=len(series), results=results
+        start=body.start,
+        end=body.end,
+        settled_start=settled_start.isoformat(),
+        settled_end=settled_end.isoformat(),
+        intervals=len(series),
+        results=results,
     )
 
 
@@ -233,9 +250,7 @@ def _series_to_intervals(series: list[SeriesInterval]) -> list[IntervalInput]:
     ]
 
 
-def _window_savings(
-    store: Store, settings: Settings, start: dt.datetime, end: dt.datetime
-) -> dict:
+def _window_savings(store: Store, settings: Settings, start: dt.datetime, end: dt.datetime) -> dict:
     """Realised savings over a *past* window: measured actual cost minus the
     perfect-foresight optimiser cost over the same recorded PV/load/prices."""
     empty = {
@@ -243,34 +258,42 @@ def _window_savings(
         "optimiser_cost_pln": None,
         "savings_pln": None,
         "intervals": 0,
+        "settled_start": None,
+        "settled_end": None,
+        "data_status": "unavailable",
     }
-    series = _load_series(store, start, end)
+    try:
+        series = _load_series(store, start, end)
+    except IncompleteSeriesError as exc:
+        return {**empty, "data_status": str(exc)}
     if not series:
         return empty
 
     battery = _battery_params(settings, {})
-    soc_start = _soc_start_kwh(store, start, settings)
+    settled_start = _parse_dt(series[0].interval_start)
+    settled_end = _parse_dt(series[-1].interval_start) + dt.timedelta(hours=1)
+    try:
+        soc_start = _soc_start_kwh(store, settled_start, settings)
+    except IncompleteSeriesError as exc:
+        return {**empty, "data_status": str(exc)}
 
     actual = value_actual(series, battery)
     actual_cost = actual.cost.net_cost_pln if actual.cost is not None else None
 
     opt = optimise(_series_to_intervals(series), soc_start, _optimiser_params(settings, {}))
     opt_cost = (
-        value_optimiser_plan(opt, series, battery).net_cost_pln
-        if opt.status == "optimal"
-        else None
+        value_optimiser_plan(opt, series, battery).net_cost_pln if opt.status == "optimal" else None
     )
 
-    savings = (
-        actual_cost - opt_cost
-        if actual_cost is not None and opt_cost is not None
-        else None
-    )
+    savings = actual_cost - opt_cost if actual_cost is not None and opt_cost is not None else None
     return {
         "actual_cost_pln": round(actual_cost, 4) if actual_cost is not None else None,
         "optimiser_cost_pln": round(opt_cost, 4) if opt_cost is not None else None,
         "savings_pln": round(savings, 4) if savings is not None else None,
         "intervals": len(series),
+        "settled_start": settled_start.isoformat(),
+        "settled_end": settled_end.isoformat(),
+        "data_status": "complete",
     }
 
 
@@ -281,9 +304,7 @@ def get_savings(request: Request) -> dict:
     settings = _settings(request)
     now = dt.datetime.now(tz=dt.UTC)
     local_now = now.astimezone(ZoneInfo(settings.tz))
-    day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(
-        dt.UTC
-    )
+    day_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(dt.UTC)
     week_start = day_start - dt.timedelta(days=6)
     return {
         "now": _iso(now),
@@ -304,11 +325,28 @@ def get_hourly_comparison(request: Request, hours: int = 48) -> dict:
     floor = now.replace(minute=0, second=0, microsecond=0)
     start = floor - dt.timedelta(hours=hours)
 
-    series = _load_series(store, start, now)
+    try:
+        series = _load_series(store, start, now)
+    except IncompleteSeriesError as exc:
+        return {
+            "now": _iso(now),
+            "tz": settings.tz,
+            "data_status": str(exc),
+            "points": [],
+        }
     if not series:
-        return {"now": _iso(now), "tz": settings.tz, "points": []}
+        return {"now": _iso(now), "tz": settings.tz, "data_status": "unavailable", "points": []}
 
-    soc_start = _soc_start_kwh(store, start, settings)
+    settled_start = _parse_dt(series[0].interval_start)
+    try:
+        soc_start = _soc_start_kwh(store, settled_start, settings)
+    except IncompleteSeriesError as exc:
+        return {
+            "now": _iso(now),
+            "tz": settings.tz,
+            "data_status": str(exc),
+            "points": [],
+        }
     opt = optimise(_series_to_intervals(series), soc_start, _optimiser_params(settings, {}))
     opt_by_start = {s.interval_start: s for s in opt.steps} if opt.status == "optimal" else {}
 
@@ -320,12 +358,8 @@ def get_hourly_comparison(request: Request, hours: int = 48) -> dict:
         step = opt_by_start.get(s.interval_start)
         actual_charge = s.measured_charge_kwh or 0.0
         actual_discharge = s.measured_discharge_kwh or 0.0
-        opt_charge = (
-            step.pv_to_battery_kwh + step.grid_to_battery_kwh if step else None
-        )
-        opt_discharge = (
-            step.battery_to_load_kwh + step.battery_to_grid_kwh if step else None
-        )
+        opt_charge = step.pv_to_battery_kwh + step.grid_to_battery_kwh if step else None
+        opt_discharge = step.battery_to_load_kwh + step.battery_to_grid_kwh if step else None
         points.append(
             {
                 "interval_start": s.interval_start,
@@ -333,9 +367,7 @@ def get_hourly_comparison(request: Request, hours: int = 48) -> dict:
                 "sell_price": round(s.sell_price, 4),
                 "actual_charge_kwh": round(actual_charge, 3),
                 "actual_discharge_kwh": round(actual_discharge, 3),
-                "optimiser_charge_kwh": (
-                    round(opt_charge, 3) if opt_charge is not None else None
-                ),
+                "optimiser_charge_kwh": (round(opt_charge, 3) if opt_charge is not None else None),
                 "optimiser_discharge_kwh": (
                     round(opt_discharge, 3) if opt_discharge is not None else None
                 ),
@@ -346,14 +378,15 @@ def get_hourly_comparison(request: Request, hours: int = 48) -> dict:
     return {
         "now": _iso(now),
         "tz": settings.tz,
+        "data_status": "complete",
+        "settled_start": series[0].interval_start,
+        "settled_end": (_parse_dt(series[-1].interval_start) + dt.timedelta(hours=1)).isoformat(),
         "optimiser_status": opt.status,
         "points": points,
     }
 
 
-def _actual_soc_by_hour(
-    store: Store, start: dt.datetime, end: dt.datetime
-) -> dict[str, float]:
+def _actual_soc_by_hour(store: Store, start: dt.datetime, end: dt.datetime) -> dict[str, float]:
     with store.session() as session:
         telem = (
             session.execute(
@@ -365,11 +398,14 @@ def _actual_soc_by_hour(
             .scalars()
             .all()
         )
-    buckets = _hourly_telemetry(telem)
+    buckets: dict[dt.datetime, list[float]] = {}
+    for row in telem:
+        if row.soc_pct is None:
+            continue
+        hour = _aware(row.ts).replace(minute=0, second=0, microsecond=0)
+        buckets.setdefault(hour, []).append(row.soc_pct)
     return {
-        hour.isoformat(): round(vals["soc"], 1)
-        for hour, vals in buckets.items()
-        if "soc" in vals
+        hour.isoformat(): round(sum(values) / len(values), 1) for hour, values in buckets.items()
     }
 
 
@@ -383,8 +419,7 @@ def _ev_dict(ev: EvTelemetry | None, settings: Settings) -> dict | None:
         "charging_status": ev.charging_status,
         "charging_active": ev.charging_active,
         "plugged_in": (
-            ev.charging_status is not None
-            and ev.charging_status != settings.ev_unplugged_status
+            ev.charging_status is not None and ev.charging_status != settings.ev_unplugged_status
         ),
         "switch_on": ev.switch_on,
         "power_kw": ev.power_kw,
@@ -423,6 +458,21 @@ def _ev_control_dict(
         "planned_on": control.planned_on if control else None,
         "action": control.action if control else "none",
         "reason": control.reason if control else "no control decision yet",
+    }
+
+
+def _billing_meter_dict(row: PstrykMeterInterval | None) -> dict | None:
+    if row is None:
+        return None
+    return {
+        "source": "pstryk",
+        "interval_start": _iso(row.interval_start),
+        "interval_end": _iso(row.interval_end),
+        "import_kwh": row.import_kwh,
+        "export_kwh": row.export_kwh,
+        "balance_kwh": row.balance_kwh,
+        "settled": True,
+        "fetched_at": _iso(row.fetched_at),
     }
 
 
@@ -503,8 +553,12 @@ def _policy_result(name: str, cost) -> PolicyResult:  # noqa: ANN001
     )
 
 
+class IncompleteSeriesError(ValueError):
+    """Settled Pstryk data cannot be compared without complete aligned inputs."""
+
+
 def _load_series(store: Store, start: dt.datetime, end: dt.datetime) -> list[SeriesInterval]:
-    """Build an hourly series from stored prices + telemetry over [start, end)."""
+    """Build a contiguous, coverage-checked settled hourly series."""
     with store.session() as session:
         prices = (
             session.execute(
@@ -526,51 +580,74 @@ def _load_series(store: Store, start: dt.datetime, end: dt.datetime) -> list[Ser
             .scalars()
             .all()
         )
-    # Aggregate telemetry to hourly energy (kWh) using average power * 1h per hour bucket.
-    by_hour = _hourly_telemetry(telem)
+        meter_rows = (
+            session.execute(
+                select(PstrykMeterInterval)
+                .where(PstrykMeterInterval.interval_start >= start)
+                .where(PstrykMeterInterval.interval_end <= end)
+                .order_by(PstrykMeterInterval.interval_start)
+            )
+            .scalars()
+            .all()
+        )
+    if not meter_rows:
+        return []
+    expected_start = _ceil_hour(start)
+    expected_end = _aware(end).replace(minute=0, second=0, microsecond=0)
+    first_start = _aware(meter_rows[0].interval_start)
+    last_end = _aware(meter_rows[-1].interval_end)
+    if first_start != expected_start:
+        raise IncompleteSeriesError(f"missing leading settlement before {first_start.isoformat()}")
+    if last_end != expected_end:
+        raise IncompleteSeriesError(f"missing trailing settlement after {last_end.isoformat()}")
+
+    energy_by_hour = complete_hourly_energy(telem)
+    price_by_hour = {
+        _aware(row.interval_start).replace(minute=0, second=0, microsecond=0): row
+        for row in prices
+        if row.buy_gross is not None
+    }
     series: list[SeriesInterval] = []
-    for p in prices:
-        if p.buy_gross is None:
-            continue
-        hour = _aware(p.interval_start).replace(minute=0, second=0, microsecond=0)
-        agg = by_hour.get(hour, {})
+    expected_hour: dt.datetime | None = None
+    for billing in meter_rows:
+        hour = _aware(billing.interval_start).replace(minute=0, second=0, microsecond=0)
+        interval_end = _aware(billing.interval_end)
+        if interval_end - hour != dt.timedelta(hours=1):
+            raise IncompleteSeriesError(f"non-hourly Pstryk interval at {hour.isoformat()}")
+        if expected_hour is not None and hour != expected_hour:
+            raise IncompleteSeriesError(f"settlement gap before {hour.isoformat()}")
+        expected_hour = hour + dt.timedelta(hours=1)
+
+        price = price_by_hour.get(hour)
+        energy = energy_by_hour.get(hour)
+        if price is None or price.buy_gross is None or price.sell_gross is None:
+            raise IncompleteSeriesError(f"missing settled price at {hour.isoformat()}")
+        if energy is None:
+            raise IncompleteSeriesError(f"incomplete live telemetry at {hour.isoformat()}")
+
+        corrected_load = max(
+            0.0,
+            energy["pv"]
+            + billing.import_kwh
+            + energy["discharge"]
+            - billing.export_kwh
+            - energy["charge"],
+        )
         series.append(
             SeriesInterval(
                 interval_start=hour.isoformat(),
                 dt_hours=1.0,
-                pv_energy_kwh=agg.get("pv", 0.0),
-                load_energy_kwh=agg.get("load", 0.0),
-                buy_price=float(p.buy_gross),
-                sell_price=float(p.sell_gross or 0.0),
-                measured_grid_import_kwh=agg.get("grid_import", 0.0),
-                measured_grid_export_kwh=agg.get("grid_export", 0.0),
-                measured_charge_kwh=agg.get("charge", 0.0),
-                measured_discharge_kwh=agg.get("discharge", 0.0),
+                pv_energy_kwh=energy["pv"],
+                load_energy_kwh=corrected_load,
+                buy_price=float(price.buy_gross),
+                sell_price=float(price.sell_gross),
+                measured_grid_import_kwh=billing.import_kwh,
+                measured_grid_export_kwh=billing.export_kwh,
+                measured_charge_kwh=energy["charge"],
+                measured_discharge_kwh=energy["discharge"],
             )
         )
     return series
-
-
-def _hourly_telemetry(telem: Sequence[Telemetry]) -> dict[dt.datetime, dict[str, float]]:
-    buckets: dict[dt.datetime, dict[str, list[float]]] = {}
-    for t in telem:
-        hour = _aware(t.ts).replace(minute=0, second=0, microsecond=0)
-        b = buckets.setdefault(hour, {})
-        for key, val in (
-            ("pv", t.pv_kw),
-            ("load", t.load_kw),
-            ("grid_import", t.grid_import_kw),
-            ("grid_export", t.grid_export_kw),
-            ("charge", t.batt_charge_kw),
-            ("discharge", t.batt_discharge_kw),
-            ("soc", t.soc_pct),
-        ):
-            if val is not None:
-                b.setdefault(key, []).append(val)
-    out: dict[dt.datetime, dict[str, float]] = {}
-    for hour, series in buckets.items():
-        out[hour] = {k: (sum(v) / len(v)) for k, v in series.items()}  # mean kW ~ kWh for 1h
-    return out
 
 
 def _battery_params(settings: Settings, overrides: dict[str, float]) -> BatteryParams:
@@ -610,13 +687,29 @@ def _optimiser_params(settings: Settings, overrides: dict[str, float]):  # noqa:
 
 
 def _soc_start_kwh(store: Store, start: dt.datetime, settings: Settings) -> float:
+    tolerance = dt.timedelta(minutes=15)
     with store.session() as session:
-        row = session.execute(
-            select(Telemetry).where(Telemetry.ts >= start).order_by(Telemetry.ts).limit(1)
-        ).scalar_one_or_none()
-    if row and row.soc_pct is not None:
-        return row.soc_pct / 100.0 * settings.battery_capacity_kwh
-    return settings.soc_min_kwh
+        rows = (
+            session.execute(
+                select(Telemetry)
+                .where(Telemetry.ts >= start - tolerance)
+                .where(Telemetry.ts <= start + tolerance)
+                .where(Telemetry.stale.is_(False))
+                .where(Telemetry.soc_pct.is_not(None))
+            )
+            .scalars()
+            .all()
+        )
+    rows = [
+        row
+        for row in rows
+        if row.soc_pct is not None and math.isfinite(row.soc_pct) and 0 <= row.soc_pct <= 100
+    ]
+    if not rows:
+        raise IncompleteSeriesError(f"missing fresh battery SoC near {start.isoformat()}")
+    row = min(rows, key=lambda item: abs(_aware(item.ts) - start))
+    assert row.soc_pct is not None
+    return row.soc_pct / 100.0 * settings.battery_capacity_kwh
 
 
 def _iso(value: dt.datetime | None) -> str | None:
@@ -627,6 +720,12 @@ def _iso(value: dt.datetime | None) -> str | None:
 
 def _aware(value: dt.datetime) -> dt.datetime:
     return value if value.tzinfo else value.replace(tzinfo=dt.UTC)
+
+
+def _ceil_hour(value: dt.datetime) -> dt.datetime:
+    aware = _aware(value)
+    floor = aware.replace(minute=0, second=0, microsecond=0)
+    return floor if aware == floor else floor + dt.timedelta(hours=1)
 
 
 def _parse_dt(value: str) -> dt.datetime:

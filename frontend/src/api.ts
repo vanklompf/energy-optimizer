@@ -21,6 +21,17 @@ export interface PriceNow {
   source: string;
 }
 
+export interface BillingMeter {
+  source: "pstryk";
+  interval_start: string;
+  interval_end: string;
+  import_kwh: number;
+  export_kwh: number;
+  balance_kwh: number | null;
+  settled: boolean;
+  fetched_at: string;
+}
+
 export interface RunSummary {
   run_id: string;
   ts: string;
@@ -40,6 +51,7 @@ export interface StatusResponse {
   now: string;
   telemetry: Telemetry | null;
   current_price: PriceNow | null;
+  billing_meter: BillingMeter | null;
   last_run: RunSummary | null;
   ev: EvTelemetry | null;
   ev_control: EvControl;
@@ -127,6 +139,8 @@ export interface PolicyResult {
 export interface BacktestResponse {
   start: string;
   end: string;
+  settled_start: string;
+  settled_end: string;
   intervals: number;
   results: PolicyResult[];
 }
@@ -136,6 +150,9 @@ export interface SavingsWindow {
   optimiser_cost_pln: number | null;
   savings_pln: number | null;
   intervals: number;
+  settled_start: string | null;
+  settled_end: string | null;
+  data_status: string;
 }
 
 export interface SavingsResponse {
@@ -160,6 +177,9 @@ export interface HourlyComparisonResponse {
   now: string;
   tz: string;
   optimiser_status?: string;
+  data_status: string;
+  settled_start?: string;
+  settled_end?: string;
   points: HourlyComparisonPoint[];
 }
 
@@ -188,7 +208,10 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
-    if (!resp.ok) throw new Error(`backtest -> ${resp.status}`);
+    if (!resp.ok) {
+      const error = (await resp.json().catch(() => ({}))) as { detail?: string };
+      throw new Error(error.detail ?? `backtest -> ${resp.status}`);
+    }
     return resp.json() as Promise<BacktestResponse>;
   },
 };

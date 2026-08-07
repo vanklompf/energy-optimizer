@@ -1,9 +1,9 @@
 """Pstryk unified-metrics client.
 
 The 2026-04 API is a single unified-metrics endpoint. This client fetches hourly pricing
-frames, parses buy/sell prices and their components, and reports the *known-price horizon*
-(how far into the future real prices are available). Windows are UTC; conversion to local
-time happens at presentation, never here.
+and settled billing-meter frames, parses their components, and reports the *known-price
+horizon* (how far into the future real prices are available). Windows are UTC; conversion
+to local time happens at presentation, never here.
 
 Reference::
 
@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,6 +30,18 @@ import httpx
 logger = logging.getLogger(__name__)
 
 UNIFIED_METRICS_PATH = "/integrations/meter-data/unified-metrics/"
+
+
+@dataclass(slots=True)
+class MeterFrame:
+    """One settled Pstryk billing-meter interval, in kWh."""
+
+    interval_start: dt.datetime
+    interval_end: dt.datetime
+    import_kwh: float
+    export_kwh: float
+    balance_kwh: float | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -118,6 +131,39 @@ class PstrykClient:
             last_exc
         )
 
+    async def fetch_meter_values(
+        self, window_start: dt.datetime, window_end: dt.datetime, resolution: str = "hour"
+    ) -> list[MeterFrame]:
+        """Fetch settled import/export energy from the Pstryk billing meter."""
+        client = self._client
+        if client is None:
+            raise PstrykError("PstrykClient used outside of an async context manager")
+
+        params = {
+            "metrics": "meter_values",
+            "resolution": resolution,
+            "window_start": _to_utc_iso(window_start),
+            "window_end": _to_utc_iso(window_end),
+        }
+        url = self._base_url + UNIFIED_METRICS_PATH
+        last_exc: Exception | None = None
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                resp = await client.get(url, params=params, headers=self._headers())
+                resp.raise_for_status()
+                return _parse_meter_frames(resp.json(), settled_before=dt.datetime.now(dt.UTC))
+            except (httpx.HTTPError, ValueError) as exc:
+                last_exc = exc
+                logger.warning(
+                    "Pstryk meter fetch failed (attempt %d/%d): %s",
+                    attempt,
+                    self._max_retries,
+                    exc,
+                )
+        raise PstrykError(
+            f"Pstryk meter fetch failed after {self._max_retries} attempts"
+        ) from last_exc
+
 
 def known_price_horizon_hours(frames: list[PriceFrame], now: dt.datetime) -> float:
     """Hours of contiguous real prices available from ``now`` forward.
@@ -126,9 +172,7 @@ def known_price_horizon_hours(frames: list[PriceFrame], now: dt.datetime) -> flo
     """
     if not frames:
         return 0.0
-    future = sorted(
-        (f for f in frames if f.buy_gross is not None), key=lambda f: f.interval_start
-    )
+    future = sorted((f for f in frames if f.buy_gross is not None), key=lambda f: f.interval_start)
     if not future:
         return 0.0
     # Find the last contiguous hourly frame starting at or after the current hour.
@@ -143,6 +187,53 @@ def known_price_horizon_hours(frames: list[PriceFrame], now: dt.datetime) -> flo
         else:
             break
     return (horizon_end - current_hour).total_seconds() / 3600.0
+
+
+def _parse_meter_frames(
+    data: dict[str, Any], *, settled_before: dt.datetime | None = None
+) -> list[MeterFrame]:
+    """Parse complete meter intervals and discard unavailable or still-open frames."""
+    frames_raw = data.get("frames")
+    if frames_raw is None:
+        raise PstrykError("unified-metrics response missing 'frames'")
+
+    cutoff = None
+    if settled_before is not None:
+        cutoff = settled_before if settled_before.tzinfo else settled_before.replace(tzinfo=dt.UTC)
+        cutoff = cutoff.astimezone(dt.UTC)
+
+    out: list[MeterFrame] = []
+    for fr in frames_raw:
+        values = (fr.get("metrics") or {}).get("meter_values") or {}
+        start = _parse_ts(fr.get("start") or fr.get("window_start") or fr.get("timestamp"))
+        end = _parse_ts(fr.get("end") or fr.get("window_end"))
+        imported = _as_float(values.get("energy_active_import_register"))
+        exported = _as_float(values.get("energy_active_export_register"))
+        balance = _as_float(values.get("energy_balance"))
+        if start is None or end is None or imported is None or exported is None:
+            continue
+        if fr.get("is_live") is True or end - start != dt.timedelta(hours=1):
+            continue
+        if cutoff is not None and end > cutoff:
+            continue
+        if not all(math.isfinite(value) and value >= 0 for value in (imported, exported)):
+            continue
+        if balance is not None and (
+            not math.isfinite(balance) or abs(balance - (imported - exported)) > 0.001
+        ):
+            continue
+        out.append(
+            MeterFrame(
+                interval_start=start,
+                interval_end=end,
+                import_kwh=imported,
+                export_kwh=exported,
+                balance_kwh=balance,
+                raw=fr,
+            )
+        )
+    out.sort(key=lambda f: f.interval_start)
+    return out
 
 
 def _parse_frames(data: dict[str, Any]) -> list[PriceFrame]:

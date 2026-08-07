@@ -26,5 +26,7 @@ class PolicyResult(BaseModel):
 class BacktestResponse(BaseModel):
     start: str
     end: str
+    settled_start: str
+    settled_end: str
     intervals: int
     results: list[PolicyResult]

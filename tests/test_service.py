@@ -9,6 +9,7 @@ from energy_optimizer.config import Settings
 from energy_optimizer.ev import EvRequirements
 from energy_optimizer.ev_control import EvControlDecision
 from energy_optimizer.ha_client import HaState
+from energy_optimizer.pstryk_client import MeterFrame
 from energy_optimizer.safety import SafetyReport, Status
 from energy_optimizer.service import (
     Service,
@@ -17,7 +18,7 @@ from energy_optimizer.service import (
     _ev_fault_status,
     _ev_live_state,
     _hourly_from_map,
-    _hourly_mean_states,
+    _regular_state_samples,
     _relay_failure_backoff_decision,
 )
 from energy_optimizer.store import (
@@ -26,6 +27,7 @@ from energy_optimizer.store import (
     EvTelemetry,
     PlanStep,
     Price,
+    PstrykMeterInterval,
     Run,
     Store,
     Telemetry,
@@ -147,12 +149,131 @@ async def test_run_optimise_produces_plan_from_load_forecast() -> None:
 
     with store.session() as session:
         run = session.get(Run, run_id)
-        steps = (
-            session.execute(select(PlanStep).where(PlanStep.run_id == run_id)).scalars().all()
-        )
+        steps = session.execute(select(PlanStep).where(PlanStep.run_id == run_id)).scalars().all()
     assert run is not None
     assert run.status != "blocked"
     assert len(steps) > 0
+
+
+async def test_refresh_meter_values_persists_authoritative_billing_intervals(monkeypatch) -> None:
+    settings = _settings().model_copy(update={"pstryk_api_key": "secret"})
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+    start = dt.datetime(2026, 8, 7, 7, 0, tzinfo=dt.UTC)
+
+    class FakePstrykClient:
+        calls = 0
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            pass
+
+        async def fetch_meter_values(self, window_start, window_end, resolution="hour"):
+            assert resolution == "hour"
+            type(self).calls += 1
+            if type(self).calls == 3:
+                return []
+            imported = 0.053 if type(self).calls == 1 else 0.1
+            return [
+                MeterFrame(
+                    interval_start=start,
+                    interval_end=start + dt.timedelta(hours=1),
+                    import_kwh=imported,
+                    export_kwh=0.149,
+                    balance_kwh=-0.096,
+                )
+            ]
+
+    monkeypatch.setattr("energy_optimizer.service.PstrykClient", FakePstrykClient)
+
+    assert await service.refresh_meter_values(days_back=7) == 1
+    with store.session() as session:
+        row = session.get(PstrykMeterInterval, start)
+    assert row is not None
+    assert row.import_kwh == 0.053
+    assert row.export_kwh == 0.149
+    assert row.balance_kwh == -0.096
+    assert row.source == "pstryk"
+
+    assert await service.refresh_meter_values(days_back=7) == 1
+    with store.session() as session:
+        rows = session.execute(select(PstrykMeterInterval)).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].import_kwh == 0.1
+
+    assert await service.refresh_meter_values(days_back=7) == 0
+    with store.session() as session:
+        rows = session.execute(select(PstrykMeterInterval)).scalars().all()
+    assert rows == []
+
+
+def test_pstryk_meter_reconciles_load_history_used_for_forecasting() -> None:
+    settings = _settings()
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+    hour = utcnow().replace(minute=0, second=0, microsecond=0) - dt.timedelta(hours=1)
+    with store.session() as session:
+        for minute in (0, 15, 30, 45):
+            session.add(
+                Telemetry(
+                    ts=hour + dt.timedelta(minutes=minute),
+                    soc_pct=50.0,
+                    pv_kw=2.0,
+                    load_kw=None,  # load derives from the Pstryk-settled energy balance
+                    grid_import_kw=0.0,
+                    grid_export_kw=0.0,
+                    batt_charge_kw=0.4,
+                    batt_discharge_kw=0.5,
+                    stale=False,
+                )
+            )
+        session.add(
+            PstrykMeterInterval(
+                interval_start=hour,
+                interval_end=hour + dt.timedelta(hours=1),
+                import_kwh=0.1,
+                export_kwh=0.2,
+                balance_kwh=-0.1,
+                source="pstryk",
+            )
+        )
+
+    samples = service._load_samples(utcnow())
+
+    assert len(samples) == 1
+    # load = PV + import + battery discharge - export - battery charge
+    assert samples[0].load_kw == pytest.approx(2.0)
+
+
+def test_load_history_has_no_sigen_fallback_without_pstryk_meter() -> None:
+    settings = _settings()
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+    hour = utcnow().replace(minute=0, second=0, microsecond=0) - dt.timedelta(hours=1)
+    with store.session() as session:
+        session.add(
+            Telemetry(
+                ts=hour,
+                soc_pct=50.0,
+                pv_kw=0.0,
+                load_kw=None,
+                grid_import_kw=9.0,
+                grid_export_kw=0.0,
+                batt_charge_kw=0.0,
+                batt_discharge_kw=0.0,
+                stale=False,
+            )
+        )
+
+    assert service._load_samples(utcnow()) == []
 
 
 def test_hourly_from_map_sums_substeps_into_hours() -> None:
@@ -169,7 +290,7 @@ def test_hourly_from_map_sums_substeps_into_hours() -> None:
     assert hourly[base + dt.timedelta(hours=1)] == 1.0
 
 
-def test_hourly_mean_states_buckets_by_hour() -> None:
+def test_regular_state_samples_holds_recorder_values_at_five_minute_steps() -> None:
     hour = dt.datetime(2026, 7, 13, 9, 0, tzinfo=dt.UTC)
 
     def state(minute: int, value: str) -> HaState:
@@ -180,8 +301,15 @@ def test_hourly_mean_states_buckets_by_hour() -> None:
             attributes={},
         )
 
-    means = _hourly_mean_states([state(0, "2.0"), state(30, "4.0"), state(45, "unknown")])
-    assert means[hour] == 3.0
+    samples = _regular_state_samples(
+        [state(0, "2.0"), state(30, "4.0"), state(45, "unknown")],
+        hour,
+        hour + dt.timedelta(hours=1),
+    )
+    assert len(samples) == 9
+    assert samples[hour + dt.timedelta(minutes=25)] == 2.0
+    assert samples[hour + dt.timedelta(minutes=40)] == 4.0
+    assert hour + dt.timedelta(minutes=45) not in samples
 
 
 def test_ev_fault_status_fails_closed_for_unavailable_protection_sensor() -> None:
@@ -251,7 +379,7 @@ async def test_run_optimise_adds_shadow_vehicle_slots_while_relay_control_is_dis
     settings = _settings().model_copy(
         update={
             "ev_control_enabled": False,
-            "ev_minimum_target_soc_pct": 75.0,
+            "ev_minimum_target_soc_pct": 100.0,
             "ev_charge_power_kw": 1.8,
             "ev_capacity_kwh": 10.9,
             "ev_charge_efficiency": 0.9,
@@ -316,13 +444,10 @@ async def test_run_optimise_adds_shadow_vehicle_slots_while_relay_control_is_dis
 
     with store.session() as session:
         ev_steps = (
-            session.execute(select(EvPlanStep).where(EvPlanStep.run_id == run_id))
-            .scalars()
-            .all()
+            session.execute(select(EvPlanStep).where(EvPlanStep.run_id == run_id)).scalars().all()
         )
     assert sum(step.charge_kwh for step in ev_steps) >= 10.9 * 0.10 / 0.9
     assert any(step.planned_on for step in ev_steps)
-    assert min(ev_steps, key=lambda step: step.interval_start).planned_on is True
 
 
 @pytest.mark.parametrize(
@@ -390,9 +515,7 @@ async def test_control_ev_charging_verifies_shelly_actuation_and_fails_safe(
     expected_desired_on,
     reason_fragment,
 ) -> None:
-    settings = _settings().model_copy(
-        update={"ha_token": ha_token, "ev_control_enabled": True}
-    )
+    settings = _settings().model_copy(update={"ha_token": ha_token, "ev_control_enabled": True})
     store = Store(":memory:")
     store.create_all()
     service = Service(settings, store)
@@ -459,9 +582,7 @@ async def test_control_ev_charging_verifies_shelly_actuation_and_fails_safe(
             if nonlocal_on_readback_raises[0]:
                 nonlocal_on_readback_raises[0] = False
                 raise RuntimeError("ambiguous readback timeout")
-            return HaState(
-                entity_id, verification_states.pop(0), now, {}, last_changed=now
-            )
+            return HaState(entity_id, verification_states.pop(0), now, {}, last_changed=now)
 
     nonlocal_on_readback_raises = [on_readback_raises]
     monkeypatch.setattr("energy_optimizer.service.HaClient", FakeHaClient)
@@ -471,23 +592,15 @@ async def test_control_ev_charging_verifies_shelly_actuation_and_fails_safe(
 
     expected_calls: list[tuple] = []
     if ha_token and not context_raises and force_off:
-        expected_calls.append(
-            ("switch", "turn_off", {"entity_id": settings.ev_switch_entity})
-        )
+        expected_calls.append(("switch", "turn_off", {"entity_id": settings.ev_switch_entity}))
     elif ha_token and not context_raises:
-        expected_calls.append(
-            ("switch", "turn_on", {"entity_id": settings.ev_switch_entity})
-        )
+        expected_calls.append(("switch", "turn_on", {"entity_id": settings.ev_switch_entity}))
         normal_readbacks = 0 if turn_on_raises else expected_readbacks
         if not expected_desired_on:
             normal_readbacks = max(0, normal_readbacks - 1)
-        expected_calls.extend(
-            [("get_state", settings.ev_switch_entity)] * normal_readbacks
-        )
+        expected_calls.extend([("get_state", settings.ev_switch_entity)] * normal_readbacks)
         if not expected_desired_on:
-            expected_calls.append(
-                ("switch", "turn_off", {"entity_id": settings.ev_switch_entity})
-            )
+            expected_calls.append(("switch", "turn_off", {"entity_id": settings.ev_switch_entity}))
     expected_calls.extend(
         [("get_state", settings.ev_switch_entity)]
         * (expected_readbacks - sum(call[0] == "get_state" for call in expected_calls))

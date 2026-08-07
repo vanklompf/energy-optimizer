@@ -2,9 +2,9 @@
 
 Used for backtests and counterfactuals. Given a time series of PV/load/prices and a
 starting SoC, it walks each interval, asks the policy for flows, enforces SoC bounds,
-and accumulates costs via :mod:`accounting`. The ``actual_sigen`` pseudo-policy instead
-reconstructs flows from measured telemetry so "what actually happened" can be valued on
-the same basis as counterfactuals.
+and accumulates costs via :mod:`accounting`. Actual valuation uses only settled Pstryk
+billing-meter intervals; missing intervals are omitted rather than replaced with inverter
+telemetry.
 """
 
 from __future__ import annotations
@@ -126,12 +126,14 @@ def simulate_policy(
 
 
 def value_actual(series: list[SeriesInterval], battery: BatteryParams) -> SimResult:
-    """Value what actually happened, using measured telemetry flows."""
+    """Value settled Pstryk billing-meter intervals; never fall back to inverter data."""
     flow_rows: list[StepFlows] = []
     steps: list[SimStep] = []
     for itv in series:
-        imp = itv.measured_grid_import_kwh or 0.0
-        exp = itv.measured_grid_export_kwh or 0.0
+        if itv.measured_grid_import_kwh is None or itv.measured_grid_export_kwh is None:
+            continue
+        imp = itv.measured_grid_import_kwh
+        exp = itv.measured_grid_export_kwh
         throughput = (itv.measured_charge_kwh or 0.0) + (itv.measured_discharge_kwh or 0.0)
         flow_rows.append(
             StepFlows(
@@ -154,12 +156,14 @@ def value_actual(series: list[SeriesInterval], battery: BatteryParams) -> SimRes
                 soc_kwh_end=0.0,
             )
         )
+    if not flow_rows:
+        return SimResult(policy="actual_pstryk", steps=steps, cost=None)
     cost = value_flows(
         flow_rows,
         degradation_cost_pln_per_kwh=battery.degradation_cost_pln_per_kwh,
         import_price_adjustment_pln_kwh=battery.import_price_adjustment_pln_kwh,
     )
-    return SimResult(policy="actual_sigen", steps=steps, cost=cost)
+    return SimResult(policy="actual_pstryk", steps=steps, cost=cost)
 
 
 def value_optimiser_plan(
