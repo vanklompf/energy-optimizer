@@ -345,7 +345,6 @@ class Service:
     async def _control_battery_locked(
         self, *, now: dt.datetime | None, force_fallback: bool
     ) -> dict[str, object]:
-        from .battery_control import ControlDirection
         from .control_store import (
             ensure_controller_state,
             finalize_action,
@@ -381,85 +380,104 @@ class Service:
                 return {"result": "lease_conflict", "command_id": command_id}
             ensure_controller_state(session)
 
-        if s.mode != "control" or not s.battery_control_enabled:
-            with self.store.session() as session:
-                persist_pending_action(
-                    session,
-                    command_id=command_id,
-                    source_run_id=None,
-                    interval_start=None,
-                    intent={"direction": "IDLE", "dry_run": True},
-                    authorization_allowed=False,
-                    blockers=["dry_run_or_disarmed"],
-                    requested_state="DISARMED",
-                )
-                finalize_action(
-                    session,
-                    command_id,
-                    observed_state="DISARMED",
-                    physical=None,
-                    result="dry_run_skipped",
-                    error_code="dry_run_or_disarmed",
-                )
-            return {"result": "dry_run_skipped", "command_id": command_id}
+        shadow = s.mode != "control" or not s.battery_control_enabled
 
         try:
             intent, run_id, interval_start, plan_age = self.build_battery_control_intent(now)
         except ValueError as exc:
+            if shadow:
+                with self.store.session() as session:
+                    persist_pending_action(
+                        session,
+                        command_id=command_id,
+                        source_run_id=None,
+                        interval_start=None,
+                        intent={"direction": "IDLE", "shadow": True, "error": str(exc)},
+                        authorization_allowed=False,
+                        blockers=[f"stale_plan:{exc}"],
+                        requested_state="IDLE",
+                    )
+                    finalize_action(
+                        session,
+                        command_id,
+                        observed_state="DISARMED",
+                        physical={"shadow": True, "ha_writes": 0},
+                        result="shadow",
+                        error_code=f"stale_plan:{exc}"[:64],
+                    )
+                return {
+                    "result": "shadow",
+                    "command_id": command_id,
+                    "blockers": [f"stale_plan:{exc}"],
+                }
             reason = f"stale_plan:{exc}"[:60]
             return await self.fallback_battery(reason, command_id=command_id)
 
-        economic = intent.direction in {ControlDirection.CHARGE, ControlDirection.DISCHARGE}
-        soc_pct, soc_age = self._latest_soc_with_age(now)
-        # Watchdog health is proven in Task 11; fail closed until then.
-        safety = evaluate(
-            SafetyInputs(
-                telemetry_stale=False,
-                telemetry_stale_reasons=[],
-                have_current_price=True,
-                have_pv_forecast=True,
-                have_load_forecast=True,
-                known_price_hours=float(s.optimise_horizon_hours),
-                horizon_hours=float(s.optimise_horizon_hours),
-                mode_is_control=s.mode == "control",
-                battery_control_enabled=s.battery_control_enabled,
-                number_register_ack_reliable=s.battery_control_number_register_ack_reliable,
-                lease_held=True,
-                watchdog_healthy=False,
-                economic_action=economic,
-                plan_status_ok=True,
-                plan_age_seconds=plan_age,
-                max_plan_age_seconds=s.battery_control_max_plan_age_seconds,
-                max_telemetry_age_seconds=s.battery_control_max_telemetry_age_seconds,
-                current_interval_start=interval_start,
-                current_interval_end=interval_start + dt.timedelta(minutes=s.step_minutes),
-                now=now,
-                current_buy_price=None,
-                current_sell_price=None,
-                current_price_is_real=False,
-                current_price_age_seconds=None,
-                soc_pct=soc_pct,
-                soc_update_age_seconds=soc_age,
-                corroborating_power_fresh=False,
-            )
+        safety, evidence = self._evaluate_battery_authorization(
+            intent,
+            now=now,
+            interval_start=interval_start,
+            plan_age=plan_age,
+            lease_held=True,
+            shadow=shadow,
         )
+        intent_payload = {
+            "direction": intent.direction.value,
+            "requested_power_kw": intent.requested_power_kw,
+            "cutoff_soc_pct": intent.cutoff_soc_pct,
+            "expiry": intent.expiry.isoformat(),
+            "grid_charge": intent.grid_charge,
+            "export": intent.export,
+            "expected_grid_direction": intent.expected_grid_direction,
+            "expected_grid_kw_min": intent.expected_grid_kw_min,
+            "expected_grid_kw_max": intent.expected_grid_kw_max,
+            "expected_financial_value_pln": intent.expected_financial_value_pln,
+            "reason_codes": list(intent.reason_codes),
+            "shadow": shadow,
+            "evidence": evidence,
+        }
         with self.store.session() as session:
             persist_pending_action(
                 session,
                 command_id=command_id,
                 source_run_id=run_id,
                 interval_start=interval_start,
-                intent={
-                    "direction": intent.direction.value,
-                    "requested_power_kw": intent.requested_power_kw,
-                    "grid_charge": intent.grid_charge,
-                    "export": intent.export,
-                    "reason_codes": list(intent.reason_codes),
-                },
+                intent=intent_payload,
                 authorization_allowed=safety.control_authorized,
                 blockers=safety.control_blockers,
                 requested_state=intent.direction.value,
             )
+
+        if shadow:
+            # Hard no-write boundary: never instantiate SigenergyController / HaClient here.
+            with self.store.session() as session:
+                finalize_action(
+                    session,
+                    command_id,
+                    observed_state="DISARMED",
+                    physical={
+                        "shadow": True,
+                        "ha_writes": 0,
+                        "would_authorize": evidence.get("would_authorize", False),
+                    },
+                    result="shadow",
+                    error_code=(
+                        None
+                        if evidence.get("would_authorize")
+                        else (",".join(safety.control_blockers) or "not_authorized")[:64]
+                    ),
+                )
+            return {
+                "result": "shadow",
+                "command_id": command_id,
+                "direction": intent.direction.value,
+                "requested_power_kw": intent.requested_power_kw,
+                "authorized": safety.control_authorized,
+                "would_authorize": evidence.get("would_authorize", False),
+                "blockers": safety.control_blockers,
+                "source_run_id": run_id,
+                "interval_start": interval_start.isoformat(),
+            }
 
         if not safety.control_authorized:
             with self.store.session() as session:
@@ -1084,6 +1102,157 @@ class Service:
         )
 
     # --- helpers -----------------------------------------------------------
+    def _evaluate_battery_authorization(
+        self,
+        intent,
+        *,
+        now: dt.datetime,
+        interval_start: dt.datetime,
+        plan_age: float,
+        lease_held: bool,
+        shadow: bool,
+    ) -> tuple[SafetyReport, dict[str, object]]:
+        """Build live-control SafetyInputs from real store evidence (fail-closed)."""
+        from .battery_control import ControlDirection
+        from .control_store import ensure_controller_state
+        from .watchdog import HeartbeatSample, heartbeat_is_healthy
+
+        s = self.settings
+        economic = intent.direction in {ControlDirection.CHARGE, ControlDirection.DISCHARGE}
+        soc_pct, soc_age = self._latest_soc_with_age(now)
+        telemetry_stale, stale_reasons = self._telemetry_stale(now)
+
+        with self.store.session() as session:
+            tele = session.execute(
+                select(Telemetry).order_by(Telemetry.ts.desc()).limit(1)
+            ).scalar_one_or_none()
+            price_floor = now.replace(minute=0, second=0, microsecond=0)
+            price = session.execute(
+                select(Price).where(Price.interval_start == price_floor)
+            ).scalar_one_or_none()
+            state = ensure_controller_state(session)
+            heartbeat_at = state.last_heartbeat_at
+            consecutive_failures = int(state.consecutive_failures or 0)
+
+        telemetry_ages: dict[str, float | None] = {
+            "soc": soc_age,
+            "battery_power": None,
+            "grid_import": None,
+            "grid_export": None,
+        }
+        corroborating = False
+        if tele is not None:
+            age = max(0.0, (now - _aware(tele.ts)).total_seconds())
+            telemetry_ages["battery_power"] = age
+            telemetry_ages["grid_import"] = age
+            telemetry_ages["grid_export"] = age
+            corroborating = (
+                age <= s.battery_control_max_telemetry_age_seconds
+                and (
+                    tele.batt_charge_kw is not None
+                    or tele.batt_discharge_kw is not None
+                    or tele.grid_import_kw is not None
+                    or tele.grid_export_kw is not None
+                )
+            )
+
+        buy = price.buy_gross if price is not None else None
+        sell = price.sell_gross if price is not None else None
+        price_is_real = bool(
+            price is not None and price.source == "api" and buy is not None and sell is not None
+        )
+        price_age = (
+            max(0.0, (now - _aware(price.fetched_at)).total_seconds())
+            if price is not None
+            else None
+        )
+
+        heartbeat = (
+            HeartbeatSample(ts=_aware(heartbeat_at), retained=False)
+            if heartbeat_at is not None
+            else None
+        )
+        # Local publish freshness is not HA watchdog confirmation; fail closed unless both.
+        watchdog_healthy = heartbeat_is_healthy(
+            heartbeat,
+            now=now,
+            expiry_seconds=s.battery_control_heartbeat_expiry_seconds,
+        ) and bool(s.battery_control_watchdog_health_entity)
+
+        soc_at_boundary = False
+        if soc_pct is not None:
+            soc_at_boundary = (
+                abs(soc_pct - s.battery_control_min_soc_pct) < 0.5
+                or abs(soc_pct - s.battery_control_max_soc_pct) < 0.5
+            )
+
+        ev_live = self._latest_ev_telemetry()
+        ev_fresh = bool(
+            ev_live is not None
+            and (now - _aware(ev_live.ts)).total_seconds()
+            <= s.battery_control_max_telemetry_age_seconds
+        )
+
+        prices = self._future_prices(now)
+        have_current_price = self._have_current_price(prices, now)
+        known_hours = self._known_price_hours(prices, now)
+
+        inputs = SafetyInputs(
+            telemetry_stale=telemetry_stale,
+            telemetry_stale_reasons=stale_reasons,
+            have_current_price=have_current_price,
+            have_pv_forecast=True,  # live control does not re-fetch forecasts here
+            have_load_forecast=True,
+            known_price_hours=known_hours,
+            horizon_hours=float(s.optimise_horizon_hours),
+            mode_is_control=s.mode == "control",
+            battery_control_enabled=s.battery_control_enabled,
+            number_register_ack_reliable=s.battery_control_number_register_ack_reliable,
+            lease_held=lease_held,
+            watchdog_healthy=watchdog_healthy,
+            economic_action=economic,
+            plan_status_ok=True,
+            plan_age_seconds=plan_age,
+            max_plan_age_seconds=s.battery_control_max_plan_age_seconds,
+            max_telemetry_age_seconds=s.battery_control_max_telemetry_age_seconds,
+            current_interval_start=interval_start,
+            current_interval_end=interval_start + dt.timedelta(minutes=s.step_minutes),
+            now=now,
+            current_buy_price=buy,
+            current_sell_price=sell,
+            current_price_is_real=price_is_real,
+            current_price_age_seconds=price_age,
+            telemetry_ages_seconds=telemetry_ages,
+            soc_pct=soc_pct,
+            soc_update_age_seconds=soc_age,
+            soc_at_boundary=soc_at_boundary,
+            corroborating_power_fresh=corroborating,
+            recent_command_failures=consecutive_failures,
+            ev_goal_active=False,
+            ev_telemetry_fresh=ev_fresh,
+        )
+        safety = evaluate(inputs)
+        gate_blockers = {"mode_not_control", "battery_control_disabled"}
+        remaining = [b for b in safety.control_blockers if b not in gate_blockers]
+        evidence: dict[str, object] = {
+            "shadow": shadow,
+            "plan_age_seconds": plan_age,
+            "price_is_real": price_is_real,
+            "price_age_seconds": price_age,
+            "price_fetched_at": price.fetched_at.isoformat() if price is not None else None,
+            "telemetry_ts": tele.ts.isoformat() if tele is not None else None,
+            "telemetry_ages_seconds": telemetry_ages,
+            "soc_pct": soc_pct,
+            "soc_age_seconds": soc_age,
+            "corroborating_power_fresh": corroborating,
+            "watchdog_healthy": watchdog_healthy,
+            "heartbeat_at": heartbeat_at.isoformat() if heartbeat_at is not None else None,
+            "lease_held": lease_held,
+            "would_authorize": not remaining,
+            "non_gate_blockers": remaining,
+        }
+        return safety, evidence
+
     def _latest_soc_pct(self) -> float | None:
         soc, _age = self._latest_soc_with_age(utcnow())
         return soc

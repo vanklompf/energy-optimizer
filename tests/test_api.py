@@ -66,32 +66,34 @@ def test_status_empty(client: TestClient) -> None:
 def test_control_actions_history_is_read_only(client: TestClient) -> None:
     store = client.app.state.store
     with store.session() as session:
-        from energy_optimizer.control_store import persist_pending_action, finalize_action
+        from energy_optimizer.control_store import finalize_action, persist_pending_action
 
         persist_pending_action(
             session,
             command_id="hist-1",
-            source_run_id=None,
+            source_run_id="shadow-run",
             interval_start=None,
-            intent={"direction": "IDLE"},
+            intent={"direction": "CHARGE", "shadow": True, "evidence": {"would_authorize": False}},
             authorization_allowed=False,
-            blockers=["dry_run_or_disarmed"],
-            requested_state="DISARMED",
+            blockers=["mode_not_control", "battery_control_disabled"],
+            requested_state="CHARGE",
         )
         finalize_action(
             session,
             "hist-1",
             observed_state="DISARMED",
-            physical=None,
-            result="dry_run_skipped",
-            error_code="dry_run_or_disarmed",
+            physical={"shadow": True, "ha_writes": 0},
+            result="shadow",
+            error_code="mode_not_control,battery_control_disabled",
         )
 
     resp = client.get("/api/control/actions")
     assert resp.status_code == 200
     actions = resp.json()["actions"]
     assert actions[0]["command_id"] == "hist-1"
-    assert actions[0]["result"] == "dry_run_skipped"
+    assert actions[0]["result"] == "shadow"
+    assert actions[0]["requested_state"] == "CHARGE"
+    assert actions[0]["observed_state"] == "DISARMED"
     # No public arm/clear mutation endpoints.
     assert client.post("/api/control/arm").status_code in {404, 405, 422}
     assert client.post("/api/control/disarm").status_code in {404, 405, 422}

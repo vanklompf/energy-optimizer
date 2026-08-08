@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 from energy_optimizer.config import Settings
 from energy_optimizer.control_store import try_acquire_lease
@@ -41,7 +42,62 @@ def _settings(**overrides) -> Settings:
     return Settings(**base)
 
 
-async def test_control_battery_dry_run_records_audit_without_ha(monkeypatch) -> None:
+async def test_control_battery_shadow_records_real_intent_without_ha(monkeypatch) -> None:
+    settings = _settings()
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+    now = dt.datetime(2026, 8, 8, 12, 7, tzinfo=dt.UTC)
+    interval = dt.datetime(2026, 8, 8, 12, 0, tzinfo=dt.UTC)
+    with store.session() as session:
+        session.add(
+            Run(
+                run_id="shadow-run",
+                ts=now,
+                mode="dry_run",
+                horizon_hours=48,
+                known_price_hours=24,
+                status="ok",
+            )
+        )
+        session.add(
+            PlanStep(
+                run_id="shadow-run",
+                interval_start=interval,
+                dt_hours=0.25,
+                pv_to_battery_kwh=1.0,
+                grid_to_load_kwh=0.5,
+            )
+        )
+
+    ha_calls: list[str] = []
+
+    class BoomHa:
+        def __init__(self, *args, **kwargs) -> None:
+            ha_calls.append("init")
+
+    monkeypatch.setattr("energy_optimizer.service.HaClient", BoomHa)
+
+    result = await service.control_battery(now=now)
+    assert result["result"] == "shadow"
+    assert result["direction"] == "CHARGE"
+    assert result["source_run_id"] == "shadow-run"
+    assert ha_calls == []
+    with store.session() as session:
+        action = session.get(ControlAction, result["command_id"])
+        assert action is not None
+        assert action.result == "shadow"
+        assert action.source_run_id == "shadow-run"
+        assert action.requested_state == "CHARGE"
+        assert action.observed_state == "DISARMED"
+        intent = json.loads(action.intent_json or "{}")
+        physical = json.loads(action.physical_json or "{}")
+        assert intent["shadow"] is True
+        assert "evidence" in intent
+        assert physical["ha_writes"] == 0
+
+
+async def test_control_battery_shadow_without_plan_still_skips_ha(monkeypatch) -> None:
     settings = _settings()
     store = Store(":memory:")
     store.create_all()
@@ -56,13 +112,15 @@ async def test_control_battery_dry_run_records_audit_without_ha(monkeypatch) -> 
     monkeypatch.setattr("energy_optimizer.service.HaClient", BoomHa)
 
     result = await service.control_battery()
-    assert result["result"] == "dry_run_skipped"
+    assert result["result"] == "shadow"
     assert ha_calls == []
     with store.session() as session:
         action = session.get(ControlAction, result["command_id"])
         assert action is not None
-        assert action.result == "dry_run_skipped"
+        assert action.result == "shadow"
         assert action.authorization_allowed is False
+        blockers = json.loads(action.blockers_json or "[]")
+        assert any("stale_plan" in b for b in blockers)
 
 
 async def test_control_battery_stale_plan_falls_back_without_ha(monkeypatch) -> None:
@@ -94,7 +152,7 @@ async def test_control_battery_stale_plan_falls_back_without_ha(monkeypatch) -> 
             pass
 
         async def fallback(self, reason, command_id=None):
-            from energy_optimizer.battery_control import ControlResult, ControllerState
+            from energy_optimizer.battery_control import ControllerState, ControlResult
             from energy_optimizer.sigenergy_control import SigenergyControlResult
 
             return SigenergyControlResult(
