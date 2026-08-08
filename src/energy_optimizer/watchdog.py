@@ -178,3 +178,56 @@ def heartbeat_is_healthy(
         return False
     age = (now - heartbeat.ts).total_seconds()
     return 0 <= age <= expiry_seconds
+
+
+@dataclass(slots=True)
+class HeartbeatSilenceTracker:
+    """Persist last valid heartbeat independently of the current MQTT trigger payload.
+
+    A periodic/timer evaluation can call ``evaluate`` with ``incoming=None`` to prove
+    silence detection when MQTT becomes completely quiet.
+    """
+
+    last_valid_ts: dt.datetime | None = None
+    last_reject_reason: str | None = None
+
+    def ingest(self, sample: HeartbeatSample | None, *, now: dt.datetime) -> bool:
+        """Accept a fresh non-retained heartbeat. Reject malformed/future/retained."""
+        if sample is None:
+            self.last_reject_reason = "heartbeat_missing"
+            return False
+        if sample.retained:
+            self.last_reject_reason = "retained_heartbeat_untrusted"
+            return False
+        if sample.ts > now:
+            self.last_reject_reason = "heartbeat_from_future"
+            return False
+        if not sample.state:
+            self.last_reject_reason = "heartbeat_malformed"
+            return False
+        self.last_valid_ts = sample.ts
+        self.last_reject_reason = None
+        return True
+
+    def as_sample(self) -> HeartbeatSample | None:
+        if self.last_valid_ts is None:
+            return None
+        return HeartbeatSample(ts=self.last_valid_ts, retained=False, source="persisted")
+
+    def evaluate_silence(
+        self,
+        *,
+        now: dt.datetime,
+        expiry_seconds: float,
+        incoming: HeartbeatSample | None = None,
+    ) -> WatchdogDecision:
+        """Evaluate health on a timer tick; optional ``incoming`` updates the tracker first."""
+        if incoming is not None:
+            self.ingest(incoming, now=now)
+        sample = self.as_sample()
+        if sample is None:
+            return WatchdogDecision(False, "heartbeat_missing", True)
+        age = (now - sample.ts).total_seconds()
+        if age < 0 or age > expiry_seconds:
+            return WatchdogDecision(False, "heartbeat_expired", True)
+        return WatchdogDecision(True, "ok", False)

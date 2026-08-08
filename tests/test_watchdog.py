@@ -6,6 +6,7 @@ from energy_optimizer.config import Settings
 from energy_optimizer.watchdog import (
     FakeHaWatchdog,
     HeartbeatSample,
+    HeartbeatSilenceTracker,
     heartbeat_is_healthy,
 )
 
@@ -126,7 +127,9 @@ def test_startup_with_remote_ems_on_falls_back_and_never_enables_remote() -> Non
     assert decision.reason == "startup_remote_ems_on"
     assert all(not (d == "switch" and a == "turn_on") for d, a, _ in watchdog.service_calls)
     assert any(
-        d == "switch" and a == "turn_off" and c["entity_id"] == settings.battery_control_remote_ems_switch_entity
+        d == "switch"
+        and a == "turn_off"
+        and c["entity_id"] == settings.battery_control_remote_ems_switch_entity
         for d, a, c in watchdog.service_calls
     )
 
@@ -141,3 +144,58 @@ def test_healthy_path_issues_no_writes() -> None:
     )
     assert decision.healthy is True
     assert watchdog.service_calls == []
+
+
+def test_silence_tracker_detects_expiry_without_new_mqtt_message() -> None:
+    """Timer-tick evaluation with incoming=None must still expire a quiet heartbeat."""
+    tracker = HeartbeatSilenceTracker()
+    t0 = dt.datetime(2026, 8, 8, 12, 0, tzinfo=dt.UTC)
+    assert tracker.ingest(HeartbeatSample(ts=t0, retained=False), now=t0) is True
+
+    # No further MQTT payloads — only a periodic evaluation.
+    later = t0 + dt.timedelta(seconds=30)
+    assert tracker.evaluate_silence(now=later, expiry_seconds=60, incoming=None).healthy is True
+
+    expired = t0 + dt.timedelta(seconds=61)
+    decision = tracker.evaluate_silence(now=expired, expiry_seconds=60, incoming=None)
+    assert decision.healthy is False
+    assert decision.reason == "heartbeat_expired"
+    assert decision.should_fallback is True
+
+
+def test_silence_tracker_rejects_retained_future_and_malformed() -> None:
+    tracker = HeartbeatSilenceTracker()
+    now = dt.datetime(2026, 8, 8, 12, 0, tzinfo=dt.UTC)
+    assert (
+        tracker.ingest(HeartbeatSample(ts=now, retained=True, state="active"), now=now) is False
+    )
+    assert tracker.last_reject_reason == "retained_heartbeat_untrusted"
+    assert tracker.last_valid_ts is None
+
+    assert (
+        tracker.ingest(
+            HeartbeatSample(ts=now + dt.timedelta(seconds=5), retained=False), now=now
+        )
+        is False
+    )
+    assert tracker.last_reject_reason == "heartbeat_from_future"
+
+    assert tracker.ingest(HeartbeatSample(ts=now, retained=False, state=""), now=now) is False
+    assert tracker.last_reject_reason == "heartbeat_malformed"
+
+
+def test_timer_tick_fallback_uses_persisted_timestamp_not_trigger_payload() -> None:
+    settings = _settings()
+    watchdog = FakeHaWatchdog(settings)
+    tracker = HeartbeatSilenceTracker()
+    t0 = dt.datetime(2026, 8, 8, 12, 0, tzinfo=dt.UTC)
+    tracker.ingest(HeartbeatSample(ts=t0), now=t0)
+
+    # Simulate time_pattern tick with no MQTT payload after expiry.
+    now = t0 + dt.timedelta(seconds=90)
+    decision = tracker.evaluate_silence(now=now, expiry_seconds=60, incoming=None)
+    assert decision.should_fallback is True
+    acted = watchdog.maybe_act(heartbeat=tracker.as_sample(), now=now)
+    assert acted.should_fallback is True
+    assert ("switch", "turn_on") not in [(d, a) for d, a, _ in watchdog.service_calls]
+    assert any(c[1] == "turn_off" for c in watchdog.service_calls)

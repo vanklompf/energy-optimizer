@@ -66,7 +66,13 @@ Suggested site helper (name may vary): `input_boolean.pvopti_battery_control_eme
 
 ## Suggested HA automation triggers (site repo)
 
-- MQTT: no message on heartbeat topic for `expiry` seconds (or binary sensor unavailable).
+- **Periodic / timer (required):** `time_pattern` (e.g. every 15s) or an HA timer so
+  heartbeat silence is evaluated after expiry even when MQTT becomes completely quiet.
+  An MQTT-message-only trigger does **not** satisfy Stage C.
+- Persist last valid heartbeat into an `input_datetime` (or equivalent) on ingest;
+  the silence check reads that helper, not the current trigger payload.
+- Reject retained, future, or malformed heartbeat payloads at ingest time.
+- MQTT: optional immediate evaluation on heartbeat topic (in addition to the timer).
 - State: controller lockout attribute / MQTT battery state `LOCKOUT`.
 - State: emergency helper ON.
 - Home Assistant start: if Remote EMS switch is `on`, run fallback once.
