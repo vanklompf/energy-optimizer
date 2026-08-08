@@ -23,7 +23,7 @@ Rules:
 
 - Ordinary implementation, tests, CI, review, and local Docker runs are **non-actuating**. Do not contact live Home Assistant, use live credentials, enable HA entities, change integration options, deploy infrastructure, or send physical control services.
 - Keep `dry_run`, battery control disabled/disarmed, battery export disabled, and an empty arm token as defaults.
-- Use fakes/emulators for HA writes and physical telemetry. No test may require live HA or an inverter.
+- Use fakes/emulators, dummy HA credentials, and blocked outbound networking where the runner supports it. Tests must reject live-looking HA configuration. No test may require or contact live HA or an inverter.
 - Run `git status --short` first. Preserve unrelated work; do not reset, clean, stash, or overwrite it. Stage exact paths only and inspect the staged diff before each commit.
 - Work task-by-task with strict TDD: focused failing test, verify the expected failure, minimal implementation, focused pass, applicable broader suite/static checks, safety review, then a narrow commit.
 - Docker-first verification is canonical: `make test`, `make lint`, `make typecheck`, and `make fe-build`. Focused tests run with `docker compose -f compose.dev.yml run --rm --no-deps app pytest <targets> -v`.
@@ -97,7 +97,7 @@ Each control tick performs this sequence:
 6. Run control-specific authorization and dynamic clamps.
 7. Apply hysteresis/deadband/minimum-dwell logic. A no-op still records a decision.
 8. Execute an idempotent HA transaction using a safe transition sequence.
-9. Read back control entities and physical telemetry until success or timeout.
+9. Read back acknowledgeable control state and physical telemetry until success or timeout. Defective HA number states never count as register acknowledgement.
 10. Persist the requested command, observed result, verification metrics, and resulting controller state.
 11. Publish heartbeat and status. The next tick re-plans/reconciles; no command is considered permanent.
 
@@ -105,7 +105,7 @@ State machine:
 
 - `DISARMED`: remote EMS off; no writes except an explicit fallback/reconcile.
 - `PREFLIGHT`: validate configuration, entity capabilities, freshness, lease, watchdog, and fallback.
-- `ARMED_IDLE`: authorized to control, currently using neutral/fallback behavior.
+- `ARMED_IDLE`: software gates/lease are valid, but Remote EMS is off and verified local `Maximum Self Consumption` is active. Entering Remote EMS-on Standby is a bounded transaction substate, not an indefinite idle state.
 - `ACTIVE_CHARGE`: verified charge command.
 - `ACTIVE_DISCHARGE`: verified discharge command.
 - `FALLBACK`: actively restoring local/default EMS after a soft failure.
@@ -173,6 +173,7 @@ State machine:
 - Empirical Standby verification defaults: ±0.12 kW neutral band and physical timeout no shorter than 15 seconds.
 - A capability/acknowledgement requirement that prevents control authorization while reliable number-register acknowledgement is unavailable.
 - A supported-direction allowlist. Initial implementation may model discharge/export, but authorization remains false until their empirical rollout gates pass.
+- Existing `EO_ALLOW_GRID_CHARGING` and `EO_ALLOW_BATTERY_EXPORT` values describe planner feasibility only. Do not reuse them as physical actuation gates; new control permissions remain separately named and default false.
 
 **TDD steps:**
 
@@ -269,10 +270,10 @@ State machine:
 - Add control-specific inputs: current plan/run status and age, current interval bounds, source and age of current buy/sell price, telemetry ages per entity, inverter/control entity availability, EV telemetry freshness when an EV goal affects the step, lease status, watchdog health, manual override/reconciliation state, SoC/power limits, and recent command failures.
 - Return `control_authorized` separately; never derive it from the existing `control_enabled` field name.
 - Require status `OK` and all critical sources fresh for economic charge/export. Define a conservative fallback/idle path that does not require forecast confidence.
-- Treat NaN/unknown/unavailable values as blockers, not zero.
+- Treat NaN/unknown/unavailable values as blockers, not zero. Boundary-pinned SoC is fresh only when its HA update/poll timestamp and corroborating fast telemetry are fresh; unchanged numeric value alone is neither freshness nor staleness.
 - Record all blocker codes in stable machine-readable form.
 
-**Tests:** Add a table-driven test for every blocker and boundary timestamp, including DST-aware interval selection. Verify that low-confidence planning remains publishable but cannot trigger live arbitrage.
+**Tests:** Add a table-driven test for every blocker and boundary timestamp, including DST-aware interval selection. Include unchanged-but-fresh 100% SoC, unchanged-and-stale SoC, unavailable SoC, and corroborating telemetry loss. Verify that low-confidence planning remains publishable but cannot trigger live arbitrage.
 
 **Commit:** `feat: authorize live control independently from planning`.
 
@@ -558,6 +559,8 @@ Expected: all tests pass; no test requires live HA or live inverter access.
 **Commit:** `docs: add PvOpti live-control runbook`.
 
 ## 5. Staged rollout and release gates
+
+Stages C–G are operator-run acceptance procedures requiring separate explicit authorization. A generic coding harness may implement offline artifacts and tests for them but must not deploy, arm, inject live failures, or infer authorization from this plan.
 
 ### Stage A — Characterization only
 

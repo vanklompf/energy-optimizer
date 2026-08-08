@@ -51,6 +51,10 @@ Sigen telemetry convention used by this project:
 - grid import and export are separate non-negative telemetry values;
 - PvOpti commands battery behavior, not billed grid flow. Grid flow is the residual of PV, household/EV load, and battery power.
 
+The 6.0 kW inverter AC constraint, 8.8/9.6 kW ESS-side limits, and 11/6.6 kW modeled site limits are different constraints and must not be substituted for one another. In particular, a configured export limit is not proof of DSO permission for deliberate battery export.
+
+SoC freshness is boundary-aware. A battery pinned at 100% (or a configured lower boundary) may legitimately report an unchanged value while polling and faster power/grid telemetry remain healthy. Do not classify boundary-pinned SoC as stale solely because its numeric value did not change; require a fresh state update/poll timestamp and corroborating telemetry. This exception does not make an old or unavailable SoC state fresh.
+
 ## Exact Home Assistant control mapping
 
 The empirical contract contains full options/ranges. Core IDs are:
@@ -172,7 +176,16 @@ Pstryk's settled hourly meter intervals are the sole source of billed grid impor
 
 ## Development and deployment boundary
 
-Implementation and ordinary CI are non-actuating. Use fake HA clients or a local emulator. Do not contact the live HA instance or use credentials.
+Implementation and ordinary CI are non-actuating. Use fake HA clients or a local emulator, dummy credentials, and deny outbound network access where the test runner permits it. Tests must fail if configured with a live-looking HA URL/token. Do not contact the live HA instance or use live credentials.
+
+Current deployment facts that affect the control design:
+
+- the site sets `energy_optimizer_available_externally: true`, while the FastAPI application has no authentication middleware or dependency;
+- therefore HTTP `arm` and `clear-lockout` endpoints must not be exposed until an authenticated mutation boundary exists;
+- the site currently builds the image locally with `energy_optimizer_image_force_rebuild: true`, while the generic role defaults to image version `latest`;
+- active rollout requires an immutable reviewed image identifier and an exact rendered configuration record, not either of those mutable build modes;
+- the role deploys one Docker container with one `/data` volume, and PvOpti uses one SQLite database there;
+- a SQLite lease protects processes sharing that database, not a second deployment with a different volume, so deployment validation must enforce one replica/site owner.
 
 The deployment repositories use these owning paths when cross-repository tasks are eventually authorized:
 
