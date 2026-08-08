@@ -71,3 +71,128 @@ def test_ev_control_settings_have_safe_homelab_defaults() -> None:
     assert s.ev_relay_verify_timeout_seconds == 30.0
     assert s.ev_relay_failure_backoff_minutes == 30
     assert s.ev_forecast_surplus_factor == 0.8
+
+
+def test_battery_control_defaults_are_non_actuating() -> None:
+    s = Settings(db=":memory:")
+    assert s.mode == "dry_run"
+    assert s.battery_control_enabled is False
+    assert s.battery_control_arm_token == ""
+    assert s.battery_export_enabled is False
+    assert s.battery_control_grid_charge_enabled is False
+    assert s.battery_control_authorize_discharge is False
+    assert s.battery_control_authorize_export is False
+    assert s.battery_control_number_register_ack_reliable is False
+    assert "DISCHARGE" not in s.battery_control_supported_directions
+    assert s.battery_control_remote_ems_switch_entity == (
+        "switch.sigen_plant_remote_ems_controlled_by_home_assistant"
+    )
+    assert s.battery_control_mode_select_entity == (
+        "select.sigen_plant_remote_ems_control_mode"
+    )
+    assert s.battery_control_mode_standby == "Standby"
+    assert s.battery_control_mode_charge_grid_first == "Command Charging (Grid First)"
+    assert s.battery_control_fallback_mode == "Standby"
+    assert s.battery_control_require_remote_ems_off is True
+    assert s.battery_control_local_charge_limit_kw == 8.8
+    assert s.battery_control_local_discharge_limit_kw == 9.6
+    assert s.battery_control_local_charge_cutoff_pct == 100.0
+    assert s.battery_control_local_discharge_cutoff_pct == 0.0
+    assert s.battery_control_standby_neutral_band_kw == 0.12
+    assert s.battery_control_physical_verify_timeout_seconds >= 15.0
+    # Planner feasibility flags must stay independent of physical actuation gates.
+    assert s.allow_grid_charging is True
+    assert s.allow_battery_export is True
+
+
+def _armed_control_kwargs(**overrides: object) -> dict[str, object]:
+    """Minimal kwargs that satisfy control-mode startup validation."""
+    from energy_optimizer.config import BATTERY_CONTROL_EXPECTED_ARM_TOKEN
+
+    base: dict[str, object] = {
+        "db": ":memory:",
+        "mode": "control",
+        "battery_control_enabled": True,
+        "battery_control_arm_token": BATTERY_CONTROL_EXPECTED_ARM_TOKEN,
+        "battery_control_number_register_ack_reliable": True,
+        "battery_control_grid_charge_enabled": True,
+        "battery_control_supported_directions": ["FALLBACK", "IDLE", "CHARGE"],
+    }
+    base.update(overrides)
+    return base
+
+
+def test_control_mode_requires_both_gates_and_ack() -> None:
+    from energy_optimizer.config import BATTERY_CONTROL_EXPECTED_ARM_TOKEN
+
+    Settings(**_armed_control_kwargs())  # type: ignore[arg-type]
+
+    with pytest.raises(ValueError, match="battery_control_enabled"):
+        Settings(**_armed_control_kwargs(battery_control_enabled=False))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="arm_token"):
+        Settings(**_armed_control_kwargs(battery_control_arm_token=""))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="arm_token"):
+        Settings(
+            **_armed_control_kwargs(battery_control_arm_token="wrong-token")  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="number.register|acknowledgement|ack"):
+        Settings(
+            **_armed_control_kwargs(battery_control_number_register_ack_reliable=False)  # type: ignore[arg-type]
+        )
+    assert BATTERY_CONTROL_EXPECTED_ARM_TOKEN
+
+
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("battery_control_remote_ems_switch_entity", "", "entity"),
+        ("battery_control_mode_select_entity", "", "entity"),
+        ("battery_control_charge_limit_entity", "", "entity"),
+        ("battery_control_discharge_limit_entity", "", "entity"),
+        ("battery_control_charge_cutoff_entity", "", "entity"),
+        ("battery_control_discharge_cutoff_entity", "", "entity"),
+        ("battery_control_mode_standby", "Unknown", "mode|Unknown|option"),
+        ("battery_control_mode_charge_grid_first", "Not A Real Mode", "mode|option"),
+        ("battery_control_fallback_mode", "Unknown", "fallback|Unknown|mode"),
+        ("battery_control_command_mode", "Standby", "command.*fallback|distinct|identical"),
+        ("battery_control_max_charge_kw", 0.0, "charge.*kw|positive|non.?positive"),
+        ("battery_control_max_discharge_kw", -1.0, "discharge.*kw|positive|non.?positive"),
+        ("battery_control_physical_verify_timeout_seconds", 14.9, "15|physical|verify"),
+        ("battery_control_cadence_seconds", 0, "cadence|positive|non.?positive"),
+        ("battery_control_max_plan_age_seconds", -1, "plan.?age|positive|non.?positive"),
+        ("battery_control_max_grid_export_kw", 100.0, "export.*limit|capability|site|inverter"),
+        (
+            "battery_control_min_soc_pct",
+            99.0,
+            "SoC|soc|ordered|reserve|maximum|minimum",
+        ),
+    ],
+)
+def test_battery_control_startup_rejects_invalid_config(
+    field: str, value: object, match: str
+) -> None:
+    kwargs = _armed_control_kwargs(**{field: value})
+    if field == "battery_control_command_mode":
+        kwargs["battery_control_fallback_mode"] = "Standby"
+        kwargs["battery_control_command_mode"] = "Standby"
+    with pytest.raises(ValueError, match=match):
+        Settings(**kwargs)  # type: ignore[arg-type]
+
+
+def test_battery_control_rejects_unknown_supported_direction() -> None:
+    with pytest.raises(ValueError, match="supported.direction"):
+        Settings(
+            **_armed_control_kwargs(  # type: ignore[arg-type]
+                battery_control_supported_directions=["FALLBACK", "IDLE", "TELEPORT"],
+            )
+        )
+
+
+def test_authorize_discharge_requires_discharge_in_allowlist() -> None:
+    with pytest.raises(ValueError, match="DISCHARGE|authorize_discharge|supported"):
+        Settings(
+            **_armed_control_kwargs(  # type: ignore[arg-type]
+                battery_control_authorize_discharge=True,
+                battery_control_supported_directions=["FALLBACK", "IDLE", "CHARGE"],
+            )
+        )

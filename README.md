@@ -72,6 +72,14 @@ EV control (`EO_EV_CONTROL_ENABLED`) is off by default. When on, the optimiser g
 slots. Relay OFF for unplugged/unavailable/fault; `EO_EV_CHARGE_TO_100_ENTITY` forces
 immediate full charge when ON.
 
+Stationary battery control defaults to non-actuating: `EO_MODE=dry_run`,
+`EO_BATTERY_CONTROL_ENABLED=false`, empty `EO_BATTERY_CONTROL_ARM_TOKEN`, and
+`EO_BATTERY_EXPORT_ENABLED=false`. `EO_MODE=control` also requires the documented arm
+token, reliable number-register acknowledgement, and the entity/timing validation in
+`.env.example`. Planner flags `EO_ALLOW_GRID_CHARGING` / `EO_ALLOW_BATTERY_EXPORT` do
+not arm physical battery control. See the Sigenergy control contract before changing
+any of these.
+
 ## Deployment
 
 ansible-nas role `energy_optimizer` (GHCR pull or local build from this tree). Tag push

@@ -14,6 +14,51 @@ from typing import Literal, Self
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Documented expected runtime arm token. Leave EO_BATTERY_CONTROL_ARM_TOKEN empty in
+# examples; control mode requires an exact match and never infers arming from mode alone.
+BATTERY_CONTROL_EXPECTED_ARM_TOKEN = "pvopti-battery-control-armed"
+
+# Exact Remote EMS option strings from docs/sigenergy-control-contract.md.
+SIGENERGY_MODE_PCS_REMOTE_CONTROL = "PCS Remote Control"
+SIGENERGY_MODE_STANDBY = "Standby"
+SIGENERGY_MODE_MAXIMUM_SELF_CONSUMPTION = "Maximum Self Consumption"
+SIGENERGY_MODE_COMMAND_CHARGING_GRID_FIRST = "Command Charging (Grid First)"
+SIGENERGY_MODE_COMMAND_CHARGING_PV_FIRST = "Command Charging (PV First)"
+SIGENERGY_MODE_COMMAND_DISCHARGING_PV_FIRST = "Command Discharging (PV First)"
+SIGENERGY_MODE_COMMAND_DISCHARGING_ESS_FIRST = "Command Discharging (ESS First)"
+SIGENERGY_MODE_V2G = "V2G"
+SIGENERGY_MODE_UNKNOWN = "Unknown"
+
+SIGENERGY_KNOWN_MODES: frozenset[str] = frozenset(
+    {
+        SIGENERGY_MODE_PCS_REMOTE_CONTROL,
+        SIGENERGY_MODE_STANDBY,
+        SIGENERGY_MODE_MAXIMUM_SELF_CONSUMPTION,
+        SIGENERGY_MODE_COMMAND_CHARGING_GRID_FIRST,
+        SIGENERGY_MODE_COMMAND_CHARGING_PV_FIRST,
+        SIGENERGY_MODE_COMMAND_DISCHARGING_PV_FIRST,
+        SIGENERGY_MODE_COMMAND_DISCHARGING_ESS_FIRST,
+        SIGENERGY_MODE_V2G,
+        SIGENERGY_MODE_UNKNOWN,
+    }
+)
+
+# Modes PvOpti may select. Unknown / PCS / V2G remain forbidden.
+SIGENERGY_SELECTABLE_MODES: frozenset[str] = frozenset(
+    {
+        SIGENERGY_MODE_STANDBY,
+        SIGENERGY_MODE_MAXIMUM_SELF_CONSUMPTION,
+        SIGENERGY_MODE_COMMAND_CHARGING_GRID_FIRST,
+        SIGENERGY_MODE_COMMAND_CHARGING_PV_FIRST,
+        SIGENERGY_MODE_COMMAND_DISCHARGING_PV_FIRST,
+        SIGENERGY_MODE_COMMAND_DISCHARGING_ESS_FIRST,
+    }
+)
+
+BATTERY_CONTROL_DIRECTIONS: frozenset[str] = frozenset(
+    {"FALLBACK", "IDLE", "CHARGE", "DISCHARGE"}
+)
+
 
 class PvPlane(BaseModel):
     """A single PV array plane used by the PV forecaster."""
@@ -37,7 +82,7 @@ class Settings(BaseSettings):
     )
 
     # --- General ---
-    mode: Literal["dry_run"] = "dry_run"
+    mode: Literal["dry_run", "control"] = "dry_run"
     tz: str = "Europe/Warsaw"
     db: str = "/data/energy_optimizer.sqlite"
     http_host: str = "0.0.0.0"
@@ -137,6 +182,82 @@ class Settings(BaseSettings):
     # reach this SoC by the end of the current optimisation horizon.
     ev_battery_full_soc_pct: float = Field(default=95.0, ge=50.0, le=100.0)
 
+    # --- Stationary battery control (fail-safe; independent of planner flags) ---
+    # Two-key gate: mode=control AND battery_control_enabled AND matching arm token.
+    # EO_ALLOW_GRID_CHARGING / EO_ALLOW_BATTERY_EXPORT remain planner-only.
+    battery_control_enabled: bool = False
+    battery_control_arm_token: str = ""
+    battery_export_enabled: bool = False
+    battery_control_grid_charge_enabled: bool = False
+    battery_control_authorize_discharge: bool = False
+    battery_control_authorize_export: bool = False
+    # Contract: HA number entities do not acknowledge register writes on this install.
+    battery_control_number_register_ack_reliable: bool = False
+    battery_control_supported_directions: list[str] = Field(
+        default_factory=lambda: ["FALLBACK", "IDLE", "CHARGE"]
+    )
+
+    battery_control_remote_ems_switch_entity: str = (
+        "switch.sigen_plant_remote_ems_controlled_by_home_assistant"
+    )
+    battery_control_mode_select_entity: str = "select.sigen_plant_remote_ems_control_mode"
+    battery_control_charge_limit_entity: str = "number.sigen_plant_ess_max_charging_limit"
+    battery_control_discharge_limit_entity: str = "number.sigen_plant_ess_max_discharging_limit"
+    battery_control_charge_cutoff_entity: str = (
+        "number.sigen_plant_ess_charge_cut_off_state_of_charge"
+    )
+    battery_control_discharge_cutoff_entity: str = (
+        "number.sigen_plant_ess_discharge_cut_off_state_of_charge"
+    )
+    battery_control_watchdog_health_entity: str = ""
+    battery_control_watchdog_ack_entity: str = ""
+
+    battery_control_mode_standby: str = SIGENERGY_MODE_STANDBY
+    battery_control_mode_charge_grid_first: str = SIGENERGY_MODE_COMMAND_CHARGING_GRID_FIRST
+    battery_control_mode_charge_pv_first: str = SIGENERGY_MODE_COMMAND_CHARGING_PV_FIRST
+    battery_control_mode_discharge_pv_first: str = SIGENERGY_MODE_COMMAND_DISCHARGING_PV_FIRST
+    battery_control_mode_discharge_ess_first: str = SIGENERGY_MODE_COMMAND_DISCHARGING_ESS_FIRST
+    battery_control_mode_max_self_consumption: str = SIGENERGY_MODE_MAXIMUM_SELF_CONSUMPTION
+    # Active command mode used when charging under Remote EMS.
+    battery_control_command_mode: str = SIGENERGY_MODE_COMMAND_CHARGING_GRID_FIRST
+    battery_control_fallback_mode: str = SIGENERGY_MODE_STANDBY
+    battery_control_require_remote_ems_off: bool = True
+
+    # Explicit local-restore values; never populate from HA number-entity fallback states.
+    battery_control_local_charge_limit_kw: float = 8.8
+    battery_control_local_discharge_limit_kw: float = 9.6
+    battery_control_local_charge_cutoff_pct: float = 100.0
+    battery_control_local_discharge_cutoff_pct: float = 0.0
+
+    battery_control_max_grid_import_kw: float = Field(default=11.0, ge=0)
+    # Capped by the inverter AC limit by default (site export rating alone is not enough).
+    battery_control_max_grid_export_kw: float = Field(default=6.0, ge=0)
+    battery_control_max_charge_kw: float = Field(default=8.8, ge=0)
+    battery_control_max_discharge_kw: float = Field(default=9.6, ge=0)
+    battery_control_min_soc_pct: float = Field(default=15.0, ge=0, le=100)
+    battery_control_max_soc_pct: float = Field(default=98.0, ge=0, le=100)
+    battery_control_charge_cutoff_margin_pct: float = Field(default=0.5, ge=0, le=100)
+    battery_control_discharge_cutoff_margin_pct: float = Field(default=0.5, ge=0, le=100)
+
+    battery_control_cadence_seconds: float = Field(default=30.0, ge=0)
+    battery_control_max_plan_age_seconds: float = Field(default=900.0, ge=0)
+    battery_control_max_telemetry_age_seconds: float = Field(default=120.0, ge=0)
+    battery_control_command_settle_seconds: float = Field(default=2.0, ge=0)
+    battery_control_command_poll_seconds: float = Field(default=1.0, ge=0)
+    battery_control_command_timeout_seconds: float = Field(default=30.0, ge=0)
+    # Contract: physical Standby/command verification deadline is at least 15 seconds.
+    battery_control_physical_verify_timeout_seconds: float = Field(default=15.0, ge=0)
+    battery_control_heartbeat_interval_seconds: float = Field(default=15.0, ge=0)
+    battery_control_heartbeat_expiry_seconds: float = Field(default=60.0, ge=0)
+    battery_control_min_dwell_seconds: float = Field(default=60.0, ge=0)
+    battery_control_standby_neutral_band_kw: float = Field(default=0.12, ge=0)
+    battery_control_deadband_kw: float = Field(default=0.12, ge=0)
+    battery_control_max_power_step_kw: float = Field(default=0.5, ge=0)
+    battery_control_max_ramp_kw_per_s: float = Field(default=0.5, ge=0)
+    battery_control_retry_limit: int = Field(default=2, ge=0)
+    battery_control_lockout_duration_seconds: float = Field(default=3600.0, ge=0)
+    battery_control_activation_margin_pln_kwh: float = Field(default=0.05, ge=0)
+
     # --- PV forecast ---
     pv_lat: float = 51.9194
     pv_lon: float = 19.1451
@@ -197,6 +318,154 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_battery_control_settings(self) -> Self:
+        self._validate_battery_control_mode_strings()
+        self._validate_battery_control_directions()
+        self._validate_battery_control_limits_and_timings()
+        if self.mode == "control" or self.battery_control_enabled:
+            self._validate_battery_control_entities()
+        if self.mode == "control":
+            self._validate_battery_control_armed()
+        return self
+
+    def _validate_battery_control_mode_strings(self) -> None:
+        mode_fields = {
+            "battery_control_mode_standby": self.battery_control_mode_standby,
+            "battery_control_mode_charge_grid_first": self.battery_control_mode_charge_grid_first,
+            "battery_control_mode_charge_pv_first": self.battery_control_mode_charge_pv_first,
+            "battery_control_mode_discharge_pv_first": self.battery_control_mode_discharge_pv_first,
+            "battery_control_mode_discharge_ess_first": (
+                self.battery_control_mode_discharge_ess_first
+            ),
+            "battery_control_mode_max_self_consumption": (
+                self.battery_control_mode_max_self_consumption
+            ),
+            "battery_control_command_mode": self.battery_control_command_mode,
+            "battery_control_fallback_mode": self.battery_control_fallback_mode,
+        }
+        for name, value in mode_fields.items():
+            if value not in SIGENERGY_KNOWN_MODES:
+                raise ValueError(f"{name} is not a known Sigenergy mode option: {value!r}")
+            if value == SIGENERGY_MODE_UNKNOWN:
+                raise ValueError(f"{name} must not use Unknown mode option")
+            if value not in SIGENERGY_SELECTABLE_MODES:
+                raise ValueError(f"{name} mode option is not selectable by PvOpti: {value!r}")
+        if self.battery_control_command_mode == self.battery_control_fallback_mode:
+            raise ValueError(
+                "battery_control_command_mode must be distinct from battery_control_fallback_mode"
+            )
+
+    def _validate_battery_control_directions(self) -> None:
+        directions = [d.strip().upper() for d in self.battery_control_supported_directions]
+        if not directions:
+            raise ValueError("battery_control_supported_directions must not be empty")
+        unknown = [d for d in directions if d not in BATTERY_CONTROL_DIRECTIONS]
+        if unknown:
+            raise ValueError(f"unsupported control supported.direction value(s): {unknown}")
+        object.__setattr__(self, "battery_control_supported_directions", directions)
+        if self.battery_control_authorize_discharge and "DISCHARGE" not in directions:
+            raise ValueError(
+                "authorize_discharge requires DISCHARGE in battery_control_supported_directions"
+            )
+        if self.battery_control_authorize_export and not self.battery_export_enabled:
+            raise ValueError(
+                "authorize_export requires battery_export_enabled physical actuation gate"
+            )
+
+    def _validate_battery_control_entities(self) -> None:
+        required = {
+            "battery_control_remote_ems_switch_entity": (
+                self.battery_control_remote_ems_switch_entity
+            ),
+            "battery_control_mode_select_entity": self.battery_control_mode_select_entity,
+            "battery_control_charge_limit_entity": self.battery_control_charge_limit_entity,
+            "battery_control_discharge_limit_entity": self.battery_control_discharge_limit_entity,
+            "battery_control_charge_cutoff_entity": self.battery_control_charge_cutoff_entity,
+            "battery_control_discharge_cutoff_entity": self.battery_control_discharge_cutoff_entity,
+        }
+        missing = [name for name, value in required.items() if not str(value).strip()]
+        if missing:
+            raise ValueError(f"battery control entity id(s) missing: {', '.join(missing)}")
+
+    def _validate_battery_control_limits_and_timings(self) -> None:
+        if self.battery_control_max_charge_kw <= 0:
+            raise ValueError("battery_control_max_charge_kw must be positive")
+        if self.battery_control_max_discharge_kw <= 0:
+            raise ValueError("battery_control_max_discharge_kw must be positive")
+        if self.battery_control_max_grid_import_kw <= 0:
+            raise ValueError("battery_control_max_grid_import_kw must be positive")
+        if self.battery_control_cadence_seconds <= 0:
+            raise ValueError("battery_control_cadence_seconds must be positive")
+        if self.battery_control_max_plan_age_seconds <= 0:
+            raise ValueError("battery_control_max_plan_age_seconds must be positive")
+        if self.battery_control_max_telemetry_age_seconds <= 0:
+            raise ValueError("battery_control_max_telemetry_age_seconds must be positive")
+        if self.battery_control_command_poll_seconds <= 0:
+            raise ValueError("battery_control_command_poll_seconds must be positive")
+        if self.battery_control_command_timeout_seconds <= 0:
+            raise ValueError("battery_control_command_timeout_seconds must be positive")
+        if self.battery_control_heartbeat_interval_seconds <= 0:
+            raise ValueError("battery_control_heartbeat_interval_seconds must be positive")
+        if self.battery_control_heartbeat_expiry_seconds <= 0:
+            raise ValueError("battery_control_heartbeat_expiry_seconds must be positive")
+        if self.battery_control_lockout_duration_seconds <= 0:
+            raise ValueError("battery_control_lockout_duration_seconds must be positive")
+        if self.battery_control_standby_neutral_band_kw <= 0:
+            raise ValueError("battery_control_standby_neutral_band_kw must be positive")
+        if self.battery_control_deadband_kw <= 0:
+            raise ValueError("battery_control_deadband_kw must be positive")
+        if self.battery_control_max_power_step_kw <= 0:
+            raise ValueError("battery_control_max_power_step_kw must be positive")
+        if self.battery_control_max_ramp_kw_per_s <= 0:
+            raise ValueError("battery_control_max_ramp_kw_per_s must be positive")
+        if self.battery_control_physical_verify_timeout_seconds < 15.0:
+            raise ValueError(
+                "battery_control_physical_verify_timeout_seconds must be at least 15 "
+                "(Sigenergy physical verification contract)"
+            )
+        export_cap = min(self.site_export_limit_kw, self.inverter_limit_kw)
+        if self.battery_control_max_grid_export_kw > export_cap + 1e-9:
+            raise ValueError(
+                "battery_control_max_grid_export_kw exceeds site/inverter export capability"
+            )
+        if self.battery_control_max_charge_kw > self.battery_max_charge_kw + 1e-9:
+            raise ValueError("battery_control_max_charge_kw exceeds battery_max_charge_kw")
+        if self.battery_control_max_discharge_kw > self.battery_max_discharge_kw + 1e-9:
+            raise ValueError("battery_control_max_discharge_kw exceeds battery_max_discharge_kw")
+        if not (
+            self.battery_hard_soc_min_pct
+            <= self.battery_control_min_soc_pct
+            <= self.battery_control_max_soc_pct
+            <= self.battery_soc_max_pct
+        ):
+            raise ValueError(
+                "battery control SoC must be ordered: hard floor <= control minimum "
+                "<= control maximum <= battery maximum"
+            )
+        if self.mode == "control" or self.battery_control_enabled:
+            if self.battery_control_min_soc_pct < self.battery_soc_min_pct - 1e-9:
+                raise ValueError(
+                    "battery_control_min_soc_pct must be at least the operating reserve "
+                    "(battery_soc_min_pct)"
+                )
+
+    def _validate_battery_control_armed(self) -> None:
+        if not self.battery_control_enabled:
+            raise ValueError(
+                "mode=control requires battery_control_enabled as an independent gate"
+            )
+        if self.battery_control_arm_token != BATTERY_CONTROL_EXPECTED_ARM_TOKEN:
+            raise ValueError(
+                "mode=control requires battery_control_arm_token to match the documented "
+                "expected arm token"
+            )
+        if not self.battery_control_number_register_ack_reliable:
+            raise ValueError(
+                "mode=control requires reliable number-register acknowledgement "
+                "(battery_control_number_register_ack_reliable)"
+            )
+
     @field_validator("pv_planes", mode="before")
     @classmethod
     def _parse_pv_planes(cls, v: object) -> object:
@@ -206,6 +475,18 @@ class Settings(BaseSettings):
             import json
 
             return json.loads(v)
+        return v
+
+    @field_validator("battery_control_supported_directions", mode="before")
+    @classmethod
+    def _parse_supported_directions(cls, v: object) -> object:
+        if isinstance(v, str):
+            import json
+
+            text = v.strip()
+            if text.startswith("["):
+                return json.loads(text)
+            return [part.strip() for part in text.split(",") if part.strip()]
         return v
 
 
