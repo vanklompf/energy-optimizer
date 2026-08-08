@@ -184,6 +184,60 @@ class DailyReport(Base):
     forecast_error_cost_pln: Mapped[float | None] = mapped_column(Float)
 
 
+class ControlAction(Base):
+    """Append-only audit of battery control decisions and outcomes. Never stores secrets."""
+
+    __tablename__ = "control_actions"
+
+    command_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, index=True
+    )
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    source_run_id: Mapped[str | None] = mapped_column(String(64))
+    interval_start: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    intent_json: Mapped[str | None] = mapped_column(SAText)
+    authorization_allowed: Mapped[bool] = mapped_column(Boolean, default=False)
+    blockers_json: Mapped[str | None] = mapped_column(SAText)
+    requested_state: Mapped[str | None] = mapped_column(String(32))
+    observed_state: Mapped[str | None] = mapped_column(String(32))
+    physical_json: Mapped[str | None] = mapped_column(SAText)
+    result: Mapped[str] = mapped_column(String(32), default="pending")  # pending|ok|failed|fallback
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    latency_ms: Mapped[float | None] = mapped_column(Float)
+
+
+class ControllerStateRow(Base):
+    """Singleton controller state including lockout. key always ``current``."""
+
+    __tablename__ = "controller_state"
+
+    key: Mapped[str] = mapped_column(String(16), primary_key=True, default="current")
+    state: Mapped[str] = mapped_column(String(32), default="DISARMED")
+    armed_reason: Mapped[str | None] = mapped_column(SAText)
+    consecutive_failures: Mapped[int] = mapped_column(default=0)
+    lockout_until: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    lockout_reason: Mapped[str | None] = mapped_column(SAText)
+    last_successful_command_id: Mapped[str | None] = mapped_column(String(64))
+    last_fallback_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    last_fallback_verified: Mapped[bool] = mapped_column(Boolean, default=False)
+    manual_override: Mapped[bool] = mapped_column(Boolean, default=False)
+    last_heartbeat_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ControllerLease(Base):
+    """Single-owner lease for one site/target key."""
+
+    __tablename__ = "controller_lease"
+
+    target_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    owner_id: Mapped[str] = mapped_column(String(64))
+    acquired_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    renewed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    expires_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
+
+
 class Store:
     """Owns the SQLAlchemy engine and session factory for a single SQLite database."""
 
