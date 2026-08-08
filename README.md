@@ -15,6 +15,14 @@ zero-filled or compressed out of time.
 
 See [`DESIGN.md`](./DESIGN.md) for the design. Config reference: [`.env.example`](./.env.example).
 
+Battery-control implementation handoff:
+
+- [implementation plan](./docs/plans/2026-08-08_001527-pvopti-actual-energy-control.md)
+- [site and external-system context](./docs/battery-control-context.md)
+- [verified Sigenergy control contract](./docs/sigenergy-control-contract.md)
+
+The implementation plan is non-actuating: ordinary coding, tests, and CI must not contact or control the live inverter.
+
 ## Docker-first
 
 Run only in Docker. Common tasks are in the `Makefile` and compose files:

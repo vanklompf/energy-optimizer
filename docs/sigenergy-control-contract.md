@@ -6,6 +6,8 @@ Site: Sigen Plant through Home Assistant
 
 This document records only behavior observed on the installed system. Upstream names or assumed Modbus semantics are not treated as verified capabilities.
 
+Implementation consumers should also read [`battery-control-context.md`](./battery-control-context.md) and the [actual-control implementation plan](./plans/2026-08-08_001527-pvopti-actual-energy-control.md). This empirical document is authoritative when a plan, code comment, or upstream integration assumption conflicts with it.
+
 ## Safety state after characterization
 
 - Remote EMS is verified `off` in HA and raw diagnostics (`plant_remote_ems_enable = 0`).
