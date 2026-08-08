@@ -122,10 +122,20 @@ async def test_charge_happy_path_and_unacked_limit_blocks(monkeypatch) -> None:
     )
     physical = EmulatedPhysical(
         [
-            phys(0.0),
-            phys(0.05),
-            phys(0.5, grid_in=0.6),
-            phys(0.5, grid_in=0.6),
+            phys(0.0, ems_mode="Standby"),
+            phys(0.05, ems_mode="Standby"),
+            phys(
+                0.5,
+                grid_in=0.6,
+                ems_mode="Command Charging (Grid First)",
+                charge_limit_kw=0.5,
+            ),
+            phys(
+                0.5,
+                grid_in=0.6,
+                ems_mode="Command Charging (Grid First)",
+                charge_limit_kw=0.5,
+            ),
         ]
     )
 
@@ -258,7 +268,8 @@ async def test_service_dry_run_and_lease_conflict_and_startup_fallback(monkeypat
     _seed_plan(store, now)
 
     dry = await service.control_battery(now=now)
-    assert dry["result"] == "dry_run_skipped"
+    assert dry["result"] == "shadow"
+    assert dry["direction"] == "CHARGE"
 
     # Fresh store: foreign owner holds the lease before this process tries.
     store2 = Store(":memory:")
@@ -346,7 +357,7 @@ async def test_duplicate_instance_lease_lockout() -> None:
     b = Service(settings, store)
     now = utcnow()
     first = await a.control_battery(now=now)
-    assert first["result"] == "dry_run_skipped"
+    assert first["result"] == "shadow"
     second = await b.control_battery(now=now)
     assert second["result"] == "lease_conflict"
     from energy_optimizer.store import ControllerStateRow

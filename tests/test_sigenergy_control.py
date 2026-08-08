@@ -77,13 +77,33 @@ class FakeHa:
 class FakePhysical:
     sequence: list[PhysicalSnapshot]
     idx: int = 0
+    freeze_timestamps: bool = False
 
     async def read_physical(self) -> PhysicalSnapshot:
         if self.idx < len(self.sequence) - 1:
             snap = self.sequence[self.idx]
             self.idx += 1
+        else:
+            snap = self.sequence[-1]
+        if self.freeze_timestamps:
             return snap
-        return self.sequence[-1]
+        now = dt.datetime.now(tz=dt.UTC)
+        return PhysicalSnapshot(
+            battery_power_kw=snap.battery_power_kw,
+            grid_import_kw=snap.grid_import_kw,
+            grid_export_kw=snap.grid_export_kw,
+            soc_pct=snap.soc_pct,
+            ems_mode=snap.ems_mode,
+            sampled_at=now,
+            battery_power_updated_at=now,
+            grid_import_updated_at=now,
+            grid_export_updated_at=now,
+            soc_updated_at=now,
+            charge_limit_kw=snap.charge_limit_kw,
+            discharge_limit_kw=snap.discharge_limit_kw,
+            charge_cutoff_pct=snap.charge_cutoff_pct,
+            discharge_cutoff_pct=snap.discharge_cutoff_pct,
+        )
 
 
 def _state(entity_id: str, state: str, attributes: dict | None = None) -> HaState:
@@ -101,12 +121,23 @@ def _phys(
     grid_in: float | None = 0.0,
     grid_out: float | None = 0.0,
     soc: float | None = 50.0,
+    ems_mode: str | None = None,
+    updated_at: dt.datetime | None = None,
+    charge_limit_kw: float | None = None,
 ) -> PhysicalSnapshot:
+    ts = updated_at or dt.datetime.now(tz=dt.UTC)
     return PhysicalSnapshot(
         battery_power_kw=battery,
         grid_import_kw=grid_in,
         grid_export_kw=grid_out,
         soc_pct=soc,
+        ems_mode=ems_mode,
+        sampled_at=ts,
+        battery_power_updated_at=ts,
+        grid_import_updated_at=ts,
+        grid_export_updated_at=ts,
+        soc_updated_at=ts,
+        charge_limit_kw=charge_limit_kw,
     )
 
 
@@ -217,9 +248,15 @@ async def test_characterized_charge_order_when_ack_reliable() -> None:
     )
     physical = FakePhysical(
         [
-            _phys(-0.36),
-            _phys(0.05),
-            _phys(0.5, grid_in=0.9, soc=50.1),
+            _phys(-0.36, ems_mode="Standby"),
+            _phys(0.05, ems_mode="Standby"),
+            _phys(
+                0.5,
+                grid_in=0.9,
+                soc=50.1,
+                ems_mode="Command Charging (Grid First)",
+                charge_limit_kw=0.5,
+            ),
         ]
     )
 
@@ -268,8 +305,8 @@ async def test_fallback_turns_remote_ems_off() -> None:
     )
     physical = FakePhysical(
         [
-            _phys(0.5, grid_in=0.8),
-            _phys(0.05),
+            _phys(0.5, grid_in=0.8, ems_mode="Command Charging (Grid First)"),
+            _phys(0.05, ems_mode="Standby"),
         ]
     )
     ticks = {"n": 0.0}
@@ -291,6 +328,215 @@ async def test_fallback_turns_remote_ems_off() -> None:
     result = await controller.fallback("test")
     assert ("switch", "turn_off") in [(d, s) for d, s, _ in result.service_calls]
     assert ha.states[settings.battery_control_remote_ems_switch_entity].state == "off"
+    # Unreliable number ack path cannot claim verified recovery.
+    assert result.control.physical_verified is False
+    assert result.control.observed_state.value == "LOCKOUT"
+
+
+@pytest.mark.asyncio
+async def test_fallback_verified_requires_restores_and_local_behavior() -> None:
+    settings = _settings()
+    ha = FakeHa(
+        states={
+            settings.battery_control_remote_ems_switch_entity: _state(
+                settings.battery_control_remote_ems_switch_entity, "on"
+            ),
+            settings.battery_control_mode_select_entity: _state(
+                settings.battery_control_mode_select_entity, "Command Charging (Grid First)"
+            ),
+        },
+        number_register_ack_reliable=True,
+        number_ack=AckStatus.ACKNOWLEDGED,
+    )
+    physical = FakePhysical(
+        [
+            _phys(0.5, ems_mode="Command Charging (Grid First)"),
+            _phys(0.05, ems_mode="Standby"),
+        ]
+    )
+    ticks = {"n": 0.0}
+
+    def mono() -> float:
+        ticks["n"] += 0.25
+        return ticks["n"]
+
+    async def _sleep(_s: float) -> None:
+        return None
+
+    controller = SigenergyController(
+        ha,  # type: ignore[arg-type]
+        settings,
+        physical=physical,
+        sleep=_sleep,
+        monotonic=mono,
+    )
+    result = await controller.fallback("test")
+    assert result.control.physical_verified is True
+    assert result.control.observed_state.value == "DISARMED"
+    assert result.lockout is False
+
+
+@pytest.mark.asyncio
+async def test_charge_rejects_export_while_charging() -> None:
+    settings = _settings()
+    ha = FakeHa(
+        states={
+            settings.battery_control_remote_ems_switch_entity: _state(
+                settings.battery_control_remote_ems_switch_entity, "off"
+            ),
+            settings.battery_control_mode_select_entity: _state(
+                settings.battery_control_mode_select_entity,
+                "Standby",
+                attributes={"options": ["Standby", "Command Charging (Grid First)"]},
+            ),
+        },
+        number_register_ack_reliable=True,
+        number_ack=AckStatus.ACKNOWLEDGED,
+    )
+    physical = FakePhysical(
+        [
+            _phys(0.05, ems_mode="Standby"),
+            _phys(0.05, ems_mode="Standby"),
+            _phys(
+                0.5,
+                grid_in=0.2,
+                grid_out=0.4,
+                ems_mode="Command Charging (Grid First)",
+                charge_limit_kw=0.5,
+            ),
+        ]
+    )
+    ticks = {"n": 0.0}
+
+    def mono() -> float:
+        ticks["n"] += 0.5
+        return ticks["n"]
+
+    async def _sleep(_s: float) -> None:
+        return None
+
+    controller = SigenergyController(
+        ha,  # type: ignore[arg-type]
+        settings,
+        physical=physical,
+        sleep=_sleep,
+        monotonic=mono,
+    )
+    result = await controller.apply_intent(_intent(power=0.5))
+    assert result.control.physical_verified is False
+    assert result.control.failure_reason in {
+        "charge_with_export_contradiction",
+        "unplanned_export",
+        "fallback_restores_unverified",
+        "fallback_neutral_timeout",
+        "fallback_local_behavior_unverified",
+        "fallback_standby_unacknowledged",
+        "fallback_remote_off_failed",
+    } or (
+        result.control.failure_reason is not None
+        and (
+            "charge_with_export" in result.control.failure_reason
+            or "export" in result.control.failure_reason
+            or result.control.failure_reason.startswith("fallback_")
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_charge_rejects_stale_pre_command_samples() -> None:
+    settings = _settings()
+    ha = FakeHa(
+        states={
+            settings.battery_control_remote_ems_switch_entity: _state(
+                settings.battery_control_remote_ems_switch_entity, "off"
+            ),
+            settings.battery_control_mode_select_entity: _state(
+                settings.battery_control_mode_select_entity,
+                "Standby",
+                attributes={"options": ["Standby", "Command Charging (Grid First)"]},
+            ),
+        },
+        number_register_ack_reliable=True,
+        number_ack=AckStatus.ACKNOWLEDGED,
+    )
+    stale = dt.datetime(2020, 1, 1, tzinfo=dt.UTC)
+    physical = FakePhysical(
+        [
+            _phys(0.05, ems_mode="Standby"),
+            _phys(0.05, ems_mode="Standby"),
+            _phys(
+                0.5,
+                grid_in=0.9,
+                ems_mode="Command Charging (Grid First)",
+                charge_limit_kw=0.5,
+                updated_at=stale,
+            ),
+        ],
+        freeze_timestamps=True,
+    )
+    ticks = {"n": 0.0}
+
+    def mono() -> float:
+        ticks["n"] += 0.5
+        return ticks["n"]
+
+    async def _sleep(_s: float) -> None:
+        return None
+
+    controller = SigenergyController(
+        ha,  # type: ignore[arg-type]
+        settings,
+        physical=physical,
+        sleep=_sleep,
+        monotonic=mono,
+    )
+    result = await controller.apply_intent(_intent(power=0.5))
+    assert result.control.physical_verified is False
+    assert result.control.failure_reason is not None
+
+
+@pytest.mark.asyncio
+async def test_fallback_rejects_continued_charge_after_remote_off() -> None:
+    settings = _settings()
+    ha = FakeHa(
+        states={
+            settings.battery_control_remote_ems_switch_entity: _state(
+                settings.battery_control_remote_ems_switch_entity, "on"
+            ),
+            settings.battery_control_mode_select_entity: _state(
+                settings.battery_control_mode_select_entity, "Command Charging (Grid First)"
+            ),
+        },
+        number_register_ack_reliable=True,
+        number_ack=AckStatus.ACKNOWLEDGED,
+    )
+    # Neutral briefly for standby wait, then keep charging after remote off.
+    physical = FakePhysical(
+        [
+            _phys(0.05, ems_mode="Standby"),
+            _phys(0.5, ems_mode="Standby"),
+        ]
+    )
+    ticks = {"n": 0.0}
+
+    def mono() -> float:
+        ticks["n"] += 0.5
+        return ticks["n"]
+
+    async def _sleep(_s: float) -> None:
+        return None
+
+    controller = SigenergyController(
+        ha,  # type: ignore[arg-type]
+        settings,
+        physical=physical,
+        sleep=_sleep,
+        monotonic=mono,
+    )
+    result = await controller.fallback("test")
+    assert result.control.physical_verified is False
+    assert result.control.failure_reason == "fallback_local_behavior_unverified"
+    assert result.lockout is True
 
 
 @pytest.mark.asyncio

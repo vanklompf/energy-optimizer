@@ -90,7 +90,10 @@ class EmulatedHa:
     def _maybe_fail(self, domain: str | None = None, service: str | None = None) -> None:
         if self.http_error is not None:
             raise self.http_error
-        if self.disconnect_after_calls is not None and len(self.calls) >= self.disconnect_after_calls:
+        if (
+            self.disconnect_after_calls is not None
+            and len(self.calls) >= self.disconnect_after_calls
+        ):
             raise ConnectionError("emulated HA disconnect")
         if self.fail_service and domain and service and (domain, service) == self.fail_service:
             raise RuntimeError(f"emulated HA {domain}.{service} failure")
@@ -100,13 +103,33 @@ class EmulatedHa:
 class EmulatedPhysical:
     sequence: list[PhysicalSnapshot]
     idx: int = 0
+    freeze_timestamps: bool = False
 
     async def read_physical(self) -> PhysicalSnapshot:
         if self.idx >= len(self.sequence):
-            return self.sequence[-1]
-        snap = self.sequence[self.idx]
-        self.idx += 1
-        return snap
+            snap = self.sequence[-1]
+        else:
+            snap = self.sequence[self.idx]
+            self.idx += 1
+        if self.freeze_timestamps:
+            return snap
+        now = dt.datetime.now(tz=dt.UTC)
+        return PhysicalSnapshot(
+            battery_power_kw=snap.battery_power_kw,
+            grid_import_kw=snap.grid_import_kw,
+            grid_export_kw=snap.grid_export_kw,
+            soc_pct=snap.soc_pct,
+            ems_mode=snap.ems_mode,
+            sampled_at=now,
+            battery_power_updated_at=now,
+            grid_import_updated_at=now,
+            grid_export_updated_at=now,
+            soc_updated_at=now,
+            charge_limit_kw=snap.charge_limit_kw,
+            discharge_limit_kw=snap.discharge_limit_kw,
+            charge_cutoff_pct=snap.charge_cutoff_pct,
+            discharge_cutoff_pct=snap.discharge_cutoff_pct,
+        )
 
 
 def phys(
@@ -116,11 +139,20 @@ def phys(
     grid_out: float | None = 0.0,
     soc: float | None = 50.0,
     ems_mode: str | None = None,
+    charge_limit_kw: float | None = None,
+    updated_at: dt.datetime | None = None,
 ) -> PhysicalSnapshot:
+    ts = updated_at or dt.datetime.now(tz=dt.UTC)
     return PhysicalSnapshot(
         battery_power_kw=battery_power_kw,
         grid_import_kw=grid_in,
         grid_export_kw=grid_out,
         soc_pct=soc,
         ems_mode=ems_mode,
+        sampled_at=ts,
+        battery_power_updated_at=ts,
+        grid_import_updated_at=ts,
+        grid_export_updated_at=ts,
+        soc_updated_at=ts,
+        charge_limit_kw=charge_limit_kw,
     )
