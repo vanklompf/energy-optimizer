@@ -1,10 +1,14 @@
 # Energy Optimizer — design
 
-Status: implemented dry-run + opt-in EV relay control (updated 2026-08-03).
+Status: dry-run recommendations + opt-in EV relay control; stationary battery control
+plane implemented behind fail-closed gates (updated 2026-08-08).
 
 Dockerised solar/battery optimisation app (`energy-optimizer` / PvOpti repo), shipped as
-an image and deployed by the ansible-nas `energy_optimizer` role. Sigen battery control
-stays dry-run; EV/PHEV charger relay control is a separate opt-in.
+an image and deployed by the ansible-nas `energy_optimizer` role. Sigen battery **actuation**
+defaults remain dry-run/disarmed; EV/PHEV charger relay control is a separate opt-in.
+
+Operator arming, fallback, and incident response: [`docs/control-runbook.md`](./docs/control-runbook.md).
+Deployment `EO_*` contract: [`docs/deployment-variables.md`](./docs/deployment-variables.md).
 
 ## System context
 
@@ -50,16 +54,20 @@ flowchart LR
 | Module | Responsibility |
 |---|---|
 | `config.py` | Pydantic Settings (`EO_*`) |
-| `ha_client.py` | HA REST states/history; staleness |
+| `ha_client.py` | HA REST states/history; verified control primitives |
 | `pstryk_client.py` | unified-metrics + history bootstrap |
 | `forecast/*` | PV planes, load median, price padding |
 | `optimiser.py` | duration-aware explicit-flow MILP (HiGHS/PuLP) |
 | `ev.py` / `ev_control.py` | flexible-load plan + fail-safe relay decisions |
-| `simulator.py` / `policies.py` / `accounting.py` | backtests and counterfactuals |
-| `explain.py` / `safety.py` | reasons; blockers; Sigen `control_enabled` always false |
-| `scheduler.py` | collect 1m, EV control 1m, prices/optimise 15m |
+| `battery_control.py` / `sigenergy_control.py` | typed intents + transactional adapter |
+| `safety.py` | plan status + independent `control_authorized` |
+| `control_store.py` | audit / lease / lockout |
+| `watchdog.py` | heartbeat health + fake HA watchdog fixtures |
+| `simulator.py` / `policies.py` / `accounting.py` | backtests; control-aware replay |
+| `explain.py` | recommendation reasons |
+| `scheduler.py` | collect 1m, EV 1m, battery cadence, heartbeat, prices/optimise 15m |
 | `store.py` | SQLAlchemy SQLite |
-| `mqtt_publish.py` | discovery + recommendation sensors |
+| `mqtt_publish.py` | discovery + recommendation + battery control sensors |
 | `web/` | REST + static SPA |
 
 ## Storage (`/data/energy_optimizer.sqlite`)
@@ -71,6 +79,7 @@ prices(...)             # buy/sell components; source api|forecast
 forecasts(...)
 runs(...) / plan_steps(...) / ev_plan_steps(...)
 ev_control_status(...)  # latest relay decision
+control_actions(...) / controller_state(...) / controller_lease(...)
 daily_reports(...)
 ```
 

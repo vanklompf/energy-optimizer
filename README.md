@@ -20,6 +20,9 @@ Battery-control implementation handoff:
 - [implementation plan](./docs/plans/2026-08-08_001527-pvopti-actual-energy-control.md)
 - [site and external-system context](./docs/battery-control-context.md)
 - [verified Sigenergy control contract](./docs/sigenergy-control-contract.md)
+- [deployment variable contract](./docs/deployment-variables.md)
+- [watchdog interface](./docs/battery-control-watchdog-interface.md)
+- [live-control operator runbook](./docs/control-runbook.md)
 
 The implementation plan is non-actuating: ordinary coding, tests, and CI must not contact or control the live inverter.
 
