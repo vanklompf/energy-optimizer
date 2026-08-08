@@ -73,6 +73,8 @@ class Service:
         self.store = store
         self._mqtt: MqttPublisher | None = None
         self.ev_charge_to_100_active = False
+        self.controller_owner_id = str(uuid.uuid4())
+        self._battery_control_lock = asyncio.Lock()
 
     # --- lifecycle ---------------------------------------------------------
     def start_mqtt(self) -> None:
@@ -276,6 +278,369 @@ class Service:
                 )
             )
         logger.info("EV control action=%s reason=%s", decision.action, decision.reason)
+
+    # --- battery control ---------------------------------------------------
+    def build_battery_control_intent(self, now: dt.datetime | None = None):
+        """Select the plan interval containing now and translate it to a typed intent."""
+        from .battery_control import PlanFlowSnapshot, intent_from_plan_flows
+        from .safety import select_current_interval
+
+        now = now or utcnow()
+        s = self.settings
+        with self.store.session() as session:
+            run = session.execute(
+                select(Run)
+                .where(Run.status.in_(("ok", "low_confidence")))
+                .order_by(Run.ts.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if run is None:
+                raise ValueError("no successful plan available")
+            steps = (
+                session.execute(
+                    select(PlanStep)
+                    .where(PlanStep.run_id == run.run_id)
+                    .order_by(PlanStep.interval_start)
+                )
+                .scalars()
+                .all()
+            )
+        starts = [_aware(step.interval_start) for step in steps]
+        selected = select_current_interval(
+            starts, now=now, step_minutes=s.step_minutes, tz=s.tz
+        )
+        if selected is None:
+            raise ValueError("no current plan interval")
+        interval_start, interval_end = selected
+        step = next(st for st in steps if _aware(st.interval_start) == interval_start)
+        flows = PlanFlowSnapshot(
+            interval_start=interval_start,
+            dt_hours=step.dt_hours,
+            pv_to_battery_kwh=step.pv_to_battery_kwh,
+            grid_to_battery_kwh=step.grid_to_battery_kwh,
+            battery_to_load_kwh=step.battery_to_load_kwh,
+            battery_to_grid_kwh=step.battery_to_grid_kwh,
+            battery_to_ev_kwh=0.0,
+            grid_import_kwh=step.grid_to_load_kwh + step.grid_to_battery_kwh,
+            grid_export_kwh=step.pv_to_grid_kwh + step.battery_to_grid_kwh,
+            pv_to_grid_kwh=step.pv_to_grid_kwh,
+        )
+        intent = intent_from_plan_flows(
+            flows,
+            settings=s,
+            source_run_id=None if run.run_id is None else abs(hash(run.run_id)) % (10**9),
+            now=now,
+            expiry=interval_end,
+        )
+        plan_age = max(0.0, (now - _aware(run.ts)).total_seconds())
+        return intent, run.run_id, interval_start, plan_age
+
+    async def control_battery(
+        self, now: dt.datetime | None = None, *, force_fallback: bool = False
+    ) -> dict[str, object]:
+        """Lease, authorize, optionally actuate, audit, and publish battery control status."""
+        async with self._battery_control_lock:
+            return await self._control_battery_locked(now=now, force_fallback=force_fallback)
+
+    async def _control_battery_locked(
+        self, *, now: dt.datetime | None, force_fallback: bool
+    ) -> dict[str, object]:
+        from .battery_control import ControlDirection
+        from .control_store import (
+            ensure_controller_state,
+            finalize_action,
+            is_locked_out,
+            persist_pending_action,
+            set_lockout,
+            try_acquire_lease,
+        )
+        from .sigenergy_control import SigenergyController
+
+        now = now or utcnow()
+        s = self.settings
+        command_id = str(uuid.uuid4())
+
+        if force_fallback:
+            return await self.fallback_battery("force_fallback", command_id=command_id)
+
+        with self.store.session() as session:
+            if is_locked_out(session, now=now):
+                return {"result": "lockout", "command_id": command_id}
+            if not try_acquire_lease(
+                session,
+                owner_id=self.controller_owner_id,
+                ttl_seconds=s.battery_control_heartbeat_expiry_seconds,
+                now=now,
+            ):
+                set_lockout(
+                    session,
+                    reason="lease_conflict",
+                    duration_seconds=s.battery_control_lockout_duration_seconds,
+                    now=now,
+                )
+                return {"result": "lease_conflict", "command_id": command_id}
+            ensure_controller_state(session)
+
+        if s.mode != "control" or not s.battery_control_enabled:
+            with self.store.session() as session:
+                persist_pending_action(
+                    session,
+                    command_id=command_id,
+                    source_run_id=None,
+                    interval_start=None,
+                    intent={"direction": "IDLE", "dry_run": True},
+                    authorization_allowed=False,
+                    blockers=["dry_run_or_disarmed"],
+                    requested_state="DISARMED",
+                )
+                finalize_action(
+                    session,
+                    command_id,
+                    observed_state="DISARMED",
+                    physical=None,
+                    result="dry_run_skipped",
+                    error_code="dry_run_or_disarmed",
+                )
+            return {"result": "dry_run_skipped", "command_id": command_id}
+
+        try:
+            intent, run_id, interval_start, plan_age = self.build_battery_control_intent(now)
+        except ValueError as exc:
+            reason = f"stale_plan:{exc}"[:60]
+            return await self.fallback_battery(reason, command_id=command_id)
+
+        economic = intent.direction in {ControlDirection.CHARGE, ControlDirection.DISCHARGE}
+        soc_pct, soc_age = self._latest_soc_with_age(now)
+        # Watchdog health is proven in Task 11; fail closed until then.
+        safety = evaluate(
+            SafetyInputs(
+                telemetry_stale=False,
+                telemetry_stale_reasons=[],
+                have_current_price=True,
+                have_pv_forecast=True,
+                have_load_forecast=True,
+                known_price_hours=float(s.optimise_horizon_hours),
+                horizon_hours=float(s.optimise_horizon_hours),
+                mode_is_control=s.mode == "control",
+                battery_control_enabled=s.battery_control_enabled,
+                number_register_ack_reliable=s.battery_control_number_register_ack_reliable,
+                lease_held=True,
+                watchdog_healthy=False,
+                economic_action=economic,
+                plan_status_ok=True,
+                plan_age_seconds=plan_age,
+                max_plan_age_seconds=s.battery_control_max_plan_age_seconds,
+                max_telemetry_age_seconds=s.battery_control_max_telemetry_age_seconds,
+                current_interval_start=interval_start,
+                current_interval_end=interval_start + dt.timedelta(minutes=s.step_minutes),
+                now=now,
+                current_buy_price=None,
+                current_sell_price=None,
+                current_price_is_real=False,
+                current_price_age_seconds=None,
+                soc_pct=soc_pct,
+                soc_update_age_seconds=soc_age,
+                corroborating_power_fresh=False,
+            )
+        )
+        with self.store.session() as session:
+            persist_pending_action(
+                session,
+                command_id=command_id,
+                source_run_id=run_id,
+                interval_start=interval_start,
+                intent={
+                    "direction": intent.direction.value,
+                    "requested_power_kw": intent.requested_power_kw,
+                    "grid_charge": intent.grid_charge,
+                    "export": intent.export,
+                    "reason_codes": list(intent.reason_codes),
+                },
+                authorization_allowed=safety.control_authorized,
+                blockers=safety.control_blockers,
+                requested_state=intent.direction.value,
+            )
+
+        if not safety.control_authorized:
+            with self.store.session() as session:
+                finalize_action(
+                    session,
+                    command_id,
+                    observed_state="DISARMED",
+                    physical=None,
+                    result="blocked",
+                    error_code=(",".join(safety.control_blockers) or "not_authorized")[:64],
+                )
+            return {
+                "result": "blocked",
+                "command_id": command_id,
+                "blockers": safety.control_blockers,
+            }
+
+        async with HaClient(
+            s.ha_url,
+            s.ha_token,
+            verify_ssl=s.ha_verify_ssl,
+            number_register_ack_reliable=s.battery_control_number_register_ack_reliable,
+        ) as ha:
+            controller = SigenergyController(ha, s)
+            outcome = await controller.apply_intent(intent)
+
+        with self.store.session() as session:
+            finalize_action(
+                session,
+                command_id,
+                observed_state=(
+                    outcome.control.observed_state.value
+                    if outcome.control.observed_state
+                    else None
+                ),
+                physical={"verified": outcome.control.physical_verified},
+                result="ok" if outcome.control.failure_reason is None else "failed",
+                error_code=outcome.control.failure_reason,
+                latency_ms=outcome.control.latency_ms,
+            )
+            state = ensure_controller_state(session)
+            if outcome.lockout:
+                set_lockout(
+                    session,
+                    reason=outcome.control.lockout_reason or "control_failure",
+                    duration_seconds=s.battery_control_lockout_duration_seconds,
+                    now=now,
+                )
+            elif outcome.control.failure_reason is None:
+                state.state = (
+                    outcome.control.observed_state.value
+                    if outcome.control.observed_state
+                    else state.state
+                )
+                state.last_successful_command_id = command_id
+                state.consecutive_failures = 0
+                state.updated_at = now
+        return {
+            "result": "ok" if outcome.control.failure_reason is None else "failed",
+            "command_id": command_id,
+            "failure_reason": outcome.control.failure_reason,
+        }
+
+    async def fallback_battery(
+        self, reason: str, *, command_id: str | None = None
+    ) -> dict[str, object]:
+        """Plan-independent fallback to local EMS. Safe when optimizer is down."""
+        from .control_store import ensure_controller_state, finalize_action, persist_pending_action
+        from .sigenergy_control import SigenergyController
+
+        s = self.settings
+        command_id = command_id or str(uuid.uuid4())
+        with self.store.session() as session:
+            persist_pending_action(
+                session,
+                command_id=command_id,
+                source_run_id=None,
+                interval_start=None,
+                intent={"direction": "FALLBACK", "reason": reason},
+                authorization_allowed=True,
+                blockers=[],
+                requested_state="FALLBACK",
+            )
+
+        if s.mode != "control" or not s.battery_control_enabled or not s.ha_token:
+            with self.store.session() as session:
+                finalize_action(
+                    session,
+                    command_id,
+                    observed_state="DISARMED",
+                    physical=None,
+                    result="fallback_recorded",
+                    error_code=reason,
+                )
+                state = ensure_controller_state(session)
+                state.last_fallback_at = utcnow()
+                state.last_fallback_verified = False
+                state.state = "DISARMED"
+            return {"result": "fallback_recorded", "command_id": command_id, "reason": reason}
+
+        async with HaClient(
+            s.ha_url,
+            s.ha_token,
+            verify_ssl=s.ha_verify_ssl,
+            number_register_ack_reliable=s.battery_control_number_register_ack_reliable,
+        ) as ha:
+            outcome = await SigenergyController(ha, s).fallback(reason, command_id=command_id)
+
+        with self.store.session() as session:
+            finalize_action(
+                session,
+                command_id,
+                observed_state=(
+                    outcome.control.observed_state.value
+                    if outcome.control.observed_state
+                    else "FALLBACK"
+                ),
+                physical={"verified": outcome.control.physical_verified},
+                result="fallback",
+                error_code=reason,
+                latency_ms=outcome.control.latency_ms,
+            )
+            state = ensure_controller_state(session)
+            state.last_fallback_at = utcnow()
+            state.last_fallback_verified = bool(outcome.control.physical_verified)
+            state.state = (
+                outcome.control.observed_state.value
+                if outcome.control.observed_state
+                else "FALLBACK"
+            )
+        return {"result": "fallback", "command_id": command_id, "reason": reason}
+
+    async def reconcile_battery_on_startup(self) -> dict[str, object]:
+        """Never trust persisted desired state; fall back if Remote EMS is unexpectedly on."""
+        from .control_store import ensure_controller_state, list_pending_actions
+
+        s = self.settings
+        with self.store.session() as session:
+            ensure_controller_state(session)
+            for pending in list_pending_actions(session):
+                pending.result = "abandoned_on_restart"
+                pending.error_code = "restart_recovery"
+                pending.updated_at = utcnow()
+
+        if s.mode != "control" or not s.battery_control_enabled or not s.ha_token:
+            return {"result": "disarmed_startup"}
+
+        async with HaClient(s.ha_url, s.ha_token, verify_ssl=s.ha_verify_ssl) as ha:
+            remote = await ha.get_state(s.battery_control_remote_ems_switch_entity)
+            if remote is not None and remote.state == "on":
+                return await self.fallback_battery("startup_remote_ems_on")
+        return {"result": "startup_ok"}
+
+    async def shutdown_battery_control(self) -> dict[str, object]:
+        from .control_store import release_lease
+
+        result = await self.fallback_battery("shutdown")
+        with self.store.session() as session:
+            release_lease(session, owner_id=self.controller_owner_id)
+        return result
+
+    async def publish_battery_heartbeat(self) -> None:
+        """Lightweight heartbeat independent of optimisation."""
+        from .control_store import ensure_controller_state
+
+        now = utcnow()
+        with self.store.session() as session:
+            state = ensure_controller_state(session)
+            state.last_heartbeat_at = now
+            state.updated_at = now
+            payload = {
+                "ts": now.isoformat(),
+                "state": state.state,
+                "owner_id": self.controller_owner_id,
+                "lockout": bool(state.lockout_until and _aware(state.lockout_until) > now),
+            }
+        if self._mqtt is not None:
+            try:
+                self._mqtt.publish_battery_heartbeat(payload)
+            except Exception as exc:  # pragma: no cover
+                logger.warning("battery heartbeat publish failed: %s", exc)
 
     async def refresh_prices(self, days_ahead: int = 2, history_days: int | None = None) -> int:
         s = self.settings
@@ -683,11 +1048,17 @@ class Service:
 
     # --- helpers -----------------------------------------------------------
     def _latest_soc_pct(self) -> float | None:
+        soc, _age = self._latest_soc_with_age(utcnow())
+        return soc
+
+    def _latest_soc_with_age(self, now: dt.datetime) -> tuple[float | None, float | None]:
         with self.store.session() as session:
             row = session.execute(
                 select(Telemetry).order_by(Telemetry.ts.desc()).limit(1)
             ).scalar_one_or_none()
-            return row.soc_pct if row else None
+        if row is None:
+            return None, None
+        return row.soc_pct, max(0.0, (now - _aware(row.ts)).total_seconds())
 
     def _latest_ev_telemetry(self) -> EvTelemetry | None:
         with self.store.session() as session:

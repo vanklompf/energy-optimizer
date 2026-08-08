@@ -137,6 +137,16 @@ class MqttPublisher:
         client = self._require_client()
         client.publish(self._state_topic, json.dumps(state.as_payload()), qos=1, retain=True)
 
+    def publish_battery_heartbeat(self, payload: dict[str, object]) -> None:
+        """Publish a non-retained heartbeat so stale 'active' cannot outlive the process.
+
+        Retained discovery/availability remain on the main LWT topic; the heartbeat itself
+        must expire via payload timestamp semantics (see Task 11 watchdog).
+        """
+        client = self._require_client()
+        topic = f"{self._cfg.node_id}/battery_control/heartbeat"
+        client.publish(topic, json.dumps(payload), qos=1, retain=False)
+
     def build_discovery_configs(self) -> dict[str, dict[str, object]]:
         """Return discovery topic -> config, without publishing (useful for tests)."""
         configs: dict[str, dict[str, object]] = {}

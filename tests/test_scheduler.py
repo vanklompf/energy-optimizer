@@ -20,6 +20,27 @@ def test_scheduler_collects_and_controls_ev_every_minute() -> None:
     assert str(job.trigger) == "interval[0:01:00]"
 
 
+def test_scheduler_registers_serialized_battery_control_and_heartbeat() -> None:
+    settings = Settings(
+        db=":memory:",
+        mqtt_enabled=False,
+        battery_control_cadence_seconds=30,
+        battery_control_heartbeat_interval_seconds=15,
+    )
+    store = Store(":memory:")
+    store.create_all()
+    scheduler = build_scheduler(Service(settings, store))
+
+    control = scheduler.get_job("battery_control")
+    heartbeat = scheduler.get_job("battery_heartbeat")
+    assert control is not None
+    assert heartbeat is not None
+    assert control.max_instances == 1
+    assert control.coalesce is True
+    assert str(control.trigger) == "interval[0:00:30]"
+    assert str(heartbeat.trigger) == "interval[0:00:15]"
+
+
 async def test_startup_and_optimise_refresh_ev_before_planning_and_control() -> None:
     calls: list[str] = []
 
@@ -41,6 +62,15 @@ async def test_startup_and_optimise_refresh_ev_before_planning_and_control() -> 
         async def control_ev_charging(self):
             calls.append("control")
 
+        async def control_battery(self, now=None, force_fallback: bool = False):
+            calls.append("battery")
+
+        async def fallback_battery(self, reason: str, command_id=None):
+            calls.append(f"battery_fallback:{reason}")
+
+        async def publish_battery_heartbeat(self):
+            calls.append("heartbeat")
+
         async def refresh_prices(self):
             calls.append("prices")
 
@@ -50,11 +80,11 @@ async def test_startup_and_optimise_refresh_ev_before_planning_and_control() -> 
     scheduler = build_scheduler(FakeService())  # type: ignore[arg-type]
 
     await scheduler.get_job("bootstrap").func()
-    assert calls == ["bootstrap", "telemetry", "ev", "optimise", "control"]
+    assert calls == ["bootstrap", "telemetry", "ev", "optimise", "control", "battery"]
 
     calls.clear()
     await scheduler.get_job("optimise").func()
-    assert calls == ["ev", "optimise", "control"]
+    assert calls == ["ev", "optimise", "control", "battery"]
 
     calls.clear()
     await scheduler.get_job("prices").func()
@@ -100,6 +130,12 @@ async def test_ev_control_waits_for_in_progress_optimisation_pipeline() -> None:
         async def control_ev_charging(self):
             calls.append("control")
 
+        async def control_battery(self, now=None, force_fallback: bool = False):
+            calls.append("battery")
+
+        async def fallback_battery(self, reason: str, command_id=None):
+            calls.append(f"battery_fallback:{reason}")
+
     scheduler = build_scheduler(FakeService())  # type: ignore[arg-type]
     optimise_task = asyncio.create_task(scheduler.get_job("optimise").func())
     await optimise_started.wait()
@@ -110,7 +146,7 @@ async def test_ev_control_waits_for_in_progress_optimisation_pipeline() -> None:
 
     release_optimise.set()
     await asyncio.gather(optimise_task, control_task)
-    assert calls == ["ev", "optimise", "control", "ev", "control"]
+    assert calls == ["ev", "optimise", "control", "battery", "ev", "control"]
 
 
 async def test_ev_control_still_attempts_fail_safe_control_when_collection_fails() -> None:
@@ -126,6 +162,12 @@ async def test_ev_control_still_attempts_fail_safe_control_when_collection_fails
         async def control_ev_charging(self, force_off: bool = False):
             calls.append(f"control:{force_off}")
 
+        async def control_battery(self, now=None, force_fallback: bool = False):
+            calls.append("battery")
+
+        async def fallback_battery(self, reason: str, command_id=None):
+            calls.append(f"battery_fallback:{reason}")
+
         async def run_optimise(self):
             calls.append("optimise")
 
@@ -136,4 +178,54 @@ async def test_ev_control_still_attempts_fail_safe_control_when_collection_fails
 
     calls.clear()
     await scheduler.get_job("optimise").func()
-    assert calls == ["ev", "control:True"]
+    assert calls == ["ev", "control:True", "battery_fallback:optimise_failed"]
+
+
+async def test_optimise_failure_triggers_battery_fallback_independently() -> None:
+    calls: list[str] = []
+
+    class FakeService:
+        settings = Settings(db=":memory:", mqtt_enabled=False)
+
+        async def collect_ev_telemetry(self):
+            calls.append("ev")
+
+        async def run_optimise(self):
+            calls.append("optimise")
+            raise RuntimeError("solver boom")
+
+        async def control_ev_charging(self, force_off: bool = False):
+            calls.append(f"control:{force_off}")
+
+        async def control_battery(self, now=None, force_fallback: bool = False):
+            calls.append("battery")
+
+        async def fallback_battery(self, reason: str, command_id=None):
+            calls.append(f"battery_fallback:{reason}")
+
+    scheduler = build_scheduler(FakeService())  # type: ignore[arg-type]
+    await scheduler.get_job("optimise").func()
+    assert calls == [
+        "ev",
+        "optimise",
+        "control:True",
+        "battery_fallback:optimise_failed",
+    ]
+
+
+async def test_collect_failure_triggers_battery_fallback() -> None:
+    calls: list[str] = []
+
+    class FakeService:
+        settings = Settings(db=":memory:", mqtt_enabled=False)
+
+        async def collect_telemetry(self):
+            calls.append("telemetry")
+            raise RuntimeError("ha down")
+
+        async def fallback_battery(self, reason: str, command_id=None):
+            calls.append(f"battery_fallback:{reason}")
+
+    scheduler = build_scheduler(FakeService())  # type: ignore[arg-type]
+    await scheduler.get_job("collect").func()
+    assert calls == ["telemetry", "battery_fallback:collect_telemetry_failed"]

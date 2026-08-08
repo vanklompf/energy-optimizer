@@ -30,6 +30,10 @@ def create_app(settings: Settings | None = None, *, run_scheduler: bool = True) 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         service.start_mqtt()
+        try:
+            await service.reconcile_battery_on_startup()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("battery startup reconcile failed")
         scheduler = None
         if run_scheduler:
             scheduler = build_scheduler(service)
@@ -40,6 +44,10 @@ def create_app(settings: Settings | None = None, *, run_scheduler: bool = True) 
         finally:
             if scheduler is not None:
                 scheduler.shutdown(wait=False)
+            try:
+                await service.shutdown_battery_control()
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("battery shutdown fallback failed")
             service.stop_mqtt()
 
     app = FastAPI(title="energy-optimizer", version="0.1.0", lifespan=lifespan)
