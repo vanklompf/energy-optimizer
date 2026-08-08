@@ -39,27 +39,33 @@ Rules:
 
 ### Audited task coverage at handoff
 
-This read-only coverage audit reflects the code and uncommitted worktree on 2026-08-08. Re-run Task 0 if those files change. Stationary-battery actuation coverage is effectively zero: PvOpti still cannot arm or command it.
+This read-only coverage audit was first recorded for the 2026-08-08 handoff snapshot. Task 0 was re-run before implementation on 2026-08-08 after HEAD `615f045` with the pre-existing hard-floor/EV worktree still present; those changes were then preserved as commits `36ce7e0`, `b676d51`, and `0af865d`. Stationary-battery actuation coverage remains effectively zero: PvOpti still cannot arm or command it.
 
 | Task | Current status | Existing evidence / resume point |
 |---|---|---|
-| 1 — empirical contract | Implementation input complete; rollout evidence partial | `docs/sigenergy-control-contract.md`; failure containment, autonomous expiry, discharge/export, cut-off enforcement, and reliable number read-back remain blockers. |
-| 2 — control configuration | Mostly absent | `Settings.mode` is still `Literal["dry_run"]`; no stationary-battery enable/arm gates, entity map, transaction timings, watchdog, fallback, or live-config validator. Worktree hard-floor settings are EV/reserve groundwork only. |
+| 1 — empirical contract | Complete as implementation input; rollout evidence partial | `docs/sigenergy-control-contract.md` + `docs/battery-control-context.md` (commit `933e26e`). Failure containment, autonomous expiry, discharge/export, cut-off enforcement, and reliable number read-back remain rollout blockers. |
+| 2 — control configuration | Absent | `Settings.mode` is still `Literal["dry_run"]`; no stationary-battery enable/arm gates, entity map, transaction timings, watchdog, fallback, or live-config validator. Hard-floor/reserve settings (`battery_hard_soc_min_pct`, `battery_soc_min_pct`) are optimizer/EV policy only. |
 | 3 — typed intent/state machine | Absent | No `battery_control.py`, controller enums/intents/results, or focused tests. |
-| 4 — actionable optimizer | Partial; preserve existing work | Existing optimizer already models independent planner permissions, explicit energy flows, binary charge/discharge and import/export exclusion, site limits, losses, degradation, and EV obligations. Worktree adds hard-floor/reserve-shortfall and explicit PV/grid/battery-to-EV flows. Activation margins are configured but not consumed; stable reasons and live-current-price authorization remain missing. |
+| 4 — actionable optimizer | Partial | Independent planner permissions, explicit house/EV flows (`pv_to_ev`/`grid_to_ev`/`battery_to_ev`), binary charge/discharge and import/export exclusion, site limits, losses, degradation, EV obligations, hard-floor SoC, and reserve-shortfall constraints are present. Activation margins are configured but not consumed; stable reason codes and live-current-price authorization remain missing. |
 | 5 — control authorization | Absent | `safety.py` still hardcodes `CONTROL_ENABLED = False`; there is no separate `control_authorized`. |
 | 6 — HA primitives | Battery-specific layer absent | Generic `HAClient.call_service` exists; typed control snapshots, validation, acknowledgement semantics, and battery tests do not. |
 | 7 — Sigenergy adapter | Absent | No adapter module or tests. |
 | 8 — audit/lease/lockout persistence | Absent | No control action/state/lease schema. |
 | 9 — service/scheduler control loop | Absent | No intent builder, battery job, fallback/reconcile, lease, or heartbeat. |
-| 10 — API/MQTT/frontend status | Absent | Existing worktree API additions describe EV policy only. |
+| 10 — API/MQTT/frontend status | Absent for battery control | Status/API expose EV policy including `battery_hard_floor_pct`; no battery-control arm/state/lease surface. |
 | 11 — layered watchdog | Absent | The deployed selector overlay solves dormant-mode ordering; it is not a watchdog. |
 | 12 — Ansible control variables | Absent beyond optimizer/EV groundwork | No battery-control gates, entity/timing mapping, watchdog assertions, or immutable active image. |
-| 13 — control-aware simulation | Mostly absent | Settlement integrity exists; worktree adds battery-to-EV throughput only, not cadence/delay/ramp/deadband/fallback replay. |
+| 13 — control-aware simulation | Mostly absent | Settlement integrity exists; simulator counts battery-to-EV throughput only, not cadence/delay/ramp/deadband/fallback replay. |
 | 14 — fault-injection integration tests | Absent | No battery-control integration test harness. |
 | 15 — operator runbook | Absent | This plan and context are implementation handoff documents, not an arming/incident runbook. |
 
-Read-only audit verification ran focused `test_config.py`, `test_optimiser.py`, `test_service.py`, and `test_api.py`: **60 passed** with deprecation warnings. That result is evidence for the audited snapshot only. Full pytest, lint, mypy, frontend, Ansible, and HA validation were not run; the implementing harness must use the canonical Docker-first commands before claiming completion.
+#### Task 0 / Task 1 work log (2026-08-08 implementation start)
+
+- HEAD before preserve commits: `615f045`. Focused Docker pytest on `tests/test_config.py`, `tests/test_optimiser.py`, `tests/test_service.py`, `tests/test_api.py`: **60 passed** (PuLP/Starlette deprecation warnings only). No baseline failures.
+- Unrelated pre-existing hard-floor/EV work was classified as Task 4 groundwork, not battery actuation, and committed separately before continuing the plan.
+- Task 1 remains satisfied by the empirical contract docs; no live HA/inverter contact. Next plan work is Task 2 (control configuration).
+- Untracked `opencode.json` left untouched (editor tooling; not part of this plan).
+- Full pytest, lint, mypy, frontend, Ansible, and HA validation were not run for this audit.
 
 Do not redo the existing optimizer foundations. Before Task 9, resolve these persistence/selection hazards:
 
@@ -145,7 +151,7 @@ State machine:
 
 ### Task 0: Establish the actual code baseline without modifying it
 
-**Status:** Completed for the 2026-08-08 handoff snapshot above. Repeat before implementation if `git status`, HEAD, or relevant symbols differ.
+**Status:** Completed. Handoff audit recorded above; re-run on 2026-08-08 before implementation (focused 60-pass suite; hard-floor/EV worktree preserved as `36ce7e0`/`b676d51`/`0af865d`). Repeat again if `git status`, HEAD, or relevant symbols differ before a later task.
 
 **Objective:** Determine which plan requirements are already present in HEAD or the current worktree and preserve unrelated work.
 

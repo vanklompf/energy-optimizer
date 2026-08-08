@@ -26,7 +26,7 @@ PvOpti is one of three repositories involved in eventual rollout:
 
 The other repositories may not be available to an external coding harness. Application tasks must not assume they are mounted. Cross-repository work is a separate workstream and must be committed in its owning repository.
 
-At this handoff, PvOpti contains unrelated uncommitted optimizer/EV work in `.env.example`, `DESIGN.md`, `src/energy_optimizer/{config,explain,optimiser,service,simulator}.py`, `src/energy_optimizer/web/routes.py`, and corresponding tests, plus untracked `opencode.json`. These changes predate the documentation handoff. Inspect and preserve them; do not assume they belong to a plan task or include them in a documentation commit without reviewing their provenance.
+At handoff, PvOpti contained unrelated optimizer/EV hard-floor work that predated the documentation commits. That work was inspected during Task 0 and preserved as `36ce7e0` (hard-floor settings), `b676d51` (MILP EV/reserve flows), and `0af865d` (service/API wiring). Untracked `opencode.json` remains local editor tooling and is not part of the battery-control plan.
 
 ## Installed site and sign conventions
 
