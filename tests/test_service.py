@@ -60,6 +60,8 @@ def _settings() -> Settings:
         ev_relay_verify_timeout_seconds=2,
         battery_max_charge_kw=5.0,
         battery_max_discharge_kw=5.0,
+        battery_control_max_charge_kw=5.0,
+        battery_control_max_discharge_kw=5.0,
         battery_soc_min_pct=20.0,
         battery_soc_max_pct=98.0,
         battery_round_trip_efficiency=0.90,

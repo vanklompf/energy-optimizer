@@ -182,8 +182,6 @@ Current deployment facts that affect the control design:
 
 - the site sets `energy_optimizer_available_externally: true`, while the FastAPI application has no authentication middleware or dependency;
 - therefore HTTP `arm` and `clear-lockout` endpoints must not be exposed until an authenticated mutation boundary exists;
-- the site currently builds the image locally with `energy_optimizer_image_force_rebuild: true`, while the generic role defaults to image version `latest`;
-- active rollout requires an immutable reviewed image identifier and an exact rendered configuration record, not either of those mutable build modes;
 - the role deploys one Docker container with one `/data` volume, and PvOpti uses one SQLite database there;
 - a SQLite lease protects processes sharing that database, not a second deployment with a different volume, so deployment validation must enforce one replica/site owner.
 

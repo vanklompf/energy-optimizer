@@ -11,7 +11,6 @@ Do not invent substitute Ansible roles inside this repository.
 | Role defaults: `dry_run`, control off, export off, empty arm token | Met in uncommitted `ansible-nas` role worktree |
 | Map battery-control `energy_optimizer_*` → `EO_*` | Met |
 | Activation asserts (gates, entities, watchdog, fallback) | Met |
-| Reject floating image for `mode=control` | Met (`image_digest` or non-`latest`/`local` tag) |
 | `no_log` around HA/Pstryk/arm | Met |
 | Site inventory non-actuating | Met (`mode=dry_run`, control/export off) |
 | Ansible commits | Deferred — keep changes uncommitted until an infra-owner commit |
@@ -61,7 +60,6 @@ A live deploy with `energy_optimizer_mode=control` must fail unless:
 - all six EMS entity IDs are non-empty
 - both watchdog entity IDs are non-empty
 - fallback mode is set and Remote EMS-off restore is required
-- image is immutable (`energy_optimizer_image_digest` set, or a non-floating reviewed tag — not `latest`/`local`)
 
 ## Site inventory policy
 

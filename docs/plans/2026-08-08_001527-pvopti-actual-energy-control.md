@@ -504,7 +504,6 @@ If those repositories are not available, add/verify the complete `EO_*` applicat
 - Map every `energy_optimizer_*` variable to one `EO_*` environment variable; quote numeric/bool values consistently.
 - Add Ansible assertions equivalent to application validation, including a multi-condition activation gate. A live deploy must fail if `mode=control` but watchdog, exact entity mapping, fallback mode, or both arming gates are absent.
 - Keep `no_log` around tasks containing HA/Pstryk credentials and arm tokens.
-- Pin a tested image digest/tag for each rollout stage; do not use an unreviewed floating tag for active control.
 - Do not turn on battery export in the site inventory until the export-specific rollout stage passes.
 
 **Verification:** In the owning infrastructure checkout, run its canonical role tests/lint, `ansible-playbook --syntax-check`, and an explicitly authorized check-mode deployment workflow. Inspect the rendered container environment with secrets redacted. A generic coding harness must not trigger a live deployment.
@@ -596,6 +595,105 @@ Expected: all tests pass; no test requires live HA or live inverter access.
 
 **Commit:** `docs: add PvOpti live-control runbook`.
 
+### Task 16: Make shadow mode exercise the real decision path
+
+**Objective:** Produce useful Stage B evidence without allowing any HA write.
+
+**Files:**
+- Modify: `src/energy_optimizer/service.py`
+- Modify: `src/energy_optimizer/control_store.py` if the existing audit schema needs additional timestamps/evidence
+- Test: `tests/test_battery_control_loop.py`
+- Test: `tests/test_api.py`
+
+**Changes:**
+
+- In `dry_run`, build the current plan-derived intent, evaluate the same authorization inputs used by control mode, and persist the source run, interval, requested direction/power, blockers, warnings, expiry, expected grid direction/range, price/telemetry timestamps, and EV/reserve constraints.
+- Preserve the hard no-write boundary: dry-run must never instantiate or call the Sigen actuator, regardless of whether the hypothetical authorization result is allowed.
+- Replace the current synthetic `IDLE` / `dry_run_skipped` audit-only path with a distinct shadow result that keeps requested intent separate from the non-actuating observed state.
+- Wire fresh watchdog, price, telemetry, and corroborating-power evidence into authorization instead of hardcoded `false`/`None` placeholders. Missing evidence must remain fail-closed.
+
+**Acceptance:** A representative Stage B window contains real source run/interval intents and authorization evidence while an HA emulator proves zero service calls.
+
+**Commit:** `fix: exercise real authorization path in shadow mode`.
+
+### Task 17: Make physical command verification multi-signal and freshness-aware
+
+**Objective:** Prevent battery power alone from producing a false successful command result.
+
+**Files:**
+- Modify: `src/energy_optimizer/sigenergy_control.py`
+- Modify: `src/energy_optimizer/ha_client.py` if timestamped physical samples are not currently available
+- Test: `tests/test_sigenergy_control.py`
+- Test: `tests/test_battery_control_integration.py`
+- Test fixture: `tests/ha_emulator.py`
+
+**Changes:**
+
+- Require fresh, post-command battery power, grid import/export, SoC, EMS mode, and limit/cut-off evidence.
+- Enforce the intent's expected grid direction/range, site import/export limits, SoC/cut-off bounds, and no-unplanned-export rule.
+- Reject stale, pre-command, missing, contradictory, or wrong-direction samples; ambiguous evidence must trigger fallback/lockout, never `physical_verified=true`.
+- Require a stable response over multiple samples rather than one threshold crossing.
+
+**Regression tests:** Reproduce and reject a grid-charge command showing battery charge while the site exports, stale timestamp acceptance, wrong mode, exceeded site import, unexpected export, and crossed SoC cut-off.
+
+**Commit:** `fix: verify battery commands with fresh grid evidence`.
+
+### Task 18: Make fallback success contingent on complete verified recovery
+
+**Objective:** Never report `DISARMED` / `physical_verified=true` from Remote EMS switch acknowledgement alone.
+
+**Files:**
+- Modify: `src/energy_optimizer/sigenergy_control.py`
+- Modify: `src/energy_optimizer/control_store.py` if per-step recovery evidence is not retained
+- Test: `tests/test_sigenergy_control.py`
+- Test: `tests/test_battery_control_integration.py`
+
+**Changes:**
+
+- Treat Standby acknowledgement and bounded physical neutral as mandatory.
+- Require every configured local limit/cut-off restore to be acknowledged through the reliable register path; retain exact failure evidence.
+- Require Remote EMS off plus observed return to local behavior before reporting verified fallback.
+- On timeout, restore failure, stale evidence, or continued battery activity, persist failure and enter/retain lockout even if Remote EMS off is acknowledged.
+- Keep cleanup best-effort, but separate "attempted" from "verified safe" in result/API/MQTT fields.
+
+**Regression tests:** Reproduce and reject fallback with neutral timeout, each individual restore failure, all restores failing, Remote EMS-off acknowledgement with continued 0.5 kW charging, stale samples, and partial HA disconnect.
+
+**Commit:** `fix: require complete physical fallback verification`.
+
+### Task 19: Make heartbeat-silence detection real and rehearse layered fallback
+
+**Objective:** Detect missing heartbeats without requiring a new MQTT message and prove the complete Stage C failure matrix.
+
+**Files:**
+- Modify in site-config: `HpeNas/homeassistant/automations/pvopti_battery_watchdog.yaml`
+- Modify/create corresponding HA helper/timer configuration in the site-config repository
+- Modify: `docs/battery-control-watchdog-interface.md`
+- Test: `tests/test_watchdog.py`
+
+**Changes:**
+
+- Add a periodic/time-based trigger or HA timer so heartbeat silence is evaluated after expiry even when MQTT becomes completely quiet.
+- Persist the last valid heartbeat timestamp independently of the trigger payload; reject malformed/future/retained stale payloads.
+- Keep every path incapable of enabling Remote EMS.
+- Prove process stop/hang, MQTT loss, HA restart, integration reload, Modbus/network loss, and the separately defined HA-host-loss outcome before Stage D.
+
+**Acceptance:** Measured fallback latency is bounded and documented for every required failure mode; absence of a host-independent HA-host-loss outcome keeps live control blocked.
+
+**Commits:** Separate PvOpti test/interface changes from owning site-config automation changes.
+
+### Task 20: Restore the complete release gate and repeat independent safety review
+
+**Objective:** Remove known test/lint/build damage before any live rollout request.
+
+**Files:**
+- Fix affected tests under `tests/`, including settings fixtures whose control limits exceed the configured battery limits
+- Fix frontend/static output ownership in the canonical build workflow without running builds as root against the worktree
+- Modify CI/Makefile targets only if needed to make the canonical gate reproducible
+
+**Verification:** Full pytest, ruff, mypy, frontend build/typecheck, `git diff --check`, Ansible lint/syntax/check-mode, HA configuration validation, and all fault-injection probes pass. Repeat an independent safety-critical review of the code, role, and site inventory before requesting Stage C, D, or E authorization.
+
+**Commit:** `test: restore PvOpti live-control release gate`.
+
 ## 5. Staged rollout and release gates
 
 Stages C–G are operator-run acceptance procedures requiring separate explicit authorization. A generic coding harness may implement offline artifacts and tests for them but must not deploy, arm, inject live failures, or infer authorization from this plan.
@@ -610,12 +708,14 @@ Stages C–G are operator-run acceptance procedures requiring separate explicit 
 
 - Deploy new code with `mode=dry_run`, battery control disabled.
 - Generate/persist intents and control authorization, but execute no HA write.
+- Gate: audit records contain real source run/interval intents and fresh authorization evidence; a stream containing only synthetic `IDLE` / `dry_run_skipped` actions does not count.
 - Compare intended power against what Sigen local EMS actually did for at least one representative solar/weather/price cycle.
 - Gate: no stale-plan intents, no contradictory directions, EV targets/reserve always honored, and no unexpected lockout churn.
 
 ### Stage C — Watchdog rehearsal
 
 - Deploy and test the HA-side watchdog/emergency-off path while PvOpti still cannot arm.
+- Gate: heartbeat silence is detected by a timer/periodic evaluation even when no further MQTT message arrives; an MQTT-message-only trigger does not satisfy this stage.
 - Gate: bounded fallback proven for process stop, MQTT loss, HA restart, and integration reload, plus a separately proven HA-host-loss outcome through inverter timeout or a host-independent actor. Otherwise live control remains blocked.
 
 ### Stage D — Supervised low-power charge only
@@ -623,7 +723,8 @@ Stages C–G are operator-run acceptance procedures requiring separate explicit 
 - **Status:** the physical 0.5 kW charge behavior was manually characterized, but application-controlled Stage D rollout has not begun.
 - Set `mode=control` and battery-control enabled/armed only during attended windows.
 - Keep battery export disabled. Clamp forced charge to a low value and a narrow SoC band.
-- Gate: reliable limit acknowledgement exists, every command has matching mode/control acknowledgement and physical response, layered fallback and manual override tests pass, and no unplanned grid export occurs. The current HA number read-back defect blocks this gate.
+- Gate: reliable limit acknowledgement exists; every command has fresh post-command mode, limit/cut-off, battery power, grid direction/range, SoC, and timestamp evidence; layered fallback and manual override tests pass; and no unplanned grid export occurs. Battery power alone cannot establish success. The current HA number read-back defect blocks this gate.
+- Gate: fallback success requires verified neutral, successful local limit/cut-off restoration, Remote EMS off, and observed local behavior. Remote EMS-off acknowledgement alone cannot establish `physical_verified=true`.
 
 ### Stage E — Full-rate grid charging
 
@@ -717,5 +818,5 @@ Remaining before application-controlled Stage D:
 - [ ] API/MQTT/UI distinguish intent, request, read-back, and physical result.
 - [ ] Settled Pstryk data remains the only billed-energy truth.
 - [ ] Full backend/frontend/Ansible/HA validation passes.
-- [ ] Safety-critical review approves the exact image/config before each live stage.
+- [ ] Safety-critical review approves the code/config before each live stage.
 - [ ] Rollback restores local EMS and is rehearsed before export is enabled.

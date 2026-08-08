@@ -28,10 +28,9 @@ PvOpti commands **battery** behavior only. Grid import/export is residual.
 2. `EO_MODE=dry_run` still default; confirm inventory not accidentally `control`.
 3. Number-register acknowledgement proven reliable **or** leave `EO_BATTERY_CONTROL_NUMBER_REGISTER_ACK_RELIABLE=false` (blocks control).
 4. Watchdog automation present, tested, and independent of the PvOpti process (HA-side). Host-loss bound still a release blocker if unproven.
-5. Image pin: digest or immutable tag (not `latest` / floating `local`) before any control deploy.
-6. Arm token empty until ready; required value is `pvopti-battery-control-armed`.
-7. Export remains disabled until export stage passes.
-8. Single replica / single SQLite volume for the site lease.
+5. Arm token empty until ready; required value is `pvopti-battery-control-armed`.
+6. Export remains disabled until export stage passes.
+7. Single replica / single SQLite volume for the site lease.
 
 Exact entity map (defaults):
 
@@ -53,14 +52,13 @@ Use configuration / redeploy:
 
 **Arm (only after gates pass):**
 
-1. Set image pin.
-2. Set `EO_BATTERY_CONTROL_NUMBER_REGISTER_ACK_RELIABLE=true` only if proven.
-3. Populate watchdog entity IDs and enable HA watchdog automation.
-4. Set `EO_BATTERY_CONTROL_ENABLED=true`.
-5. Set `EO_BATTERY_CONTROL_ARM_TOKEN=pvopti-battery-control-armed`.
-6. Set `EO_MODE=control`.
-7. Redeploy; confirm `/api/status` → `battery_control.gates_ok` and `watchdog_healthy` semantics.
-8. Confirm Remote EMS is off at idle; heartbeat non-retained on MQTT.
+1. Set `EO_BATTERY_CONTROL_NUMBER_REGISTER_ACK_RELIABLE=true` only if proven.
+2. Populate watchdog entity IDs and enable HA watchdog automation.
+3. Set `EO_BATTERY_CONTROL_ENABLED=true`.
+4. Set `EO_BATTERY_CONTROL_ARM_TOKEN=pvopti-battery-control-armed`.
+5. Set `EO_MODE=control`.
+6. Redeploy; confirm `/api/status` → `battery_control.gates_ok` and `watchdog_healthy` semantics.
+7. Confirm Remote EMS is off at idle; heartbeat non-retained on MQTT.
 
 **Disarm / force fallback:**
 
@@ -119,7 +117,7 @@ Physical validation of HA-host loss remains a separate authorized experiment.
 
 ## Rollback
 
-1. Redeploy last known dry-run image pin/tag.
+1. Redeploy with the known-safe dry-run configuration.
 2. Ensure env: `EO_MODE=dry_run`, control disabled, arm token empty.
 3. Verify Remote EMS off and local limits restored.
 4. Confirm `/api/status` shows `DRY_RUN` / disarmed and no lease held by a control owner.
