@@ -20,6 +20,7 @@ from energy_optimizer.service import (
     _hourly_from_map,
     _regular_state_samples,
     _relay_failure_backoff_decision,
+    _soc_pct_or_reserve,
 )
 from energy_optimizer.store import (
     EvControlStatus,
@@ -37,6 +38,11 @@ from energy_optimizer.store import (
 
 async def _no_sleep(_seconds: float) -> None:
     return None
+
+
+def test_zero_soc_is_not_replaced_by_the_operating_reserve() -> None:
+    assert _soc_pct_or_reserve(0.0, 15.0) == 0.0
+    assert _soc_pct_or_reserve(None, 15.0) == 15.0
 
 
 def _settings() -> Settings:

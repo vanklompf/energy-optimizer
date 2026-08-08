@@ -417,9 +417,7 @@ class Service:
         count = 0
         with self.store.session() as session:
             for tick in ticks:
-                charge_kw, discharge_kw = _split_battery_power(
-                    histories["batt_power_kw"].get(tick)
-                )
+                charge_kw, discharge_kw = _split_battery_power(histories["batt_power_kw"].get(tick))
                 session.merge(
                     Telemetry(
                         ts=tick,
@@ -461,7 +459,11 @@ class Service:
         battery_fill_input_kwh = max(
             0.0,
             battery_target_kwh
-            - ((soc_start_pct or s.battery_soc_min_pct) / 100.0 * s.battery_capacity_kwh),
+            - (
+                _soc_pct_or_reserve(soc_start_pct, s.battery_soc_min_pct)
+                / 100.0
+                * s.battery_capacity_kwh
+            ),
         ) / max(s.eta_charge, 1e-6)
         # Optional EV energy is backed only by surplus left after the
         # stationary battery's projected path to its full target.
@@ -531,7 +533,11 @@ class Service:
         _apply_ev_shortfall_warning(safety, ev_requirements, s.step_minutes)
 
         params = self.optimiser_params(ev_requirements)
-        soc_start_kwh = (soc_start_pct or s.battery_soc_min_pct) / 100.0 * s.battery_capacity_kwh
+        soc_start_kwh = (
+            _soc_pct_or_reserve(soc_start_pct, s.battery_soc_min_pct)
+            / 100.0
+            * s.battery_capacity_kwh
+        )
 
         objective = None
         solve_ms = 0.0
@@ -611,12 +617,15 @@ class Service:
                         run_id=run_id,
                         interval_start=step_start,
                         dt_hours=step.dt_hours,
-                        pv_to_load_kwh=step.pv_to_load_kwh,
+                        # Persist EV source flows in the legacy aggregate `*_to_load`
+                        # columns so stored plans remain energy-balanced without a DB
+                        # migration. The optimiser result keeps the sources separate.
+                        pv_to_load_kwh=step.pv_to_load_kwh + step.pv_to_ev_kwh,
                         pv_to_battery_kwh=step.pv_to_battery_kwh,
                         pv_to_grid_kwh=step.pv_to_grid_kwh,
-                        grid_to_load_kwh=step.grid_to_load_kwh,
+                        grid_to_load_kwh=step.grid_to_load_kwh + step.grid_to_ev_kwh,
                         grid_to_battery_kwh=step.grid_to_battery_kwh,
-                        battery_to_load_kwh=step.battery_to_load_kwh,
+                        battery_to_load_kwh=step.battery_to_load_kwh + step.battery_to_ev_kwh,
                         battery_to_grid_kwh=step.battery_to_grid_kwh,
                         curtail_kwh=step.curtail_kwh,
                         soc_pct_end=step.soc_pct_end,
@@ -641,6 +650,7 @@ class Service:
         return OptimiserParams(
             battery_capacity_kwh=s.battery_capacity_kwh,
             soc_min_kwh=s.soc_min_kwh,
+            battery_hard_min_kwh=s.hard_soc_min_kwh,
             soc_max_kwh=s.soc_max_kwh,
             max_charge_kw=s.battery_max_charge_kw,
             max_discharge_kw=s.battery_max_discharge_kw,
@@ -921,6 +931,10 @@ class Service:
             )
         except Exception as exc:  # pragma: no cover - network dependent
             logger.warning("MQTT publish failed: %s", exc)
+
+
+def _soc_pct_or_reserve(soc_pct: float | None, reserve_pct: float) -> float:
+    return reserve_pct if soc_pct is None else soc_pct
 
 
 def _ev_live_state(ev: EvTelemetry | None, now: dt.datetime) -> EvLiveState:

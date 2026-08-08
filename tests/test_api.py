@@ -47,7 +47,12 @@ def test_status_empty(client: TestClient) -> None:
     assert body["ev_control"]["relay_failure_backoff_minutes"] == 30
     assert body["ev_control"]["opportunistic_grid_allowed"] is False
     assert body["ev_control"]["forecast_surplus_factor"] == 0.8
-    assert "battery reserve is protected" in body["ev_control"]["policy_explanation"]
+    assert body["ev_control"]["battery_reserve_pct"] == 15.0
+    assert body["ev_control"]["battery_hard_floor_pct"] == 0.0
+    assert (
+        "Guaranteed Mercedes departure charging may consume"
+        in body["ev_control"]["policy_explanation"]
+    )
     assert body["billing_meter"] is None
 
 

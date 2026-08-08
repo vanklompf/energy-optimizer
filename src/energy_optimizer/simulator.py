@@ -183,6 +183,7 @@ def value_optimiser_plan(
             + step.grid_to_battery_kwh
             + step.battery_to_load_kwh
             + step.battery_to_grid_kwh
+            + step.battery_to_ev_kwh
         )
         flow_rows.append(
             StepFlows(

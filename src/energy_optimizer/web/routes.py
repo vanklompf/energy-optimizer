@@ -445,13 +445,16 @@ def _ev_control_dict(
         "opportunistic_grid_allowed": False,
         "forecast_surplus_factor": settings.ev_forecast_surplus_factor,
         "battery_reserve_pct": settings.battery_soc_min_pct,
+        "battery_hard_floor_pct": settings.battery_hard_soc_min_pct,
         "battery_full_target_pct": settings.ev_battery_full_soc_pct,
         "policy_explanation": (
             "After the guaranteed departure minimum, the Mercedes is prioritised over "
             "charging the stationary battery. Forecast-backed charging may start before "
             "live PV surplus arrives only when the same forecast still fills the house "
-            f"battery to {settings.ev_battery_full_soc_pct:.0f}% later. The battery reserve "
-            "is protected and normal opportunistic charging never uses grid energy."
+            f"battery to {settings.ev_battery_full_soc_pct:.0f}% later. Guaranteed Mercedes "
+            "departure charging may consume the battery reserve down to the hard floor; "
+            "ordinary household use, opportunistic EV charging, and economic export preserve "
+            "the reserve. Normal opportunistic charging never uses grid energy."
         ),
         "ts": _iso(control.ts) if control else None,
         "desired_on": control.desired_on if control else False,
@@ -671,6 +674,7 @@ def _optimiser_params(settings: Settings, overrides: dict[str, float]):  # noqa:
     return OptimiserParams(
         battery_capacity_kwh=overrides.get("capacity_kwh", settings.battery_capacity_kwh),
         soc_min_kwh=overrides.get("soc_min_kwh", settings.soc_min_kwh),
+        battery_hard_min_kwh=overrides.get("battery_hard_min_kwh", settings.hard_soc_min_kwh),
         soc_max_kwh=overrides.get("soc_max_kwh", settings.soc_max_kwh),
         max_charge_kw=overrides.get("max_charge_kw", settings.battery_max_charge_kw),
         max_discharge_kw=overrides.get("max_discharge_kw", settings.battery_max_discharge_kw),

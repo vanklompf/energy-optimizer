@@ -38,15 +38,13 @@ def classify_next_action(
     dt_h = s.dt_hours or 0.25
 
     charge = s.pv_to_battery_kwh + s.grid_to_battery_kwh
-    discharge = s.battery_to_load_kwh + s.battery_to_grid_kwh
+    discharge = s.battery_to_load_kwh + s.battery_to_grid_kwh + s.battery_to_ev_kwh
     curtail = s.curtail_kwh
     export = s.grid_export_kwh
 
     action, power_kwh = _dominant_action(s, charge, discharge, curtail, export)
     power_kw = power_kwh / dt_h if dt_h else 0.0
-    reason = _reason_for(
-        action, s, buy_price, sell_price, future_max_buy, future_max_sell
-    )
+    reason = _reason_for(action, s, buy_price, sell_price, future_max_buy, future_max_sell)
     return Decision(
         action=action,
         power_kw=round(power_kw, 3),
