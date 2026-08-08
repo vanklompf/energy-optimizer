@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pulp
 
@@ -55,6 +55,10 @@ class OptimiserParams:
     import_price_adjustment_pln_kwh: float = 0.0
     allow_battery_export: bool = True
     allow_grid_charging: bool = True
+    # Extra costs that suppress tiny/uncertain arbitrage cycling.
+    activation_margin_pln_kwh: float = 0.0
+    grid_charge_margin_pln_kwh: float = 0.0
+    minimum_export_spread_pln_kwh: float = 0.0
     terminal_soc_salvage_pln_kwh: float = 0.0
     preserve_terminal_soc: bool = False
     ev_charge_power_kw: float = 0.0
@@ -87,6 +91,7 @@ class PlanStepResult:
     ev_minimum_charge_kwh: float = 0.0
     ev_opportunistic_charge_kwh: float = 0.0
     marginal_value: float | None = None
+    reason_codes: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -135,13 +140,14 @@ def optimise(
         curtail.append(var("curtail", i))
         grid_to_load.append(var("grid_to_load", i))
         grid_to_ev.append(var("grid_to_ev", i))
-        grid_to_batt.append(
-            var("grid_to_batt", i) if params.allow_grid_charging else _zero(i, "g2b")
+        has_real_future_price = any(intervals[j].price_is_real for j in range(i + 1, n))
+        allow_grid_charge_i = (
+            params.allow_grid_charging and itv.price_is_real and has_real_future_price
         )
+        allow_export_i = params.allow_battery_export and itv.price_is_real
+        grid_to_batt.append(var("grid_to_batt", i) if allow_grid_charge_i else _zero(i, "g2b"))
         batt_to_load.append(var("batt_to_load", i))
-        batt_to_grid.append(
-            var("batt_to_grid", i) if params.allow_battery_export else _zero(i, "b2g")
-        )
+        batt_to_grid.append(var("batt_to_grid", i) if allow_export_i else _zero(i, "b2g"))
         batt_to_ev_minimum.append(var("batt_to_ev_minimum", i))
         batt_to_ev_opportunistic.append(var("batt_to_ev_opportunistic", i))
         grid_import.append(var("grid_import", i))
@@ -182,7 +188,7 @@ def optimise(
             else _zero(i, "ev_opp")
         )
 
-    # Objective: import cost - export revenue + degradation on battery-side throughput.
+    # Objective: import cost - export revenue + degradation + activation margins.
     obj_terms = []
     for i, itv in enumerate(intervals):
         buy = itv.buy_price + params.import_price_adjustment_pln_kwh
@@ -193,6 +199,12 @@ def optimise(
             pv_to_batt[i] + grid_to_batt[i] + batt_to_load[i] + batt_to_grid[i] + batt_to_ev
         )
         obj_terms.append(throughput * params.degradation_cost_pln_per_kwh)
+        # Activation / spread margins apply to deliberate arbitrage cycling only.
+        obj_terms.append(
+            (grid_to_batt[i] + batt_to_grid[i]) * params.activation_margin_pln_kwh
+        )
+        obj_terms.append(grid_to_batt[i] * params.grid_charge_margin_pln_kwh)
+        obj_terms.append(batt_to_grid[i] * params.minimum_export_spread_pln_kwh)
         # User preference: once forecast-backed, opportunistic EV energy is front-loaded.
         obj_terms.append(
             is_ev_opportunistic[i] * i * itv.dt_hours * params.ev_early_start_value_pln_per_hour
@@ -376,36 +388,40 @@ def optimise(
     steps: list[PlanStepResult] = []
     for i, itv in enumerate(intervals):
         soc_end = _val(soc[i])
+        step = PlanStepResult(
+            interval_start=itv.interval_start,
+            dt_hours=itv.dt_hours,
+            pv_to_load_kwh=_val(pv_to_load[i]),
+            pv_to_ev_kwh=_val(pv_to_ev[i]),
+            pv_to_battery_kwh=_val(pv_to_batt[i]),
+            pv_to_grid_kwh=_val(pv_to_grid[i]),
+            grid_to_load_kwh=_val(grid_to_load[i]),
+            grid_to_ev_kwh=_val(grid_to_ev[i]),
+            grid_to_battery_kwh=_val(grid_to_batt[i]),
+            battery_to_load_kwh=_val(batt_to_load[i]),
+            battery_to_grid_kwh=_val(batt_to_grid[i]),
+            battery_to_ev_kwh=(_val(batt_to_ev_minimum[i]) + _val(batt_to_ev_opportunistic[i])),
+            curtail_kwh=_val(curtail[i]),
+            grid_import_kwh=_val(grid_import[i]),
+            grid_export_kwh=_val(grid_export[i]),
+            soc_kwh_end=soc_end,
+            soc_pct_end=100.0 * soc_end / params.battery_capacity_kwh
+            if params.battery_capacity_kwh
+            else 0.0,
+            ev_charge_kwh=(_val(is_ev_minimum[i]) + _val(is_ev_opportunistic[i]))
+            * params.ev_charge_power_kw
+            * itv.dt_hours,
+            ev_minimum_charge_kwh=_val(is_ev_minimum[i])
+            * params.ev_charge_power_kw
+            * itv.dt_hours,
+            ev_opportunistic_charge_kwh=_val(is_ev_opportunistic[i])
+            * params.ev_charge_power_kw
+            * itv.dt_hours,
+        )
         steps.append(
-            PlanStepResult(
-                interval_start=itv.interval_start,
-                dt_hours=itv.dt_hours,
-                pv_to_load_kwh=_val(pv_to_load[i]),
-                pv_to_ev_kwh=_val(pv_to_ev[i]),
-                pv_to_battery_kwh=_val(pv_to_batt[i]),
-                pv_to_grid_kwh=_val(pv_to_grid[i]),
-                grid_to_load_kwh=_val(grid_to_load[i]),
-                grid_to_ev_kwh=_val(grid_to_ev[i]),
-                grid_to_battery_kwh=_val(grid_to_batt[i]),
-                battery_to_load_kwh=_val(batt_to_load[i]),
-                battery_to_grid_kwh=_val(batt_to_grid[i]),
-                battery_to_ev_kwh=(_val(batt_to_ev_minimum[i]) + _val(batt_to_ev_opportunistic[i])),
-                curtail_kwh=_val(curtail[i]),
-                grid_import_kwh=_val(grid_import[i]),
-                grid_export_kwh=_val(grid_export[i]),
-                soc_kwh_end=soc_end,
-                soc_pct_end=100.0 * soc_end / params.battery_capacity_kwh
-                if params.battery_capacity_kwh
-                else 0.0,
-                ev_charge_kwh=(_val(is_ev_minimum[i]) + _val(is_ev_opportunistic[i]))
-                * params.ev_charge_power_kw
-                * itv.dt_hours,
-                ev_minimum_charge_kwh=_val(is_ev_minimum[i])
-                * params.ev_charge_power_kw
-                * itv.dt_hours,
-                ev_opportunistic_charge_kwh=_val(is_ev_opportunistic[i])
-                * params.ev_charge_power_kw
-                * itv.dt_hours,
+            replace(
+                step,
+                reason_codes=classify_step_reason_codes(step, soc_min_kwh=params.soc_min_kwh),
             )
         )
 
@@ -416,6 +432,40 @@ def optimise(
         solve_ms=solve_ms,
         solver=_solver_name(chosen_solver),
     )
+
+
+def classify_step_reason_codes(
+    step: PlanStepResult, *, soc_min_kwh: float, eps: float = 1e-3
+) -> tuple[str, ...]:
+    """Stable machine-readable reason codes for a solved plan step."""
+    codes: list[str] = []
+    if step.ev_minimum_charge_kwh > eps:
+        codes.append("ev_guaranteed")
+    if step.ev_opportunistic_charge_kwh > eps:
+        codes.append("ev_opportunistic")
+    if step.grid_to_battery_kwh > eps:
+        codes.append("grid_charge_arbitrage")
+    if step.battery_to_grid_kwh > eps:
+        codes.append("battery_export_arbitrage")
+    self_use = (
+        step.pv_to_load_kwh > eps
+        or step.pv_to_battery_kwh > eps
+        or step.battery_to_load_kwh > eps
+        or step.battery_to_ev_kwh > eps
+    )
+    if self_use and "grid_charge_arbitrage" not in codes and "battery_export_arbitrage" not in codes:
+        codes.append("self_consumption")
+    idle = (
+        step.pv_to_battery_kwh <= eps
+        and step.grid_to_battery_kwh <= eps
+        and step.battery_to_load_kwh <= eps
+        and step.battery_to_grid_kwh <= eps
+        and step.battery_to_ev_kwh <= eps
+        and step.ev_charge_kwh <= eps
+    )
+    if idle and step.soc_kwh_end <= soc_min_kwh + eps:
+        codes.append("reserve_hold")
+    return tuple(codes)
 
 
 def _default_solver(msg: bool = False) -> pulp.LpSolver:

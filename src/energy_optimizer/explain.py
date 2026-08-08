@@ -21,6 +21,7 @@ class Decision:
     power_kw: float
     target_soc_pct: float
     reason: str
+    reason_codes: tuple[str, ...] = ()
 
 
 def classify_next_action(
@@ -32,7 +33,7 @@ def classify_next_action(
     future_max_sell: float | None = None,
 ) -> Decision:
     if not steps:
-        return Decision("idle", 0.0, 0.0, "No plan available")
+        return Decision("idle", 0.0, 0.0, "No plan available", ())
 
     s = steps[0]
     dt_h = s.dt_hours or 0.25
@@ -50,6 +51,7 @@ def classify_next_action(
         power_kw=round(power_kw, 3),
         target_soc_pct=round(s.soc_pct_end, 1),
         reason=reason,
+        reason_codes=s.reason_codes,
     )
 
 

@@ -687,6 +687,15 @@ def _optimiser_params(settings: Settings, overrides: dict[str, float]):  # noqa:
         import_price_adjustment_pln_kwh=settings.import_price_adjustment_pln_kwh,
         allow_battery_export=settings.allow_battery_export,
         allow_grid_charging=settings.allow_grid_charging,
+        activation_margin_pln_kwh=overrides.get(
+            "activation_margin_pln_kwh", settings.battery_control_activation_margin_pln_kwh
+        ),
+        grid_charge_margin_pln_kwh=overrides.get(
+            "grid_charge_margin_pln_kwh", settings.grid_charge_margin_pln_kwh
+        ),
+        minimum_export_spread_pln_kwh=overrides.get(
+            "minimum_export_spread_pln_kwh", settings.minimum_export_spread_pln_kwh
+        ),
     )
 
 
