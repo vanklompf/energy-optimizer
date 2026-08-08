@@ -196,6 +196,11 @@ AnsibleNasConfigs/HpeNas/group_vars/nas/
 AnsibleNasConfigs/HpeNas/homeassistant/
 ```
 
+PvOpti documents the shared heartbeat/fallback contract in
+`docs/battery-control-watchdog-interface.md`. Site HA automations belong in
+`AnsibleNasConfigs/HpeNas/homeassistant/` and must stay disabled until physical
+watchdog validation passes.
+
 Live deployment is a separate operator-authorized activity. Application code completion does not authorize changing HA `read_only`, enabling entities, setting `mode=control`, installing an arm token, or actuating the battery.
 
 ## Outstanding release blockers
