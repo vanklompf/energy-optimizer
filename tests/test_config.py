@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from energy_optimizer.config import PvPlane, Settings
 
 
@@ -14,12 +16,23 @@ def test_derived_efficiencies_and_soc(monkeypatch) -> None:
     assert abs(s.eta_charge - math.sqrt(0.9)) < 1e-9
     assert abs(s.eta_discharge - math.sqrt(0.9)) < 1e-9
     assert abs(s.soc_min_kwh - 18.08 * 0.20) < 1e-9
+    assert abs(s.hard_soc_min_kwh - 0.0) < 1e-9
     assert abs(s.soc_max_kwh - 18.08 * 0.98) < 1e-9
 
 
 def test_step_hours() -> None:
     s = Settings(db=":memory:", step_minutes=15)
     assert s.step_hours == 0.25
+
+
+def test_battery_soc_thresholds_must_be_ordered() -> None:
+    with pytest.raises(ValueError, match="hard.*reserve.*maximum"):
+        Settings(
+            db=":memory:",
+            battery_hard_soc_min_pct=20,
+            battery_soc_min_pct=15,
+            battery_soc_max_pct=98,
+        )
 
 
 def test_pv_planes_from_json_env(monkeypatch) -> None:

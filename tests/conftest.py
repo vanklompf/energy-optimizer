@@ -16,7 +16,7 @@ def settings() -> Settings:
         battery_capacity_kwh=10.0,
         battery_max_charge_kw=5.0,
         battery_max_discharge_kw=5.0,
-        battery_soc_min_pct=20.0,
+        battery_soc_min_pct=15.0,
         battery_soc_max_pct=98.0,
         battery_round_trip_efficiency=0.90,
         degradation_cost_pln_per_kwh=0.05,

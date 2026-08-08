@@ -79,10 +79,9 @@ daily_reports(...)
 ## Optimisation model
 
 Rolling-horizon MILP on aligned 15-minute steps, every 15 minutes. Hourly prices/forecasts
-are expanded to quarter-hours. Flows are non-negative interval energies (`pv_to_load`,
-`pv_to_battery`, `pv_to_grid`, `grid_to_load`, `grid_to_battery`, `battery_to_load`,
-`battery_to_grid`, `curtail`) plus binaries preventing simultaneous charge/discharge and
-import/export.
+are expanded to quarter-hours. Flows are non-negative interval energies split by source
+and destination (`pv/grid/battery` to house, EV, battery, or grid) plus curtailment and
+binaries preventing simultaneous charge/discharge and import/export.
 
 Objective (minimise): grid import cost − export revenue + degradation on battery-side
 throughput + reserve shortfall. η_c = η_d = √round-trip. Site import/export/inverter
@@ -103,7 +102,10 @@ economics for immediate full charge. Relay control is independent of Sigen contr
 
 ## Safety
 
-- No discharge below reserve SoC; export/grid-charge need configured margins over losses
+- Ordinary household discharge, opportunistic EV charging, and economic export preserve
+  the configured reserve SoC. Guaranteed departure charging may consume that reserve down
+  to the BMS-protected hard floor. Starting below reserve is feasible and does not require
+  recovery in a single interval.
 - Stale power telemetry (>5 min) or missing current-hour prices → `blocked`
 - Missing forecasts → `low_confidence`
 - Sigen `control_enabled` hardcoded false

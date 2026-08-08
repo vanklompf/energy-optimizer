@@ -9,9 +9,9 @@ from __future__ import annotations
 
 import math
 from functools import lru_cache
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -69,7 +69,11 @@ class Settings(BaseSettings):
     battery_capacity_kwh: float = 18.08
     battery_max_charge_kw: float = 8.8
     battery_max_discharge_kw: float = 9.6
-    battery_soc_min_pct: float = 20.0
+    # Manufacturer/BMS protected usable-empty point. The ordinary operating reserve
+    # is separate so EV charging can deliberately consume it without permitting
+    # household discharge or economic export below the reserve.
+    battery_hard_soc_min_pct: float = Field(default=0.0, ge=0.0, le=100.0)
+    battery_soc_min_pct: float = 15.0
     battery_soc_max_pct: float = 98.0
     battery_round_trip_efficiency: float = 0.90
     degradation_cost_pln_per_kwh: float = 0.05
@@ -165,6 +169,10 @@ class Settings(BaseSettings):
         return self.battery_capacity_kwh * self.battery_soc_min_pct / 100.0
 
     @property
+    def hard_soc_min_kwh(self) -> float:
+        return self.battery_capacity_kwh * self.battery_hard_soc_min_pct / 100.0
+
+    @property
     def soc_max_kwh(self) -> float:
         return self.battery_capacity_kwh * self.battery_soc_max_pct / 100.0
 
@@ -178,6 +186,16 @@ class Settings(BaseSettings):
         if not 0 < v <= 1:
             raise ValueError("battery_round_trip_efficiency must be in (0, 1]")
         return v
+
+    @model_validator(mode="after")
+    def _validate_battery_soc_thresholds(self) -> Self:
+        if not (
+            self.battery_hard_soc_min_pct <= self.battery_soc_min_pct <= self.battery_soc_max_pct
+        ):
+            raise ValueError(
+                "battery SoC thresholds must be ordered: hard floor <= reserve <= maximum"
+            )
+        return self
 
     @field_validator("pv_planes", mode="before")
     @classmethod
