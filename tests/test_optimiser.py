@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from energy_optimizer.optimiser import IntervalInput, OptimiserParams, optimise
 
 
@@ -9,6 +11,7 @@ def make_params(**overrides) -> OptimiserParams:
     base = dict(
         battery_capacity_kwh=10.0,
         soc_min_kwh=2.0,
+        battery_hard_min_kwh=0.0,
         soc_max_kwh=9.8,
         max_charge_kw=5.0,
         max_discharge_kw=5.0,
@@ -131,7 +134,8 @@ def test_ev_charging_is_shifted_to_solar_surplus() -> None:
     assert result.status == "optimal"
     assert result.steps[0].ev_charge_kwh == 0.0
     assert result.steps[1].ev_charge_kwh == 2.0
-    assert result.steps[1].pv_to_load_kwh == 3.0
+    assert result.steps[1].pv_to_load_kwh == 1.0
+    assert result.steps[1].pv_to_ev_kwh == 2.0
 
 
 def test_ev_minimum_charge_is_met_before_departure_deadline() -> None:
@@ -201,6 +205,7 @@ def test_guaranteed_ev_minimum_may_use_grid() -> None:
     )
     params = make_params(
         soc_min_kwh=2.0,
+        battery_hard_min_kwh=2.0,
         ev_charge_power_kw=2.0,
         ev_target_slots=1,
         ev_minimum_slots=1,
@@ -210,4 +215,167 @@ def test_guaranteed_ev_minimum_may_use_grid() -> None:
 
     assert result.status == "optimal"
     assert result.steps[0].ev_charge_kwh == 2.0
-    assert result.steps[0].grid_to_load_kwh == 2.5
+    assert result.steps[0].grid_to_load_kwh == 0.5
+    assert result.steps[0].grid_to_ev_kwh == 2.0
+
+
+def test_guaranteed_ev_may_use_energy_below_the_stationary_battery_reserve() -> None:
+    interval = IntervalInput(
+        interval_start="2026-08-03T06:00:00+00:00",
+        dt_hours=1.0,
+        pv_energy_kwh=0.0,
+        load_energy_kwh=0.0,
+        buy_price=1.0,
+        sell_price=0.0,
+        ev_available=True,
+        ev_required_soon=True,
+    )
+    params = make_params(
+        soc_min_kwh=2.0,
+        battery_hard_min_kwh=0.0,
+        site_import_limit_kw=0.0,
+        ev_charge_power_kw=1.0,
+        ev_target_slots=1,
+        ev_minimum_slots=1,
+    )
+
+    result = optimise([interval], 1.5, params)
+
+    assert result.status == "optimal"
+    assert result.steps[0].battery_to_ev_kwh > 0.0
+    assert result.steps[0].soc_kwh_end < params.soc_min_kwh
+    assert result.steps[0].soc_kwh_end >= params.battery_hard_min_kwh
+
+
+def test_starting_below_reserve_does_not_require_immediate_recovery() -> None:
+    interval = IntervalInput(
+        interval_start="2026-08-03T06:00:00+00:00",
+        dt_hours=0.25,
+        pv_energy_kwh=0.0,
+        load_energy_kwh=0.1,
+        buy_price=1.0,
+        sell_price=10.0,
+    )
+    params = make_params(
+        soc_min_kwh=2.0,
+        battery_hard_min_kwh=0.0,
+        site_import_limit_kw=1.0,
+        inverter_limit_kw=1.0,
+    )
+
+    result = optimise([interval], 1.5, params)
+
+    assert result.status == "optimal"
+    assert result.steps[0].soc_kwh_end == pytest.approx(1.5)
+    assert result.steps[0].grid_to_load_kwh == pytest.approx(0.1)
+    assert result.steps[0].battery_to_load_kwh == pytest.approx(0.0)
+    assert result.steps[0].battery_to_grid_kwh == pytest.approx(0.0)
+
+
+def test_economic_export_cannot_spend_reserve_credited_to_the_ev() -> None:
+    intervals = [
+        IntervalInput(
+            interval_start="2026-08-03T06:00:00+00:00",
+            dt_hours=1.0,
+            pv_energy_kwh=0.0,
+            load_energy_kwh=0.0,
+            buy_price=1.0,
+            sell_price=0.0,
+            ev_available=True,
+            ev_required_soon=True,
+        ),
+        IntervalInput(
+            interval_start="2026-08-03T07:00:00+00:00",
+            dt_hours=1.0,
+            pv_energy_kwh=0.0,
+            load_energy_kwh=0.0,
+            buy_price=1.0,
+            sell_price=10.0,
+        ),
+    ]
+    params = make_params(
+        soc_min_kwh=2.0,
+        battery_hard_min_kwh=0.0,
+        site_import_limit_kw=0.0,
+        ev_charge_power_kw=0.5,
+        ev_target_slots=1,
+        ev_minimum_slots=1,
+    )
+
+    result = optimise(intervals, 2.0, params)
+
+    assert result.status == "optimal"
+    assert result.steps[0].battery_to_ev_kwh > 0.0
+    assert result.steps[0].soc_kwh_end < params.soc_min_kwh
+    assert result.steps[1].battery_to_grid_kwh == pytest.approx(0.0)
+
+
+def test_recharging_after_guaranteed_ev_use_does_not_reopen_reserve_for_export() -> None:
+    intervals = [
+        IntervalInput(
+            interval_start="2026-08-03T06:00:00+00:00",
+            dt_hours=1.0,
+            pv_energy_kwh=0.0,
+            load_energy_kwh=0.0,
+            buy_price=1.0,
+            sell_price=0.0,
+            ev_available=True,
+            ev_required_soon=True,
+        ),
+        IntervalInput(
+            interval_start="2026-08-03T07:00:00+00:00",
+            dt_hours=1.0,
+            pv_energy_kwh=1.0,
+            load_energy_kwh=0.0,
+            buy_price=1.0,
+            sell_price=0.0,
+        ),
+        IntervalInput(
+            interval_start="2026-08-03T08:00:00+00:00",
+            dt_hours=1.0,
+            pv_energy_kwh=0.0,
+            load_energy_kwh=0.0,
+            buy_price=1.0,
+            sell_price=10.0,
+        ),
+    ]
+    params = make_params(
+        soc_min_kwh=2.0,
+        battery_hard_min_kwh=0.0,
+        site_import_limit_kw=0.0,
+        ev_charge_power_kw=math.sqrt(0.9),
+        ev_target_slots=1,
+        ev_minimum_slots=1,
+        terminal_soc_salvage_pln_kwh=1.0,
+    )
+
+    result = optimise(intervals, 2.0, params)
+
+    assert result.status == "optimal"
+    assert result.steps[0].soc_kwh_end == pytest.approx(1.0)
+    assert result.steps[1].soc_kwh_end == pytest.approx(1.0 + math.sqrt(0.9))
+    assert result.steps[2].battery_to_grid_kwh == pytest.approx(0.0)
+
+
+def test_opportunistic_ev_cannot_consume_the_departure_reserve() -> None:
+    interval = IntervalInput(
+        interval_start="2026-08-03T10:00:00+00:00",
+        dt_hours=1.0,
+        pv_energy_kwh=0.0,
+        load_energy_kwh=0.0,
+        buy_price=1.0,
+        sell_price=0.0,
+        ev_available=True,
+    )
+    params = make_params(
+        soc_min_kwh=2.0,
+        battery_hard_min_kwh=0.0,
+        site_import_limit_kw=0.0,
+        ev_charge_power_kw=0.5,
+        ev_target_slots=1,
+        ev_minimum_slots=0,
+    )
+
+    result = optimise([interval], 2.0, params)
+
+    assert result.status == "infeasible"

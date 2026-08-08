@@ -42,6 +42,7 @@ class IntervalInput:
 class OptimiserParams:
     battery_capacity_kwh: float
     soc_min_kwh: float
+    battery_hard_min_kwh: float
     soc_max_kwh: float
     max_charge_kw: float
     max_discharge_kw: float
@@ -68,12 +69,15 @@ class PlanStepResult:
     interval_start: str
     dt_hours: float
     pv_to_load_kwh: float
+    pv_to_ev_kwh: float
     pv_to_battery_kwh: float
     pv_to_grid_kwh: float
     grid_to_load_kwh: float
+    grid_to_ev_kwh: float
     grid_to_battery_kwh: float
     battery_to_load_kwh: float
     battery_to_grid_kwh: float
+    battery_to_ev_kwh: float
     curtail_kwh: float
     grid_import_kwh: float
     grid_export_kwh: float
@@ -113,10 +117,13 @@ def optimise(
     def var(name: str, i: int, up: float | None = None) -> pulp.LpVariable:
         return pulp.LpVariable(f"{name}_{i}", lowBound=0, upBound=up)
 
-    pv_to_load, pv_to_batt, pv_to_grid, curtail = [], [], [], []
-    grid_to_load, grid_to_batt, batt_to_load, batt_to_grid = [], [], [], []
+    pv_to_load, pv_to_batt, pv_to_grid, pv_to_ev, curtail = [], [], [], [], []
+    grid_to_load, grid_to_batt, grid_to_ev = [], [], []
+    batt_to_load, batt_to_grid = [], []
+    batt_to_ev_minimum, batt_to_ev_opportunistic = [], []
     grid_import, grid_export = [], []
     soc = []  # soc[i] = SoC at END of interval i
+    reserve_shortfall, is_below_reserve = [], []
     is_charging, is_importing = [], []
     is_ev_minimum, is_ev_opportunistic = [], []
 
@@ -124,8 +131,10 @@ def optimise(
         pv_to_load.append(var("pv_to_load", i))
         pv_to_batt.append(var("pv_to_batt", i))
         pv_to_grid.append(var("pv_to_grid", i))
+        pv_to_ev.append(var("pv_to_ev", i))
         curtail.append(var("curtail", i))
         grid_to_load.append(var("grid_to_load", i))
+        grid_to_ev.append(var("grid_to_ev", i))
         grid_to_batt.append(
             var("grid_to_batt", i) if params.allow_grid_charging else _zero(i, "g2b")
         )
@@ -133,11 +142,23 @@ def optimise(
         batt_to_grid.append(
             var("batt_to_grid", i) if params.allow_battery_export else _zero(i, "b2g")
         )
+        batt_to_ev_minimum.append(var("batt_to_ev_minimum", i))
+        batt_to_ev_opportunistic.append(var("batt_to_ev_opportunistic", i))
         grid_import.append(var("grid_import", i))
         grid_export.append(var("grid_export", i))
         soc.append(
-            pulp.LpVariable(f"soc_{i}", lowBound=params.soc_min_kwh, upBound=params.soc_max_kwh)
+            pulp.LpVariable(
+                f"soc_{i}", lowBound=params.battery_hard_min_kwh, upBound=params.soc_max_kwh
+            )
         )
+        reserve_shortfall.append(
+            pulp.LpVariable(
+                f"reserve_shortfall_{i}",
+                lowBound=0,
+                upBound=max(0.0, params.soc_min_kwh - params.battery_hard_min_kwh),
+            )
+        )
+        is_below_reserve.append(pulp.LpVariable(f"is_below_reserve_{i}", cat="Binary"))
         is_charging.append(pulp.LpVariable(f"is_charging_{i}", cat="Binary"))
         is_importing.append(pulp.LpVariable(f"is_importing_{i}", cat="Binary"))
         is_ev_minimum.append(
@@ -167,14 +188,14 @@ def optimise(
         buy = itv.buy_price + params.import_price_adjustment_pln_kwh
         obj_terms.append(grid_import[i] * buy)
         obj_terms.append(-grid_export[i] * itv.sell_price)
-        throughput = pv_to_batt[i] + grid_to_batt[i] + batt_to_load[i] + batt_to_grid[i]
+        batt_to_ev = batt_to_ev_minimum[i] + batt_to_ev_opportunistic[i]
+        throughput = (
+            pv_to_batt[i] + grid_to_batt[i] + batt_to_load[i] + batt_to_grid[i] + batt_to_ev
+        )
         obj_terms.append(throughput * params.degradation_cost_pln_per_kwh)
         # User preference: once forecast-backed, opportunistic EV energy is front-loaded.
         obj_terms.append(
-            is_ev_opportunistic[i]
-            * i
-            * itv.dt_hours
-            * params.ev_early_start_value_pln_per_hour
+            is_ev_opportunistic[i] * i * itv.dt_hours * params.ev_early_start_value_pln_per_hour
         )
     if params.terminal_soc_salvage_pln_kwh and not params.preserve_terminal_soc:
         obj_terms.append(-soc[n - 1] * params.terminal_soc_salvage_pln_kwh)
@@ -184,53 +205,124 @@ def optimise(
         dt_h = itv.dt_hours
         # PV allocation (charge measured on SoC side => divide by eta_c to get PV consumed).
         prob += (
-            pv_to_load[i] + pv_to_batt[i] / params.eta_charge + pv_to_grid[i] + curtail[i]
-            == itv.pv_energy_kwh
-        ), f"pv_alloc_{i}"
+            (
+                pv_to_load[i]
+                + pv_to_batt[i] / params.eta_charge
+                + pv_to_grid[i]
+                + pv_to_ev[i]
+                + curtail[i]
+                == itv.pv_energy_kwh
+            ),
+            f"pv_alloc_{i}",
+        )
         # Load supply (battery delivers battery_to_load * eta_d to the load).
         prob += (
-            pv_to_load[i] + grid_to_load[i] + batt_to_load[i] * params.eta_discharge
-            == itv.load_energy_kwh
-            + (is_ev_minimum[i] + is_ev_opportunistic[i])
-            * params.ev_charge_power_kw
-            * itv.dt_hours
-        ), f"load_supply_{i}"
+            (
+                pv_to_load[i] + grid_to_load[i] + batt_to_load[i] * params.eta_discharge
+                == itv.load_energy_kwh
+            ),
+            f"house_load_supply_{i}",
+        )
+        prob += (
+            (
+                pv_to_ev[i]
+                + grid_to_ev[i]
+                + (batt_to_ev_minimum[i] + batt_to_ev_opportunistic[i]) * params.eta_discharge
+                == (is_ev_minimum[i] + is_ev_opportunistic[i])
+                * params.ev_charge_power_kw
+                * itv.dt_hours
+            ),
+            f"ev_supply_{i}",
+        )
         prob += is_ev_minimum[i] + is_ev_opportunistic[i] <= 1, f"ev_mode_{i}"
+        prob += (
+            batt_to_ev_minimum[i] <= params.max_discharge_kw * dt_h * is_ev_minimum[i],
+            f"battery_to_ev_minimum_mode_{i}",
+        )
+        prob += (
+            batt_to_ev_opportunistic[i] <= params.max_discharge_kw * dt_h * is_ev_opportunistic[i],
+            f"battery_to_ev_opportunistic_mode_{i}",
+        )
         # Guaranteed pre-departure energy may use grid. During a normal opportunistic
         # slot the complete site import must be zero: PV plus stationary battery above
         # reserve must cover both the house and EV.
         prob += (
-            grid_import[i]
-            <= params.site_import_limit_kw * itv.dt_hours * (1 - is_ev_opportunistic[i])
-        ), f"ev_no_grid_import_{i}"
+            (
+                grid_import[i]
+                <= params.site_import_limit_kw * itv.dt_hours * (1 - is_ev_opportunistic[i])
+            ),
+            f"ev_no_grid_import_{i}",
+        )
         # Grid import/export composition.
         prob += (
-            grid_import[i] == grid_to_load[i] + grid_to_batt[i] / params.eta_charge
-        ), f"grid_import_{i}"
+            (
+                grid_import[i]
+                == grid_to_load[i] + grid_to_ev[i] + grid_to_batt[i] / params.eta_charge
+            ),
+            f"grid_import_{i}",
+        )
         prob += (
-            grid_export[i] == pv_to_grid[i] + batt_to_grid[i] * params.eta_discharge
-        ), f"grid_export_{i}"
+            (grid_export[i] == pv_to_grid[i] + batt_to_grid[i] * params.eta_discharge),
+            f"grid_export_{i}",
+        )
         # Battery dynamics.
         prev = soc_start_kwh if i == 0 else soc[i - 1]
         prob += (
-            soc[i]
-            == prev + pv_to_batt[i] + grid_to_batt[i] - batt_to_load[i] - batt_to_grid[i]
-        ), f"soc_dyn_{i}"
+            (
+                soc[i]
+                == prev
+                + pv_to_batt[i]
+                + grid_to_batt[i]
+                - batt_to_load[i]
+                - batt_to_grid[i]
+                - batt_to_ev_minimum[i]
+                - batt_to_ev_opportunistic[i]
+            ),
+            f"soc_dyn_{i}",
+        )
+        reserve_gap = params.soc_min_kwh - soc[i]
+        reserve_big_m = params.soc_max_kwh - params.battery_hard_min_kwh
+        prob += reserve_shortfall[i] >= reserve_gap, f"reserve_shortfall_lb_{i}"
+        prob += (
+            reserve_shortfall[i] <= reserve_gap + reserve_big_m * (1 - is_below_reserve[i]),
+            f"reserve_shortfall_exact_{i}",
+        )
+        prob += (
+            reserve_shortfall[i] <= reserve_big_m * is_below_reserve[i],
+            f"reserve_shortfall_zero_above_{i}",
+        )
+        prob += reserve_gap <= reserve_big_m * is_below_reserve[i], f"below_reserve_mode_{i}"
+        reserve_shortfall_prev = (
+            max(0.0, params.soc_min_kwh - soc_start_kwh) if i == 0 else reserve_shortfall[i - 1]
+        )
+        prob += (
+            reserve_shortfall[i] <= reserve_shortfall_prev + batt_to_ev_minimum[i],
+            f"reserve_shortfall_growth_{i}",
+        )
         # Charge / discharge power limits (SoC side) gated by is_charging.
         prob += (
-            pv_to_batt[i] + grid_to_batt[i] <= params.max_charge_kw * dt_h * is_charging[i]
-        ), f"charge_lim_{i}"
+            (pv_to_batt[i] + grid_to_batt[i] <= params.max_charge_kw * dt_h * is_charging[i]),
+            f"charge_lim_{i}",
+        )
         prob += (
-            batt_to_load[i] + batt_to_grid[i]
-            <= params.max_discharge_kw * dt_h * (1 - is_charging[i])
-        ), f"discharge_lim_{i}"
+            (
+                batt_to_load[i]
+                + batt_to_grid[i]
+                + batt_to_ev_minimum[i]
+                + batt_to_ev_opportunistic[i]
+                <= params.max_discharge_kw * dt_h * (1 - is_charging[i])
+            ),
+            f"discharge_lim_{i}",
+        )
         # Grid direction limits gated by is_importing.
         prob += (
-            grid_import[i] <= params.site_import_limit_kw * dt_h * is_importing[i]
-        ), f"import_lim_{i}"
+            (grid_import[i] <= params.site_import_limit_kw * dt_h * is_importing[i]),
+            f"import_lim_{i}",
+        )
         prob += (
-            grid_export[i] <= params.site_export_limit_kw * dt_h * (1 - is_importing[i])
-        ), f"export_lim_{i}"
+            (grid_export[i] <= params.site_export_limit_kw * dt_h * (1 - is_importing[i])),
+            f"export_lim_{i}",
+        )
         # Optional combined inverter throughput limit.
         if params.inverter_limit_kw is not None:
             cap = params.inverter_limit_kw * dt_h
@@ -241,9 +333,12 @@ def optimise(
 
     prob += pulp.lpSum(is_ev_minimum) == params.ev_minimum_slots, "ev_minimum_slots"
     prob += (
-        pulp.lpSum(is_ev_opportunistic)
-        == max(0, params.ev_target_slots - params.ev_minimum_slots)
-    ), "ev_opportunistic_slots"
+        (
+            pulp.lpSum(is_ev_opportunistic)
+            == max(0, params.ev_target_slots - params.ev_minimum_slots)
+        ),
+        "ev_opportunistic_slots",
+    )
 
     # Forecast-backed opportunistic charging is permitted only when the same plan
     # still fills the stationary battery to its configured target. Do not let the
@@ -286,12 +381,15 @@ def optimise(
                 interval_start=itv.interval_start,
                 dt_hours=itv.dt_hours,
                 pv_to_load_kwh=_val(pv_to_load[i]),
+                pv_to_ev_kwh=_val(pv_to_ev[i]),
                 pv_to_battery_kwh=_val(pv_to_batt[i]),
                 pv_to_grid_kwh=_val(pv_to_grid[i]),
                 grid_to_load_kwh=_val(grid_to_load[i]),
+                grid_to_ev_kwh=_val(grid_to_ev[i]),
                 grid_to_battery_kwh=_val(grid_to_batt[i]),
                 battery_to_load_kwh=_val(batt_to_load[i]),
                 battery_to_grid_kwh=_val(batt_to_grid[i]),
+                battery_to_ev_kwh=(_val(batt_to_ev_minimum[i]) + _val(batt_to_ev_opportunistic[i])),
                 curtail_kwh=_val(curtail[i]),
                 grid_import_kwh=_val(grid_import[i]),
                 grid_export_kwh=_val(grid_export[i]),
