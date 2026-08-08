@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
+
+import pytest
 
 from energy_optimizer.forecast.load import LoadForecaster, LoadSample
 from energy_optimizer.forecast.price import PriceSample, pad_prices
-from energy_optimizer.safety import SafetyInputs, Status, evaluate
+from energy_optimizer.safety import (
+    SafetyInputs,
+    Status,
+    evaluate,
+    select_current_interval,
+)
 
 
 def test_safety_blocks_on_missing_price() -> None:
@@ -21,6 +29,7 @@ def test_safety_blocks_on_missing_price() -> None:
     )
     assert report.status == Status.BLOCKED
     assert report.control_enabled is False
+    assert report.control_authorized is False
 
 
 def test_safety_low_confidence_on_padding() -> None:
@@ -36,6 +45,7 @@ def test_safety_low_confidence_on_padding() -> None:
         )
     )
     assert report.status == Status.LOW_CONFIDENCE
+    assert report.control_authorized is False
 
 
 def test_safety_ok() -> None:
@@ -51,6 +61,180 @@ def test_safety_ok() -> None:
         )
     )
     assert report.status == Status.OK
+    assert report.control_authorized is False  # gates still off by default
+
+
+def test_low_confidence_plan_is_publishable_but_not_live_arbitrage() -> None:
+    now = dt.datetime(2026, 8, 8, 12, 5, tzinfo=dt.UTC)
+    report = evaluate(
+        _authorized_control_inputs(
+            now,
+            have_pv_forecast=False,
+            economic_action=True,
+        )
+    )
+    assert report.status == Status.LOW_CONFIDENCE
+    assert "plan_not_ok" in report.control_blockers
+    assert report.control_authorized is False
+
+
+def _authorized_control_inputs(now: dt.datetime, **overrides: object) -> SafetyInputs:
+    start = now.replace(minute=0, second=0, microsecond=0)
+    base: dict[str, object] = dict(
+        telemetry_stale=False,
+        telemetry_stale_reasons=[],
+        have_current_price=True,
+        have_pv_forecast=True,
+        have_load_forecast=True,
+        known_price_hours=48,
+        horizon_hours=48,
+        plan_status_ok=True,
+        plan_age_seconds=30.0,
+        max_plan_age_seconds=900.0,
+        current_interval_start=start,
+        current_interval_end=start + dt.timedelta(minutes=15),
+        now=now,
+        current_buy_price=0.5,
+        current_sell_price=0.2,
+        current_price_is_real=True,
+        current_price_age_seconds=60.0,
+        telemetry_ages_seconds={"battery_power": 10.0, "grid_import": 10.0},
+        max_telemetry_age_seconds=120.0,
+        inverter_entities_available=True,
+        ev_goal_active=False,
+        ev_telemetry_fresh=True,
+        lease_held=True,
+        watchdog_healthy=True,
+        manual_override_active=False,
+        recent_command_failures=0,
+        soc_pct=55.0,
+        soc_update_age_seconds=20.0,
+        soc_at_boundary=False,
+        corroborating_power_fresh=True,
+        number_register_ack_reliable=True,
+        battery_control_enabled=True,
+        mode_is_control=True,
+        economic_action=True,
+    )
+    base.update(overrides)
+    return SafetyInputs(**base)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "field,value,blocker",
+    [
+        ("mode_is_control", False, "mode_not_control"),
+        ("battery_control_enabled", False, "battery_control_disabled"),
+        ("number_register_ack_reliable", False, "number_register_ack_unreliable"),
+        ("lease_held", False, "lease_not_held"),
+        ("watchdog_healthy", False, "watchdog_unhealthy"),
+        ("manual_override_active", True, "manual_override_active"),
+        ("recent_command_failures", 5, "recent_command_failures"),
+        ("inverter_entities_available", False, "inverter_entities_unavailable"),
+        ("plan_age_seconds", 901.0, "plan_stale"),
+        ("current_price_is_real", False, "current_price_not_real"),
+        ("current_buy_price", math.nan, "current_price_unavailable"),
+        ("current_price_age_seconds", 4000.0, "current_price_stale"),
+        ("soc_pct", None, "soc_not_fresh"),
+        ("soc_update_age_seconds", 500.0, "soc_not_fresh"),
+        ("ev_goal_active", True, "ev_telemetry_stale"),
+    ],
+)
+def test_control_authorization_blockers(field: str, value: object, blocker: str) -> None:
+    now = dt.datetime(2026, 8, 8, 12, 5, tzinfo=dt.UTC)
+    overrides: dict[str, object] = {field: value}
+    if field == "ev_goal_active":
+        overrides["ev_telemetry_fresh"] = False
+    report = evaluate(_authorized_control_inputs(now, **overrides))
+    assert blocker in report.control_blockers
+    assert report.control_authorized is False
+
+
+def test_control_authorized_when_all_gates_pass() -> None:
+    now = dt.datetime(2026, 8, 8, 12, 5, tzinfo=dt.UTC)
+    report = evaluate(_authorized_control_inputs(now))
+    assert report.status == Status.OK
+    assert report.control_authorized is True
+    assert report.control_blockers == []
+    assert report.control_enabled is False  # never derived from authorization
+
+
+def test_idle_fallback_skips_forecast_confidence() -> None:
+    now = dt.datetime(2026, 8, 8, 12, 5, tzinfo=dt.UTC)
+    report = evaluate(
+        _authorized_control_inputs(
+            now,
+            have_pv_forecast=False,
+            economic_action=False,
+            current_price_is_real=False,
+            plan_age_seconds=None,
+        )
+    )
+    assert report.status == Status.LOW_CONFIDENCE
+    assert report.control_authorized is True
+    assert "plan_not_ok" not in report.control_blockers
+
+
+def test_boundary_pinned_soc_fresh_with_corroborating_telemetry() -> None:
+    now = dt.datetime(2026, 8, 8, 12, 5, tzinfo=dt.UTC)
+    report = evaluate(
+        _authorized_control_inputs(
+            now,
+            soc_pct=100.0,
+            soc_at_boundary=True,
+            soc_update_age_seconds=30.0,
+            corroborating_power_fresh=True,
+        )
+    )
+    assert report.control_authorized is True
+
+
+def test_boundary_pinned_soc_stale_without_corroborating_telemetry() -> None:
+    now = dt.datetime(2026, 8, 8, 12, 5, tzinfo=dt.UTC)
+    report = evaluate(
+        _authorized_control_inputs(
+            now,
+            soc_pct=100.0,
+            soc_at_boundary=True,
+            soc_update_age_seconds=30.0,
+            corroborating_power_fresh=False,
+        )
+    )
+    assert "soc_not_fresh" in report.control_blockers
+
+
+def test_unchanged_stale_soc_is_not_fresh() -> None:
+    now = dt.datetime(2026, 8, 8, 12, 5, tzinfo=dt.UTC)
+    report = evaluate(
+        _authorized_control_inputs(
+            now,
+            soc_pct=100.0,
+            soc_at_boundary=True,
+            soc_update_age_seconds=500.0,
+            corroborating_power_fresh=True,
+        )
+    )
+    assert "soc_not_fresh" in report.control_blockers
+
+
+def test_select_current_interval_dst_aware() -> None:
+    # Europe/Warsaw spring forward 2026-03-29: 02:00 -> 03:00 local.
+    starts = [
+        dt.datetime(2026, 3, 29, 0, 0, tzinfo=dt.UTC),
+        dt.datetime(2026, 3, 29, 0, 15, tzinfo=dt.UTC),
+        dt.datetime(2026, 3, 29, 0, 30, tzinfo=dt.UTC),
+    ]
+    now = dt.datetime(2026, 3, 29, 0, 20, tzinfo=dt.UTC)
+    selected = select_current_interval(starts, now=now, step_minutes=15, tz="Europe/Warsaw")
+    assert selected is not None
+    assert selected[0] == starts[1]
+
+    missing = select_current_interval(
+        starts,
+        now=dt.datetime(2026, 3, 28, 23, 0, tzinfo=dt.UTC),
+        step_minutes=15,
+    )
+    assert missing is None
 
 
 def test_price_padding_marks_forecast_low_confidence() -> None:

@@ -453,7 +453,11 @@ def classify_step_reason_codes(
         or step.battery_to_load_kwh > eps
         or step.battery_to_ev_kwh > eps
     )
-    if self_use and "grid_charge_arbitrage" not in codes and "battery_export_arbitrage" not in codes:
+    if (
+        self_use
+        and "grid_charge_arbitrage" not in codes
+        and "battery_export_arbitrage" not in codes
+    ):
         codes.append("self_consumption")
     idle = (
         step.pv_to_battery_kwh <= eps

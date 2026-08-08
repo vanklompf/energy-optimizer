@@ -528,6 +528,12 @@ class Service:
                 have_load_forecast=have_load,
                 known_price_hours=known_hours,
                 horizon_hours=float(s.optimise_horizon_hours),
+                mode_is_control=s.mode == "control",
+                battery_control_enabled=s.battery_control_enabled,
+                number_register_ack_reliable=s.battery_control_number_register_ack_reliable,
+                max_plan_age_seconds=s.battery_control_max_plan_age_seconds,
+                max_telemetry_age_seconds=s.battery_control_max_telemetry_age_seconds,
+                economic_action=False,  # planning path; live control authorization is separate
             )
         )
         _apply_ev_shortfall_warning(safety, ev_requirements, s.step_minutes)
