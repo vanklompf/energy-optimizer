@@ -1,22 +1,26 @@
-"""Home Assistant REST client: live states + history, with staleness detection.
+"""Home Assistant REST client: telemetry plus verified control primitives.
 
-Read-only in the MVP. Sign normalisation for the Sigen battery power is explicit and matches
-live verification: ``sensor.sigen_plant_battery_power > 0`` while charging, ``< 0`` while
-discharging. Internally we expose separate non-negative charge/discharge values.
+Read paths expose plant telemetry with Sigen sign normalisation. Control primitives are
+idempotent entity operations with typed acknowledgement — they do not choose EMS mode
+ordering or arm the inverter.
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
-from dataclasses import dataclass
+import re
+import time
+from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
 
 import httpx
 
 logger = logging.getLogger(__name__)
 
-# HA entity ids (read-only in MVP).
+# HA entity ids (read-only telemetry).
 ENTITY_SOC = "sensor.sigen_plant_battery_state_of_charge"
 ENTITY_BATTERY_POWER = "sensor.sigen_plant_battery_power"
 ENTITY_PV_POWER = "sensor.sigen_plant_pv_power"
@@ -34,6 +38,21 @@ POWER_STALE_SECONDS = 5 * 60
 SOC_STALE_SECONDS = 10 * 60
 
 _UNAVAILABLE = {"unknown", "unavailable", "none", "", None}
+_TOKEN_RE = re.compile(r"(Bearer\s+)(\S+)", re.IGNORECASE)
+
+
+class AckStatus(StrEnum):
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+    UNACKNOWLEDGED = "UNACKNOWLEDGED"
+    MISMATCH = "MISMATCH"
+    TRANSPORT_FAILURE = "TRANSPORT_FAILURE"
+    HA_REJECTED = "HA_REJECTED"
+    UNAVAILABLE = "UNAVAILABLE"
+    VALUE_COERCED = "VALUE_COERCED"
+    TIMEOUT = "TIMEOUT"
+    CANCELLED = "CANCELLED"
+    MANUAL_OVERWRITE = "MANUAL_OVERWRITE"
+    IDEMPOTENT_NOOP = "IDEMPOTENT_NOOP"
 
 
 @dataclass(slots=True)
@@ -68,8 +87,32 @@ class TelemetrySnapshot:
     stale_reasons: list[str]
 
 
+@dataclass(slots=True)
+class ControlEntitySpec:
+    entity_id: str
+    kind: str  # switch | select | number
+
+
+@dataclass(slots=True)
+class ControlSnapshot:
+    ts: dt.datetime
+    states: dict[str, HaState | None]
+    validation_errors: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class AckResult:
+    status: AckStatus
+    entity_id: str
+    requested: str | float | bool | None
+    observed: str | float | bool | None
+    detail: str = ""
+    latency_ms: float = 0.0
+
+
 class HaError(RuntimeError):
-    pass
+    def __str__(self) -> str:
+        return redact_secrets(super().__str__())
 
 
 class HaClient:
@@ -82,6 +125,7 @@ class HaClient:
         client: httpx.AsyncClient | None = None,
         timeout: float = 15.0,
         max_retries: int = 3,
+        number_register_ack_reliable: bool = False,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._token = token
@@ -90,6 +134,8 @@ class HaClient:
         self._verify_ssl = verify_ssl
         self._client = client
         self._owns_client = client is None
+        # Contract: installed HA number entities do not acknowledge register writes.
+        self.number_register_ack_reliable = number_register_ack_reliable
 
     async def __aenter__(self) -> HaClient:
         if self._client is None:
@@ -122,7 +168,7 @@ class HaClient:
                     entity_id,
                     attempt,
                     self._max_retries,
-                    exc,
+                    redact_secrets(str(exc)),
                 )
         raise HaError(f"HA get_state({entity_id}) failed") from last_exc
 
@@ -165,6 +211,21 @@ class HaClient:
         )
         return build_snapshot(states, now)
 
+    async def get_control_snapshot(
+        self,
+        specs: list[ControlEntitySpec],
+        *,
+        now: dt.datetime | None = None,
+    ) -> ControlSnapshot:
+        """Fetch and validate configured control entities in one snapshot."""
+        now = now or dt.datetime.now(tz=dt.UTC)
+        states = await self.get_states([spec.entity_id for spec in specs])
+        errors: list[str] = []
+        for spec in specs:
+            state = states.get(spec.entity_id)
+            errors.extend(validate_control_entity(spec, state))
+        return ControlSnapshot(ts=now, states=states, validation_errors=errors)
+
     async def call_service(self, domain: str, service: str, data: dict[str, Any]) -> None:
         """Call a Home Assistant service and raise ``HaError`` on failure."""
         client = self._require_client()
@@ -172,13 +233,288 @@ class HaClient:
         try:
             response = await client.post(url, headers=self._headers(), json=data)
             response.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            raise HaError(
+                f"HA service {domain}.{service} rejected: HTTP {exc.response.status_code}"
+            ) from exc
         except httpx.HTTPError as exc:
-            raise HaError(f"HA service {domain}.{service} failed") from exc
+            raise HaError(f"HA service {domain}.{service} failed: {exc}") from exc
+
+    async def set_number(
+        self,
+        entity_id: str,
+        value: float,
+        *,
+        timeout_s: float = 5.0,
+        poll_interval_s: float = 0.2,
+        abs_tolerance: float = 0.001,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AckResult:
+        """Set a number entity and classify acknowledgement (never trust fallback 0.0 alone)."""
+        t0 = time.perf_counter()
+        if not self.number_register_ack_reliable:
+            return AckResult(
+                status=AckStatus.UNACKNOWLEDGED,
+                entity_id=entity_id,
+                requested=value,
+                observed=None,
+                detail="number_register_ack_unreliable",
+                latency_ms=_ms(t0),
+            )
+        before = await self.get_state(entity_id)
+        if before is None or before.state in _UNAVAILABLE:
+            return AckResult(
+                AckStatus.UNAVAILABLE, entity_id, value, None, "entity unavailable", _ms(t0)
+            )
+        current = before.as_float()
+        if current is not None and abs(current - value) <= abs_tolerance:
+            return AckResult(
+                AckStatus.IDEMPOTENT_NOOP, entity_id, value, current, "already set", _ms(t0)
+            )
+        try:
+            await self.call_service(
+                "number", "set_value", {"entity_id": entity_id, "value": value}
+            )
+        except HaError as exc:
+            status = (
+                AckStatus.HA_REJECTED
+                if "rejected" in str(exc).lower() or "HTTP" in str(exc)
+                else AckStatus.TRANSPORT_FAILURE
+            )
+            return AckResult(status, entity_id, value, None, str(exc), _ms(t0))
+
+        return await self._poll_number(
+            entity_id,
+            value,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+            abs_tolerance=abs_tolerance,
+            cancel_event=cancel_event,
+            previous=current,
+        )
+
+    async def select_option(
+        self,
+        entity_id: str,
+        option: str,
+        *,
+        timeout_s: float = 5.0,
+        poll_interval_s: float = 0.2,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AckResult:
+        t0 = time.perf_counter()
+        before = await self.get_state(entity_id)
+        if before is None or before.state in _UNAVAILABLE:
+            return AckResult(
+                AckStatus.UNAVAILABLE, entity_id, option, None, "entity unavailable", _ms(t0)
+            )
+        options = before.attributes.get("options") or []
+        if options and option not in options:
+            return AckResult(
+                AckStatus.MISMATCH,
+                entity_id,
+                option,
+                before.state,
+                f"option not in {options!r}",
+                _ms(t0),
+            )
+        if before.state == option:
+            return AckResult(
+                AckStatus.IDEMPOTENT_NOOP, entity_id, option, option, "already selected", _ms(t0)
+            )
+        try:
+            await self.call_service(
+                "select", "select_option", {"entity_id": entity_id, "option": option}
+            )
+        except HaError as exc:
+            status = AckStatus.HA_REJECTED if "HTTP" in str(exc) else AckStatus.TRANSPORT_FAILURE
+            return AckResult(status, entity_id, option, None, str(exc), _ms(t0))
+        return await self._poll_state_equals(
+            entity_id,
+            option,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+            cancel_event=cancel_event,
+            previous=before.state,
+            t0=t0,
+        )
+
+    async def turn_switch(
+        self,
+        entity_id: str,
+        on: bool,
+        *,
+        timeout_s: float = 5.0,
+        poll_interval_s: float = 0.2,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AckResult:
+        t0 = time.perf_counter()
+        desired = "on" if on else "off"
+        before = await self.get_state(entity_id)
+        if before is None or before.state in _UNAVAILABLE:
+            return AckResult(
+                AckStatus.UNAVAILABLE, entity_id, desired, None, "entity unavailable", _ms(t0)
+            )
+        if before.state == desired:
+            return AckResult(
+                AckStatus.IDEMPOTENT_NOOP, entity_id, desired, desired, "already set", _ms(t0)
+            )
+        service = "turn_on" if on else "turn_off"
+        try:
+            await self.call_service("switch", service, {"entity_id": entity_id})
+        except HaError as exc:
+            status = AckStatus.HA_REJECTED if "HTTP" in str(exc) else AckStatus.TRANSPORT_FAILURE
+            return AckResult(status, entity_id, desired, None, str(exc), _ms(t0))
+        return await self._poll_state_equals(
+            entity_id,
+            desired,
+            timeout_s=timeout_s,
+            poll_interval_s=poll_interval_s,
+            cancel_event=cancel_event,
+            previous=before.state,
+            t0=t0,
+        )
+
+    async def _poll_number(
+        self,
+        entity_id: str,
+        value: float,
+        *,
+        timeout_s: float,
+        poll_interval_s: float,
+        abs_tolerance: float,
+        cancel_event: asyncio.Event | None,
+        previous: float | None,
+    ) -> AckResult:
+        t0 = time.perf_counter()
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                return AckResult(
+                    AckStatus.CANCELLED, entity_id, value, None, "cancelled", _ms(t0)
+                )
+            state = await self.get_state(entity_id)
+            if state is None or state.state in _UNAVAILABLE:
+                await asyncio.sleep(poll_interval_s)
+                continue
+            observed = state.as_float()
+            if observed is None:
+                await asyncio.sleep(poll_interval_s)
+                continue
+            # Contract: HTTP 200 + fallback 0.0 is not acknowledgement of a non-zero write.
+            if abs(value) > abs_tolerance and abs(observed) <= abs_tolerance:
+                return AckResult(
+                    AckStatus.UNACKNOWLEDGED,
+                    entity_id,
+                    value,
+                    observed,
+                    "fallback_zero_readback",
+                    _ms(t0),
+                )
+            if abs(observed - value) <= abs_tolerance:
+                return AckResult(
+                    AckStatus.ACKNOWLEDGED, entity_id, value, observed, "", _ms(t0)
+                )
+            if abs(observed - value) <= max(abs_tolerance * 10, 0.01):
+                return AckResult(
+                    AckStatus.VALUE_COERCED, entity_id, value, observed, "rounded", _ms(t0)
+                )
+            if (
+                previous is not None
+                and abs(observed - previous) > abs_tolerance
+                and abs(observed - value) > abs_tolerance
+            ):
+                return AckResult(
+                    AckStatus.MANUAL_OVERWRITE,
+                    entity_id,
+                    value,
+                    observed,
+                    "state changed away from request",
+                    _ms(t0),
+                )
+            await asyncio.sleep(poll_interval_s)
+        final = await self.get_state(entity_id)
+        observed = final.as_float() if final else None
+        return AckResult(AckStatus.TIMEOUT, entity_id, value, observed, "poll timeout", _ms(t0))
+
+    async def _poll_state_equals(
+        self,
+        entity_id: str,
+        desired: str,
+        *,
+        timeout_s: float,
+        poll_interval_s: float,
+        cancel_event: asyncio.Event | None,
+        previous: str | None,
+        t0: float,
+    ) -> AckResult:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                return AckResult(
+                    AckStatus.CANCELLED, entity_id, desired, None, "cancelled", _ms(t0)
+                )
+            state = await self.get_state(entity_id)
+            if state is None or state.state in _UNAVAILABLE:
+                await asyncio.sleep(poll_interval_s)
+                continue
+            if state.state == desired:
+                return AckResult(
+                    AckStatus.ACKNOWLEDGED, entity_id, desired, state.state, "", _ms(t0)
+                )
+            if previous is not None and state.state != previous and state.state != desired:
+                return AckResult(
+                    AckStatus.MANUAL_OVERWRITE,
+                    entity_id,
+                    desired,
+                    state.state,
+                    "state changed away from request",
+                    _ms(t0),
+                )
+            await asyncio.sleep(poll_interval_s)
+        final = await self.get_state(entity_id)
+        observed = final.state if final else None
+        if observed == desired:
+            return AckResult(AckStatus.ACKNOWLEDGED, entity_id, desired, observed, "", _ms(t0))
+        return AckResult(AckStatus.TIMEOUT, entity_id, desired, observed, "poll timeout", _ms(t0))
 
     def _require_client(self) -> httpx.AsyncClient:
         if self._client is None:
             raise HaError("HaClient used outside of an async context manager")
         return self._client
+
+
+def validate_control_entity(spec: ControlEntitySpec, state: HaState | None) -> list[str]:
+    if state is None:
+        return [f"{spec.entity_id}: missing"]
+    if state.state in _UNAVAILABLE:
+        return [f"{spec.entity_id}: unavailable"]
+    errors: list[str] = []
+    if spec.kind == "select":
+        options = state.attributes.get("options")
+        if not isinstance(options, list) or not options:
+            errors.append(f"{spec.entity_id}: select options missing")
+        elif state.state not in options:
+            errors.append(f"{spec.entity_id}: state not in options")
+    elif spec.kind == "number":
+        minimum = state.attributes.get("min")
+        maximum = state.attributes.get("max")
+        step = state.attributes.get("step")
+        value = state.as_float()
+        if value is None:
+            errors.append(f"{spec.entity_id}: non-numeric state")
+        if minimum is None or maximum is None:
+            errors.append(f"{spec.entity_id}: number bounds missing")
+        if step is None:
+            errors.append(f"{spec.entity_id}: number step missing")
+    elif spec.kind == "switch":
+        if state.state not in {"on", "off"}:
+            errors.append(f"{spec.entity_id}: switch state invalid")
+    return errors
+
+
+def redact_secrets(message: str) -> str:
+    return _TOKEN_RE.sub(r"\1***", message)
 
 
 def build_snapshot(states: dict[str, HaState | None], now: dt.datetime) -> TelemetrySnapshot:
@@ -277,3 +613,7 @@ def _to_iso(value: dt.datetime) -> str:
     if value.tzinfo is None:
         value = value.replace(tzinfo=dt.UTC)
     return value.astimezone(dt.UTC).isoformat()
+
+
+def _ms(t0: float) -> float:
+    return (time.perf_counter() - t0) * 1000.0

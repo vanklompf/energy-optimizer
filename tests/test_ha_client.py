@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 
 import httpx
+import pytest
 import respx
 
 from energy_optimizer.ha_client import (
@@ -13,11 +14,15 @@ from energy_optimizer.ha_client import (
     ENTITY_GRID_IMPORT_POWER,
     ENTITY_PV_POWER,
     ENTITY_SOC,
+    AckStatus,
+    ControlEntitySpec,
     HaClient,
+    HaError,
     HaState,
     _parse_state,
     _split_battery_power,
     build_snapshot,
+    redact_secrets,
 )
 
 
@@ -132,3 +137,165 @@ async def test_call_service_posts_to_home_assistant() -> None:
     request = route.calls.last.request
     assert request.headers["Authorization"] == "Bearer secret"
     assert request.content == b'{"entity_id":"switch.garage"}'
+
+
+@respx.mock
+async def test_set_number_unacknowledged_when_capability_disabled() -> None:
+    async with HaClient(
+        "http://ha.local:8123", "secret", number_register_ack_reliable=False
+    ) as client:
+        result = await client.set_number("number.sigen_plant_ess_max_charging_limit", 0.5)
+    assert result.status == AckStatus.UNACKNOWLEDGED
+    assert result.detail == "number_register_ack_unreliable"
+
+
+@respx.mock
+async def test_set_number_fallback_zero_after_http_200_is_unacknowledged() -> None:
+    entity = "number.sigen_plant_ess_max_charging_limit"
+    respx.get(f"http://ha.local:8123/api/states/{entity}").mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json={
+                    "entity_id": entity,
+                    "state": "8.8",
+                    "attributes": {"min": 0, "max": 100, "step": 0.001},
+                    "last_updated": "2026-08-08T10:00:00Z",
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "entity_id": entity,
+                    "state": "0.0",
+                    "attributes": {"min": 0, "max": 100, "step": 0.001},
+                    "last_updated": "2026-08-08T10:00:01Z",
+                },
+            ),
+        ]
+    )
+    respx.post("http://ha.local:8123/api/services/number/set_value").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    async with HaClient(
+        "http://ha.local:8123", "secret", number_register_ack_reliable=True
+    ) as client:
+        result = await client.set_number(entity, 0.5, timeout_s=0.5, poll_interval_s=0.01)
+    assert result.status == AckStatus.UNACKNOWLEDGED
+    assert result.detail == "fallback_zero_readback"
+
+
+@respx.mock
+async def test_select_option_and_switch_ack_matrix() -> None:
+    select_id = "select.sigen_plant_remote_ems_control_mode"
+    switch_id = "switch.sigen_plant_remote_ems_controlled_by_home_assistant"
+    options = ["Standby", "Command Charging (Grid First)"]
+
+    def _select_payload(state: str) -> dict:
+        return {
+            "entity_id": select_id,
+            "state": state,
+            "attributes": {"options": options},
+            "last_updated": "2026-08-08T10:00:00Z",
+        }
+
+    respx.get(f"http://ha.local:8123/api/states/{select_id}").mock(
+        side_effect=[
+            httpx.Response(200, json=_select_payload("Standby")),  # mismatch check
+            httpx.Response(200, json=_select_payload("Standby")),  # before select
+            httpx.Response(200, json=_select_payload("Command Charging (Grid First)")),
+        ]
+    )
+    respx.post("http://ha.local:8123/api/services/select/select_option").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+    respx.get(f"http://ha.local:8123/api/states/{switch_id}").mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json={
+                    "entity_id": switch_id,
+                    "state": "off",
+                    "attributes": {},
+                    "last_updated": "2026-08-08T10:00:00Z",
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "entity_id": switch_id,
+                    "state": "on",
+                    "attributes": {},
+                    "last_updated": "2026-08-08T10:00:01Z",
+                },
+            ),
+        ]
+    )
+    respx.post("http://ha.local:8123/api/services/switch/turn_on").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    async with HaClient("http://ha.local:8123", "secret") as client:
+        bad = await client.select_option(select_id, "Unknown")
+        assert bad.status == AckStatus.MISMATCH
+        ok = await client.select_option(
+            select_id, "Command Charging (Grid First)", timeout_s=0.5, poll_interval_s=0.01
+        )
+        assert ok.status == AckStatus.ACKNOWLEDGED
+        sw = await client.turn_switch(switch_id, True, timeout_s=0.5, poll_interval_s=0.01)
+        assert sw.status == AckStatus.ACKNOWLEDGED
+
+
+@respx.mock
+async def test_ha_rejection_and_redaction() -> None:
+    respx.post("http://ha.local:8123/api/services/switch/turn_on").mock(
+        return_value=httpx.Response(401, json={"message": "Unauthorized"})
+    )
+    async with HaClient("http://ha.local:8123", "super-secret-token") as client:
+        with pytest.raises(HaError) as exc:
+            await client.call_service("switch", "turn_on", {"entity_id": "switch.x"})
+    assert "super-secret-token" not in str(exc.value)
+    assert "401" in str(exc.value)
+
+
+def test_redact_secrets_masks_bearer_token() -> None:
+    assert "secret" not in redact_secrets("Authorization: Bearer secret-value")
+    assert "***" in redact_secrets("Authorization: Bearer secret-value")
+
+
+@respx.mock
+async def test_control_snapshot_validates_bounds_and_options() -> None:
+    select_id = "select.mode"
+    number_id = "number.limit"
+    respx.get(f"http://ha.local:8123/api/states/{select_id}").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "entity_id": select_id,
+                "state": "Standby",
+                "attributes": {"options": ["Standby", "Command Charging (Grid First)"]},
+                "last_updated": "2026-08-08T10:00:00Z",
+            },
+        )
+    )
+    respx.get(f"http://ha.local:8123/api/states/{number_id}").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "entity_id": number_id,
+                "state": "0.0",
+                "attributes": {"min": 0, "max": 100, "step": 0.001},
+                "last_updated": "2026-08-08T10:00:00Z",
+            },
+        )
+    )
+    async with HaClient("http://ha.local:8123", "secret") as client:
+        snap = await client.get_control_snapshot(
+            [
+                ControlEntitySpec(select_id, "select"),
+                ControlEntitySpec(number_id, "number"),
+            ]
+        )
+    assert snap.validation_errors == []
+    assert snap.states[number_id].as_float() == 0.0
+
