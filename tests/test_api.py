@@ -54,6 +54,47 @@ def test_status_empty(client: TestClient) -> None:
         in body["ev_control"]["policy_explanation"]
     )
     assert body["billing_meter"] is None
+    bc = body["battery_control"]
+    assert bc["mode"] == "dry_run"
+    assert bc["battery_control_enabled"] is False
+    assert bc["gates_ok"] is False
+    assert bc["effective_state"] == "DRY_RUN"
+    assert bc["watchdog_healthy"] is False
+    assert bc["arm_token_configured"] is False
+
+
+def test_control_actions_history_is_read_only(client: TestClient) -> None:
+    store = client.app.state.store
+    with store.session() as session:
+        from energy_optimizer.control_store import persist_pending_action, finalize_action
+
+        persist_pending_action(
+            session,
+            command_id="hist-1",
+            source_run_id=None,
+            interval_start=None,
+            intent={"direction": "IDLE"},
+            authorization_allowed=False,
+            blockers=["dry_run_or_disarmed"],
+            requested_state="DISARMED",
+        )
+        finalize_action(
+            session,
+            "hist-1",
+            observed_state="DISARMED",
+            physical=None,
+            result="dry_run_skipped",
+            error_code="dry_run_or_disarmed",
+        )
+
+    resp = client.get("/api/control/actions")
+    assert resp.status_code == 200
+    actions = resp.json()["actions"]
+    assert actions[0]["command_id"] == "hist-1"
+    assert actions[0]["result"] == "dry_run_skipped"
+    # No public arm/clear mutation endpoints.
+    assert client.post("/api/control/arm").status_code in {404, 405, 422}
+    assert client.post("/api/control/disarm").status_code in {404, 405, 422}
 
 
 def test_status_exposes_latest_pstryk_billing_interval(client: TestClient) -> None:

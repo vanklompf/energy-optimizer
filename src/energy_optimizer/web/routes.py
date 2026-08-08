@@ -9,7 +9,11 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import select
 
-from ..config import Settings
+from ..config import BATTERY_CONTROL_EXPECTED_ARM_TOKEN, Settings
+from ..control_store import (
+    DEFAULT_SITE_KEY,
+    ensure_controller_state,
+)
 from ..ev import EV_FULL_TARGET_SOC_PCT
 from ..optimiser import IntervalInput, optimise
 from ..safety import CONTROL_ENABLED
@@ -22,6 +26,8 @@ from ..simulator import (
     value_optimiser_plan,
 )
 from ..store import (
+    ControlAction,
+    ControllerLease,
     DailyReport,
     EvControlStatus,
     EvPlanStep,
@@ -45,6 +51,137 @@ def _store(request: Request) -> Store:
 
 def _settings(request: Request) -> Settings:
     return request.app.state.settings
+
+
+def _battery_control_status(request: Request, now: dt.datetime) -> dict:
+    """Read-only battery controller observability. Never exposes arm tokens or secrets."""
+    store = _store(request)
+    settings = _settings(request)
+    service = request.app.state.service
+    gates_ok = (
+        settings.mode == "control"
+        and settings.battery_control_enabled
+        and settings.battery_control_arm_token == BATTERY_CONTROL_EXPECTED_ARM_TOKEN
+    )
+    with store.session() as session:
+        state = ensure_controller_state(session)
+        lease = session.get(ControllerLease, DEFAULT_SITE_KEY)
+        last_action = session.execute(
+            select(ControlAction).order_by(ControlAction.created_at.desc()).limit(1)
+        ).scalar_one_or_none()
+        last_verified = session.execute(
+            select(ControlAction)
+            .where(ControlAction.result == "ok")
+            .order_by(ControlAction.updated_at.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+
+    lease_expires = _aware(lease.expires_at) if lease is not None else None
+    lease_held = bool(
+        lease is not None
+        and lease.owner_id == getattr(service, "controller_owner_id", None)
+        and lease_expires is not None
+        and lease_expires > now
+    )
+    heartbeat_at = state.last_heartbeat_at
+    heartbeat_age = (
+        max(0.0, (now - _aware(heartbeat_at)).total_seconds()) if heartbeat_at else None
+    )
+    lockout_active = bool(
+        state.lockout_until is not None and _aware(state.lockout_until) > now
+    )
+    effective = "DISARMED"
+    if lockout_active:
+        effective = "LOCKOUT"
+    elif settings.mode != "control" or not settings.battery_control_enabled:
+        effective = "DRY_RUN"
+    elif gates_ok:
+        effective = state.state
+
+    intent = None
+    if last_action is not None and last_action.intent_json:
+        try:
+            import json
+
+            intent = json.loads(last_action.intent_json)
+        except json.JSONDecodeError:
+            intent = {"raw": last_action.intent_json}
+
+    physical = None
+    if last_action is not None and last_action.physical_json:
+        try:
+            import json
+
+            physical = json.loads(last_action.physical_json)
+        except json.JSONDecodeError:
+            physical = None
+
+    return {
+        "mode": settings.mode,
+        "battery_control_enabled": settings.battery_control_enabled,
+        "arm_token_configured": bool(settings.battery_control_arm_token),
+        "arm_token_matches": (
+            settings.battery_control_arm_token == BATTERY_CONTROL_EXPECTED_ARM_TOKEN
+        ),
+        "export_enabled": settings.battery_export_enabled,
+        "number_register_ack_reliable": settings.battery_control_number_register_ack_reliable,
+        "gates_ok": gates_ok,
+        "effective_state": effective,
+        "controller_state": state.state,
+        "lease": {
+            "held": lease_held,
+            "owner_id": lease.owner_id if lease else None,
+            "expires_at": lease_expires.isoformat() if lease_expires else None,
+            "self_owner_id": getattr(service, "controller_owner_id", None),
+        },
+        "watchdog_healthy": False,
+        "heartbeat_age_seconds": heartbeat_age,
+        "heartbeat_expiry_seconds": settings.battery_control_heartbeat_expiry_seconds,
+        "current_intent": intent,
+        "last_action": _control_action_dict(last_action),
+        "last_verified_action": _control_action_dict(last_verified),
+        "last_fallback_at": (
+            _aware(state.last_fallback_at).isoformat() if state.last_fallback_at else None
+        ),
+        "last_fallback_verified": bool(state.last_fallback_verified),
+        "lockout": {
+            "active": lockout_active,
+            "until": (
+                _aware(state.lockout_until).isoformat() if state.lockout_until else None
+            ),
+            "reason": state.lockout_reason,
+        },
+        "physical_verification": physical,
+    }
+
+
+def _control_action_dict(action: ControlAction | None) -> dict | None:
+    if action is None:
+        return None
+    blockers = None
+    if action.blockers_json:
+        try:
+            import json
+
+            blockers = json.loads(action.blockers_json)
+        except json.JSONDecodeError:
+            blockers = [action.blockers_json]
+    return {
+        "command_id": action.command_id,
+        "created_at": _aware(action.created_at).isoformat(),
+        "updated_at": _aware(action.updated_at).isoformat(),
+        "source_run_id": action.source_run_id,
+        "interval_start": (
+            _aware(action.interval_start).isoformat() if action.interval_start else None
+        ),
+        "authorization_allowed": action.authorization_allowed,
+        "blockers": blockers,
+        "requested_state": action.requested_state,
+        "observed_state": action.observed_state,
+        "result": action.result,
+        "error_code": action.error_code,
+        "latency_ms": action.latency_ms,
+    }
 
 
 @router.get("/status")
@@ -84,7 +221,24 @@ def get_status(request: Request) -> dict:
             settings,
             override_active=request.app.state.service.ev_charge_to_100_active,
         ),
+        "battery_control": _battery_control_status(request, now),
     }
+
+
+@router.get("/control/actions")
+def get_control_actions(request: Request, limit: int = 20) -> dict:
+    """Recent battery control audit history (read-only)."""
+    store = _store(request)
+    limit = max(1, min(limit, 200))
+    with store.session() as session:
+        rows = (
+            session.execute(
+                select(ControlAction).order_by(ControlAction.created_at.desc()).limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+    return {"actions": [_control_action_dict(row) for row in rows]}
 
 
 @router.get("/prices")

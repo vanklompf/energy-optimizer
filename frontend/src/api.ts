@@ -55,6 +55,54 @@ export interface StatusResponse {
   last_run: RunSummary | null;
   ev: EvTelemetry | null;
   ev_control: EvControl;
+  battery_control: BatteryControlStatus;
+}
+
+export interface BatteryControlAction {
+  command_id: string;
+  created_at: string;
+  updated_at: string;
+  source_run_id: string | null;
+  interval_start: string | null;
+  authorization_allowed: boolean;
+  blockers: string[] | null;
+  requested_state: string | null;
+  observed_state: string | null;
+  result: string;
+  error_code: string | null;
+  latency_ms: number | null;
+}
+
+export interface BatteryControlStatus {
+  mode: string;
+  battery_control_enabled: boolean;
+  arm_token_configured: boolean;
+  arm_token_matches: boolean;
+  export_enabled: boolean;
+  number_register_ack_reliable: boolean;
+  gates_ok: boolean;
+  effective_state: string;
+  controller_state: string;
+  lease: {
+    held: boolean;
+    owner_id: string | null;
+    expires_at: string | null;
+    self_owner_id: string | null;
+  };
+  watchdog_healthy: boolean;
+  heartbeat_age_seconds: number | null;
+  heartbeat_expiry_seconds: number;
+  current_intent: Record<string, unknown> | null;
+  last_action: BatteryControlAction | null;
+  last_verified_action: BatteryControlAction | null;
+  last_fallback_at: string | null;
+  last_fallback_verified: boolean;
+  lockout: {
+    active: boolean;
+    until: string | null;
+    reason: string | null;
+  };
+  physical_verification: Record<string, unknown> | null;
 }
 
 export interface EvTelemetry {

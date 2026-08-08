@@ -154,6 +154,17 @@ const STATUS_CLASS: Record<string, string> = {
   blocked: "badge-block",
 };
 
+const CONTROL_BADGE: Record<string, { label: string; className: string }> = {
+  DRY_RUN: { label: "DRY RUN", className: "badge-dryrun" },
+  DISARMED: { label: "DISARMED", className: "badge-dryrun" },
+  PREFLIGHT: { label: "PREFLIGHT", className: "badge-warn" },
+  ARMED_IDLE: { label: "ARMED", className: "badge-ok" },
+  ACTIVE_CHARGE: { label: "CHARGING", className: "badge-ok" },
+  ACTIVE_DISCHARGE: { label: "DISCHARGING", className: "badge-ok" },
+  FALLBACK: { label: "FALLBACK", className: "badge-warn" },
+  LOCKOUT: { label: "LOCKOUT", className: "badge-block" },
+};
+
 export default function NowView() {
   const { data, error, loading } = usePolling(api.status, 15000);
   const { data: savings } = usePolling(api.savings, 300000);
@@ -168,9 +179,58 @@ export default function NowView() {
   const run = data.last_run;
   const ev = data.ev;
   const evControl = data.ev_control;
+  const bc = data.battery_control;
+  const controlBadge = CONTROL_BADGE[bc.effective_state] ?? {
+    label: bc.effective_state,
+    className: "badge-warn",
+  };
+  const intent = bc.current_intent;
+  const requestedPower =
+    intent && typeof intent.requested_power_kw === "number"
+      ? intent.requested_power_kw
+      : null;
+  const measuredCharge = t?.batt_charge_kw ?? null;
+  const measuredDischarge = t?.batt_discharge_kw ?? null;
+  const measuredPower =
+    measuredCharge != null || measuredDischarge != null
+      ? (measuredCharge ?? 0) - (measuredDischarge ?? 0)
+      : null;
 
   return (
     <>
+      <div className="panel" style={{ marginBottom: 16 }}>
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <div className={`badge ${controlBadge.className}`} style={{ fontSize: 14, padding: "6px 14px" }}>
+            {controlBadge.label}
+          </div>
+          <span className="muted">
+            mode={bc.mode} · enabled={String(bc.battery_control_enabled)} · gates=
+            {bc.gates_ok ? "ok" : "blocked"} · watchdog=
+            {bc.watchdog_healthy ? "healthy" : "unproven"}
+          </span>
+        </div>
+        <ul className="metrics" style={{ marginTop: 12 }}>
+          <li><span>Controller state</span><b>{bc.controller_state}</b></li>
+          <li><span>Lease</span><b>{bc.lease.held ? "held" : "free"}</b></li>
+          <li><span>Requested power</span><b>{fmt(requestedPower, " kW")}</b></li>
+          <li><span>Measured battery power</span><b>{fmt(measuredPower, " kW")}</b></li>
+          <li><span>Last result</span><b>{bc.last_action?.result ?? "—"}</b></li>
+          <li><span>Last latency</span><b>{fmt(bc.last_action?.latency_ms, " ms", 0)}</b></li>
+          <li><span>Last fallback</span><b>{bc.last_fallback_at ? new Date(bc.last_fallback_at).toLocaleString() : "—"}</b></li>
+          <li><span>Lockout</span><b>{bc.lockout.active ? bc.lockout.reason ?? "active" : "none"}</b></li>
+        </ul>
+        {bc.last_action?.blockers && bc.last_action.blockers.length > 0 && (
+          <p className="reason">Blockers: {bc.last_action.blockers.join(", ")}</p>
+        )}
+        {bc.last_action?.error_code && (
+          <p className="muted">Last error: {bc.last_action.error_code}</p>
+        )}
+        <p className="muted">
+          Physical verification is required for success; an HTTP 200 alone is never treated as actuated.
+          Heartbeat age {bc.heartbeat_age_seconds == null ? "n/a" : `${Math.round(bc.heartbeat_age_seconds)}s`}
+          {" "}/ expiry {bc.heartbeat_expiry_seconds}s.
+        </p>
+      </div>
       <PriceChart />
       <PlanChart />
       <div className="grid">

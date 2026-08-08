@@ -623,22 +623,59 @@ class Service:
 
     async def publish_battery_heartbeat(self) -> None:
         """Lightweight heartbeat independent of optimisation."""
-        from .control_store import ensure_controller_state
+        from .control_store import ensure_controller_state, lease_held_by
+        from .mqtt_publish import BatteryControlMqttState
+        from .store import ControlAction
 
         now = utcnow()
+        s = self.settings
         with self.store.session() as session:
             state = ensure_controller_state(session)
             state.last_heartbeat_at = now
             state.updated_at = now
+            lease_held = lease_held_by(
+                session, owner_id=self.controller_owner_id, now=now
+            )
+            last = session.execute(
+                select(ControlAction).order_by(ControlAction.created_at.desc()).limit(1)
+            ).scalar_one_or_none()
+            blockers = ""
+            last_result = "none"
+            if last is not None:
+                last_result = last.result
+                blockers = last.error_code or ""
+            armed = (
+                s.mode == "control"
+                and s.battery_control_enabled
+                and bool(s.battery_control_arm_token)
+            )
+            effective = "DRY_RUN"
+            if state.lockout_until is not None and _aware(state.lockout_until) > now:
+                effective = "LOCKOUT"
+            elif armed:
+                effective = state.state
             payload = {
                 "ts": now.isoformat(),
                 "state": state.state,
                 "owner_id": self.controller_owner_id,
+                "expires_at": (
+                    now + dt.timedelta(seconds=s.battery_control_heartbeat_expiry_seconds)
+                ).isoformat(),
                 "lockout": bool(state.lockout_until and _aware(state.lockout_until) > now),
             }
+            mqtt_state = BatteryControlMqttState(
+                battery_control_state=state.state,
+                battery_control_effective=effective,
+                battery_control_last_result=last_result,
+                battery_control_blockers=blockers,
+                battery_control_armed=armed,
+                battery_control_lease_held=lease_held,
+                battery_control_watchdog_healthy=False,
+            )
         if self._mqtt is not None:
             try:
                 self._mqtt.publish_battery_heartbeat(payload)
+                self._mqtt.publish_battery_control_state(mqtt_state)
             except Exception as exc:  # pragma: no cover
                 logger.warning("battery heartbeat publish failed: %s", exc)
 
