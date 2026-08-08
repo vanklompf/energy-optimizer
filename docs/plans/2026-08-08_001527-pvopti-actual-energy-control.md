@@ -37,6 +37,36 @@ Rules:
 - Task 1's empirical output is complete enough to begin non-actuating implementation. Remaining failure/discharge/export characterization is a rollout blocker, not a blocker for domain/configuration/shadow code.
 - The installed integration has a critical number-register acknowledgement gap. Live authorization must remain impossible until Task 6/7 provides reliable acknowledgement or explicitly blocks with a stable reason code.
 
+### Audited task coverage at handoff
+
+This read-only coverage audit reflects the code and uncommitted worktree on 2026-08-08. Re-run Task 0 if those files change. Stationary-battery actuation coverage is effectively zero: PvOpti still cannot arm or command it.
+
+| Task | Current status | Existing evidence / resume point |
+|---|---|---|
+| 1 — empirical contract | Implementation input complete; rollout evidence partial | `docs/sigenergy-control-contract.md`; failure containment, autonomous expiry, discharge/export, cut-off enforcement, and reliable number read-back remain blockers. |
+| 2 — control configuration | Mostly absent | `Settings.mode` is still `Literal["dry_run"]`; no stationary-battery enable/arm gates, entity map, transaction timings, watchdog, fallback, or live-config validator. Worktree hard-floor settings are EV/reserve groundwork only. |
+| 3 — typed intent/state machine | Absent | No `battery_control.py`, controller enums/intents/results, or focused tests. |
+| 4 — actionable optimizer | Partial; preserve existing work | Existing optimizer already models independent planner permissions, explicit energy flows, binary charge/discharge and import/export exclusion, site limits, losses, degradation, and EV obligations. Worktree adds hard-floor/reserve-shortfall and explicit PV/grid/battery-to-EV flows. Activation margins are configured but not consumed; stable reasons and live-current-price authorization remain missing. |
+| 5 — control authorization | Absent | `safety.py` still hardcodes `CONTROL_ENABLED = False`; there is no separate `control_authorized`. |
+| 6 — HA primitives | Battery-specific layer absent | Generic `HAClient.call_service` exists; typed control snapshots, validation, acknowledgement semantics, and battery tests do not. |
+| 7 — Sigenergy adapter | Absent | No adapter module or tests. |
+| 8 — audit/lease/lockout persistence | Absent | No control action/state/lease schema. |
+| 9 — service/scheduler control loop | Absent | No intent builder, battery job, fallback/reconcile, lease, or heartbeat. |
+| 10 — API/MQTT/frontend status | Absent | Existing worktree API additions describe EV policy only. |
+| 11 — layered watchdog | Absent | The deployed selector overlay solves dormant-mode ordering; it is not a watchdog. |
+| 12 — Ansible control variables | Absent beyond optimizer/EV groundwork | No battery-control gates, entity/timing mapping, watchdog assertions, or immutable active image. |
+| 13 — control-aware simulation | Mostly absent | Settlement integrity exists; worktree adds battery-to-EV throughput only, not cadence/delay/ramp/deadband/fallback replay. |
+| 14 — fault-injection integration tests | Absent | No battery-control integration test harness. |
+| 15 — operator runbook | Absent | This plan and context are implementation handoff documents, not an arming/incident runbook. |
+
+Read-only audit verification ran focused `test_config.py`, `test_optimiser.py`, `test_service.py`, and `test_api.py`: **60 passed** with deprecation warnings. That result is evidence for the audited snapshot only. Full pytest, lint, mypy, frontend, Ansible, and HA validation were not run; the implementing harness must use the canonical Docker-first commands before claiming completion.
+
+Do not redo the existing optimizer foundations. Before Task 9, resolve these persistence/selection hazards:
+
+- `Service` currently folds `pv_to_ev`, `grid_to_ev`, and `battery_to_ev` into legacy `*_to_load` columns when persisting `PlanStep`; a later controller cannot reconstruct household-vs-EV assumptions or rich reasons from the stored plan.
+- `classify_next_action()` currently uses `steps[0]`; live intent construction must instead select the interval containing the current time and reject stale/gapped plans.
+- `minimum_export_spread_pln_kwh` and `grid_charge_margin_pln_kwh` are configured but not used by the optimizer/control authorization.
+
 ---
 
 ## 1. Scope, invariants, and terminology
@@ -114,6 +144,8 @@ State machine:
 ## 4. Implementation tasks
 
 ### Task 0: Establish the actual code baseline without modifying it
+
+**Status:** Completed for the 2026-08-08 handoff snapshot above. Repeat before implementation if `git status`, HEAD, or relevant symbols differ.
 
 **Objective:** Determine which plan requirements are already present in HEAD or the current worktree and preserve unrelated work.
 
