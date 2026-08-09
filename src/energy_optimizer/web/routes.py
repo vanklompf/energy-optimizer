@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import math
 from zoneinfo import ZoneInfo
 
@@ -17,6 +18,7 @@ from ..control_store import (
 from ..ev import EV_FULL_TARGET_SOC_PCT
 from ..optimiser import IntervalInput, optimise
 from ..safety import CONTROL_ENABLED
+from ..shadow_observation import ShadowAction, TelemetrySample, observe_shadow_action
 from ..simulator import (
     BatteryParams,
     SeriesInterval,
@@ -239,6 +241,87 @@ def get_control_actions(request: Request, limit: int = 20) -> dict:
             .all()
         )
     return {"actions": [_control_action_dict(row) for row in rows]}
+
+
+@router.get("/control/shadow-observations")
+def get_shadow_observations(request: Request, limit: int = 96) -> dict:
+    """Compare completed shadow intents with later passive Sigen telemetry.
+
+    This endpoint is evidence for Stage B only. It never makes a Home Assistant
+    request, sends an MQTT command, or treats a local-EMS match as actuation proof.
+    """
+    store = _store(request)
+    settings = _settings(request)
+    now = dt.datetime.now(tz=dt.UTC)
+    limit = max(1, min(limit, 500))
+    with store.session() as session:
+        actions = (
+            session.execute(
+                select(ControlAction)
+                .where(ControlAction.result == "shadow")
+                .where(ControlAction.interval_start.is_not(None))
+                .order_by(ControlAction.created_at.desc())
+                .limit(limit)
+            )
+            .scalars()
+            .all()
+        )
+        observations = []
+        for action in actions:
+            if action.interval_start is None:
+                continue
+            start = _aware(action.interval_start)
+            end = start + dt.timedelta(hours=settings.step_hours)
+            if end > now or not action.intent_json:
+                continue
+            try:
+                intent = json.loads(action.intent_json)
+            except json.JSONDecodeError:
+                continue
+            if not intent.get("shadow"):
+                continue
+            telemetry = (
+                session.execute(
+                    select(Telemetry)
+                    .where(Telemetry.ts >= start)
+                    .where(Telemetry.ts < end)
+                    .where(Telemetry.stale.is_(False))
+                    .order_by(Telemetry.ts)
+                )
+                .scalars()
+                .all()
+            )
+            observation = observe_shadow_action(
+                ShadowAction(
+                    command_id=action.command_id,
+                    interval_start=start,
+                    dt_hours=settings.step_hours,
+                    direction=str(intent.get("direction", "IDLE")),
+                    requested_power_kw=float(intent.get("requested_power_kw", 0.0)),
+                ),
+                [
+                    TelemetrySample(
+                        ts=_aware(sample.ts),
+                        batt_charge_kw=sample.batt_charge_kw,
+                        batt_discharge_kw=sample.batt_discharge_kw,
+                    )
+                    for sample in telemetry
+                ],
+            )
+            observations.append(
+                {
+                    "command_id": observation.command_id,
+                    "source_run_id": action.source_run_id,
+                    "interval_start": start.isoformat(),
+                    "planned_direction": str(intent.get("direction", "IDLE")),
+                    "requested_power_kw": float(intent.get("requested_power_kw", 0.0)),
+                    "status": observation.status,
+                    "actual_direction": observation.actual_direction,
+                    "average_battery_kw": observation.average_battery_kw,
+                    "sample_count": observation.sample_count,
+                }
+            )
+    return {"observations": observations}
 
 
 @router.get("/prices")

@@ -8,6 +8,7 @@ from sqlalchemy import delete
 
 from energy_optimizer.config import Settings
 from energy_optimizer.store import (
+    ControlAction,
     EvControlStatus,
     EvPlanStep,
     EvTelemetry,
@@ -462,22 +463,34 @@ def _seed_hours(app_store, end: dt.datetime, hours: int) -> None:
 
 def test_savings_windows(client: TestClient) -> None:
     store = client.app.state.store
-    end = dt.datetime.now(tz=dt.UTC).replace(minute=0, second=0, microsecond=0)
-    # Cover the full trailing week plus today so both windows have data regardless
-    # of what local time the test runs at.
+    # Seed the current UTC hour too: at the Europe/Warsaw midnight boundary the
+    # previous implementation only seeded yesterday, leaving the local-day window empty.
+    end = (
+        dt.datetime.now(tz=dt.UTC).replace(minute=0, second=0, microsecond=0)
+        + dt.timedelta(hours=1)
+    )
+    # Cover the full trailing week plus today. At the beginning of a local day,
+    # no *settled, complete* hourly Pstryk interval exists yet, so the day may
+    # legitimately be unavailable until the first hour closes.
     _seed_hours(store, end, 8 * 24)
     resp = client.get("/api/savings")
     assert resp.status_code == 200
     body = resp.json()
-    for window in ("day", "week"):
-        assert window in body
-        w = body[window]
-        assert w["intervals"] > 0
-        assert w["actual_cost_pln"] is not None
-        assert w["optimiser_cost_pln"] is not None
-        assert w["savings_pln"] is not None
-        # Optimiser is never worse than the measured actual, so savings >= 0.
-        assert w["savings_pln"] >= -1e-6
+    week = body["week"]
+    assert week["intervals"] > 0
+    assert week["actual_cost_pln"] is not None
+    assert week["optimiser_cost_pln"] is not None
+    assert week["savings_pln"] is not None
+    assert week["savings_pln"] >= -1e-6
+
+    day = body["day"]
+    if day["intervals"] > 0:
+        assert day["actual_cost_pln"] is not None
+        assert day["optimiser_cost_pln"] is not None
+        assert day["savings_pln"] is not None
+        assert day["savings_pln"] >= -1e-6
+    else:
+        assert day["data_status"] == "unavailable"
 
 
 def test_savings_empty(client: TestClient) -> None:
@@ -510,3 +523,41 @@ def test_prices_window(client: TestClient) -> None:
     assert len(body["prices"]) == 7
     assert body["current_hour"] is not None
     assert all("buy_gross" in p for p in body["prices"])
+
+
+def test_shadow_observations_compare_finished_shadow_interval(client: TestClient) -> None:
+    store = client.app.state.store
+    start = dt.datetime.now(tz=dt.UTC).replace(second=0, microsecond=0) - dt.timedelta(minutes=30)
+    with store.session() as session:
+        session.add(
+            ControlAction(
+                command_id="shadow-observation-1",
+                source_run_id="run-1",
+                interval_start=start,
+                intent_json='{"direction":"CHARGE","requested_power_kw":0.5,"shadow":true}',
+                authorization_allowed=False,
+                blockers_json='["mode_not_control"]',
+                requested_state="CHARGE",
+                observed_state="DISARMED",
+                physical_json='{"shadow":true,"ha_writes":0}',
+                result="shadow",
+            )
+        )
+        for minute, charge in ((1, 0.45), (6, 0.52)):
+            session.add(
+                Telemetry(
+                    ts=start + dt.timedelta(minutes=minute),
+                    batt_charge_kw=charge,
+                    batt_discharge_kw=0.0,
+                    stale=False,
+                )
+            )
+
+    resp = client.get("/api/control/shadow-observations")
+
+    assert resp.status_code == 200
+    observation = resp.json()["observations"][0]
+    assert observation["command_id"] == "shadow-observation-1"
+    assert observation["status"] == "match"
+    assert observation["actual_direction"] == "CHARGE"
+    assert observation["sample_count"] == 2
