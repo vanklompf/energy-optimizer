@@ -186,6 +186,86 @@ async def test_set_number_fallback_zero_after_http_200_is_unacknowledged() -> No
 
 
 @respx.mock
+async def test_set_number_matching_readback_with_unchanged_timestamp_is_unacknowledged() -> None:
+    """A matching cached value is not evidence that the just-issued write reached Sigen."""
+    entity = "number.sigen_plant_ess_max_charging_limit"
+    stale = "2026-08-08T10:00:00Z"
+    respx.get(f"http://ha.local:8123/api/states/{entity}").mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json={
+                    "entity_id": entity,
+                    "state": "8.8",
+                    "attributes": {"min": 0, "max": 100, "step": 0.001},
+                    "last_updated": stale,
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "entity_id": entity,
+                    "state": "0.5",
+                    "attributes": {"min": 0, "max": 100, "step": 0.001},
+                    "last_updated": stale,
+                },
+            ),
+        ]
+    )
+    respx.post("http://ha.local:8123/api/services/number/set_value").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    async with HaClient(
+        "http://ha.local:8123", "secret", number_register_ack_reliable=True
+    ) as client:
+        result = await client.set_number(entity, 0.5, timeout_s=0.5, poll_interval_s=0.01)
+
+    assert result.status == AckStatus.UNACKNOWLEDGED
+    assert result.detail == "stale_readback"
+
+
+@respx.mock
+async def test_set_number_unavailable_post_write_readback_times_out_unacknowledged() -> None:
+    """An unavailable HA number after a successful POST cannot acknowledge a register write."""
+    entity = "number.sigen_plant_ess_max_charging_limit"
+    respx.get(f"http://ha.local:8123/api/states/{entity}").mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json={
+                    "entity_id": entity,
+                    "state": "8.8",
+                    "attributes": {"min": 0, "max": 100, "step": 0.001},
+                    "last_updated": "2026-08-08T10:00:00Z",
+                },
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "entity_id": entity,
+                    "state": None,
+                    "attributes": {"min": 0, "max": 100, "step": 0.001},
+                    "last_updated": "2026-08-08T10:00:01Z",
+                },
+            ),
+        ]
+    )
+    respx.post("http://ha.local:8123/api/services/number/set_value").mock(
+        return_value=httpx.Response(200, json=[])
+    )
+
+    async with HaClient(
+        "http://ha.local:8123", "secret", number_register_ack_reliable=True
+    ) as client:
+        result = await client.set_number(entity, 0.5, timeout_s=0.0, poll_interval_s=0.01)
+
+    assert result.status == AckStatus.TIMEOUT
+    assert result.observed is None
+    assert result.detail == "poll timeout"
+
+
+@respx.mock
 async def test_select_option_and_switch_ack_matrix() -> None:
     select_id = "select.sigen_plant_remote_ems_control_mode"
     switch_id = "switch.sigen_plant_remote_ems_controlled_by_home_assistant"
@@ -298,4 +378,3 @@ async def test_control_snapshot_validates_bounds_and_options() -> None:
         )
     assert snap.validation_errors == []
     assert snap.states[number_id].as_float() == 0.0
-

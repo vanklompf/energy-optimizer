@@ -272,9 +272,7 @@ class HaClient:
                 AckStatus.IDEMPOTENT_NOOP, entity_id, value, current, "already set", _ms(t0)
             )
         try:
-            await self.call_service(
-                "number", "set_value", {"entity_id": entity_id, "value": value}
-            )
+            await self.call_service("number", "set_value", {"entity_id": entity_id, "value": value})
         except HaError as exc:
             status = (
                 AckStatus.HA_REJECTED
@@ -291,6 +289,7 @@ class HaClient:
             abs_tolerance=abs_tolerance,
             cancel_event=cancel_event,
             previous=current,
+            previous_updated=before.last_updated,
         )
 
     async def select_option(
@@ -385,14 +384,13 @@ class HaClient:
         abs_tolerance: float,
         cancel_event: asyncio.Event | None,
         previous: float | None,
+        previous_updated: dt.datetime | None,
     ) -> AckResult:
         t0 = time.perf_counter()
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             if cancel_event is not None and cancel_event.is_set():
-                return AckResult(
-                    AckStatus.CANCELLED, entity_id, value, None, "cancelled", _ms(t0)
-                )
+                return AckResult(AckStatus.CANCELLED, entity_id, value, None, "cancelled", _ms(t0))
             state = await self.get_state(entity_id)
             if state is None or state.state in _UNAVAILABLE:
                 await asyncio.sleep(poll_interval_s)
@@ -411,10 +409,23 @@ class HaClient:
                     "fallback_zero_readback",
                     _ms(t0),
                 )
-            if abs(observed - value) <= abs_tolerance:
+            # A matching cached value cannot acknowledge the service just sent.  Require
+            # HA to expose a strictly newer state from this polling sequence.
+            if (
+                previous_updated is None
+                or state.last_updated is None
+                or state.last_updated <= previous_updated
+            ):
                 return AckResult(
-                    AckStatus.ACKNOWLEDGED, entity_id, value, observed, "", _ms(t0)
+                    AckStatus.UNACKNOWLEDGED,
+                    entity_id,
+                    value,
+                    observed,
+                    "stale_readback",
+                    _ms(t0),
                 )
+            if abs(observed - value) <= abs_tolerance:
+                return AckResult(AckStatus.ACKNOWLEDGED, entity_id, value, observed, "", _ms(t0))
             if abs(observed - value) <= max(abs_tolerance * 10, 0.01):
                 return AckResult(
                     AckStatus.VALUE_COERCED, entity_id, value, observed, "rounded", _ms(t0)
