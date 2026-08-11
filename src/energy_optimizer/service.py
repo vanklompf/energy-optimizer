@@ -545,7 +545,12 @@ class Service:
         self, reason: str, *, command_id: str | None = None
     ) -> dict[str, object]:
         """Plan-independent fallback to local EMS. Safe when optimizer is down."""
-        from .control_store import ensure_controller_state, finalize_action, persist_pending_action
+        from .control_store import (
+            ensure_controller_state,
+            finalize_action,
+            persist_pending_action,
+            set_lockout,
+        )
         from .sigenergy_control import SigenergyController
 
         s = self.settings
@@ -578,13 +583,36 @@ class Service:
                 state.state = "DISARMED"
             return {"result": "fallback_recorded", "command_id": command_id, "reason": reason}
 
-        async with HaClient(
-            s.ha_url,
-            s.ha_token,
-            verify_ssl=s.ha_verify_ssl,
-            number_register_ack_reliable=s.battery_control_number_register_ack_reliable,
-        ) as ha:
-            outcome = await SigenergyController(ha, s).fallback(reason, command_id=command_id)
+        try:
+            async with HaClient(
+                s.ha_url,
+                s.ha_token,
+                verify_ssl=s.ha_verify_ssl,
+                number_register_ack_reliable=s.battery_control_number_register_ack_reliable,
+            ) as ha:
+                outcome = await SigenergyController(ha, s).fallback(reason, command_id=command_id)
+        except Exception as exc:  # Preserve an auditable lockout if fallback cannot reach HA.
+            logger.error("battery fallback could not reach Home Assistant: %s", exc)
+            now = utcnow()
+            with self.store.session() as session:
+                finalize_action(
+                    session,
+                    command_id,
+                    observed_state="LOCKOUT",
+                    physical={"verified": False, "ha_reachable": False},
+                    result="fallback_unreachable",
+                    error_code=reason,
+                )
+                state = ensure_controller_state(session)
+                state.last_fallback_at = now
+                state.last_fallback_verified = False
+                set_lockout(
+                    session,
+                    reason="fallback_ha_unreachable",
+                    duration_seconds=s.battery_control_lockout_duration_seconds,
+                    now=now,
+                )
+            return {"result": "fallback_unreachable", "command_id": command_id, "reason": reason}
 
         with self.store.session() as session:
             finalize_action(
@@ -625,10 +653,14 @@ class Service:
         if s.mode != "control" or not s.battery_control_enabled or not s.ha_token:
             return {"result": "disarmed_startup"}
 
-        async with HaClient(s.ha_url, s.ha_token, verify_ssl=s.ha_verify_ssl) as ha:
-            remote = await ha.get_state(s.battery_control_remote_ems_switch_entity)
-            if remote is not None and remote.state == "on":
-                return await self.fallback_battery("startup_remote_ems_on")
+        try:
+            async with HaClient(s.ha_url, s.ha_token, verify_ssl=s.ha_verify_ssl) as ha:
+                remote = await ha.get_state(s.battery_control_remote_ems_switch_entity)
+        except Exception as exc:  # HA state unknown is an unsafe restart condition.
+            logger.error("startup Remote EMS state could not be read: %s", exc)
+            return await self.fallback_battery("startup_remote_ems_unknown")
+        if remote is not None and remote.state == "on":
+            return await self.fallback_battery("startup_remote_ems_on")
         return {"result": "startup_ok"}
 
     async def shutdown_battery_control(self) -> dict[str, object]:

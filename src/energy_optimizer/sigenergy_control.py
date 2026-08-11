@@ -247,9 +247,7 @@ class SigenergyController:
                     command_id, "charge_limit_unacknowledged", t0, cancel_event
                 )
         else:
-            return self._fail(
-                command_id, ControllerState.ARMED_IDLE, "UNACKNOWLEDGED_LIMIT", t0
-            )
+            return self._fail(command_id, ControllerState.ARMED_IDLE, "UNACKNOWLEDGED_LIMIT", t0)
 
         selected = await self._tracked_select(self.mode_select, mode, cancel_event=cancel_event)
         if selected.status not in {AckStatus.ACKNOWLEDGED, AckStatus.IDEMPOTENT_NOOP}:
@@ -304,6 +302,9 @@ class SigenergyController:
         """
         self._service_calls = []
         self._ack_results = []
+        # Once fallback has begun, a cancelled command must not cancel fail-safe cleanup.
+        # Each restoration step is still bounded by its own acknowledgement/physical timeout.
+        cancel_event = None
         command_id = command_id or str(uuid.uuid4())
         t0 = time.perf_counter()
         evidence: dict[str, object] = {"attempted": True, "reason": reason}
@@ -505,9 +506,7 @@ class SigenergyController:
             ),
         )
 
-    async def _enter_standby_neutral(
-        self, *, cancel_event: asyncio.Event | None
-    ) -> AckResult:
+    async def _enter_standby_neutral(self, *, cancel_event: asyncio.Event | None) -> AckResult:
         ack = await self._tracked_select(
             self.mode_select,
             self._settings.battery_control_mode_standby,
@@ -550,10 +549,7 @@ class SigenergyController:
                 await self._sleep(0.2)
                 continue
             physical = await self._read_physical()
-            if (
-                physical.battery_power_kw is not None
-                and abs(physical.battery_power_kw) <= band
-            ):
+            if physical.battery_power_kw is not None and abs(physical.battery_power_kw) <= band:
                 good += 1
                 if good >= _STABLE_GOOD_SAMPLES:
                     return True

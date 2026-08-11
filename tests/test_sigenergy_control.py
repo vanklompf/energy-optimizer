@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 from dataclasses import dataclass, field
 
@@ -19,6 +20,19 @@ class FakeHa:
     select_ack: AckStatus = AckStatus.ACKNOWLEDGED
     switch_ack: AckStatus = AckStatus.ACKNOWLEDGED
     number_ack: AckStatus = AckStatus.UNACKNOWLEDGED
+    honour_cancel: bool = False
+
+    @staticmethod
+    def _cancelled(
+        entity_id: str,
+        requested: str | float | bool,
+        kwargs: dict,
+        honour_cancel: bool,
+    ) -> AckResult | None:
+        cancel_event = kwargs.get("cancel_event")
+        if honour_cancel and cancel_event is not None and cancel_event.is_set():
+            return AckResult(AckStatus.CANCELLED, entity_id, requested, None, "cancelled")
+        return None
 
     async def get_state(self, entity_id: str) -> HaState | None:
         return self.states.get(entity_id)
@@ -44,6 +58,9 @@ class FakeHa:
             self.states[entity_id] = _state(entity_id, shown)
 
     async def select_option(self, entity_id: str, option: str, **kwargs) -> AckResult:
+        cancelled = self._cancelled(entity_id, option, kwargs, self.honour_cancel)
+        if cancelled is not None:
+            return cancelled
         self.calls.append(("select", "select_option", {"entity_id": entity_id, "option": option}))
         observed = None
         if self.select_ack in {AckStatus.ACKNOWLEDGED, AckStatus.IDEMPOTENT_NOOP}:
@@ -554,3 +571,45 @@ async def test_unknown_physical_state_does_not_command() -> None:
     result = await controller.apply_intent(_intent())
     assert result.control.failure_reason == "physical_state_unknown"
     assert result.service_calls == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_ignores_cancel_and_still_turns_remote_ems_off() -> None:
+    """Cancellation stops a command, never the emergency cleanup it requires."""
+    settings = _settings()
+    ha = FakeHa(
+        states={
+            settings.battery_control_remote_ems_switch_entity: _state(
+                settings.battery_control_remote_ems_switch_entity, "on"
+            ),
+            settings.battery_control_mode_select_entity: _state(
+                settings.battery_control_mode_select_entity, "Command Charging (Grid First)"
+            ),
+        },
+        number_register_ack_reliable=False,
+        honour_cancel=True,
+    )
+    cancel_event = asyncio.Event()
+    cancel_event.set()
+    ticks = {"value": 0.0}
+
+    def monotonic() -> float:
+        ticks["value"] += 0.5
+        return ticks["value"]
+
+    async def sleep(_seconds: float) -> None:
+        return None
+
+    controller = SigenergyController(
+        ha,  # type: ignore[arg-type]
+        settings,
+        physical=FakePhysical([_phys(0.05, ems_mode="Standby")]),
+        sleep=sleep,
+        monotonic=monotonic,
+    )
+    result = await controller.fallback("cancelled_command", cancel_event=cancel_event)
+
+    call_kinds = [(domain, service) for domain, service, _ in result.service_calls]
+    assert ("switch", "turn_off") in call_kinds
+    assert ha.states[settings.battery_control_remote_ems_switch_entity].state == "off"
+    assert result.control.physical_verified is False

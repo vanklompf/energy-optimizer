@@ -5,7 +5,7 @@ import json
 
 from energy_optimizer.config import Settings
 from energy_optimizer.control_store import try_acquire_lease
-from energy_optimizer.ha_client import HaState
+from energy_optimizer.ha_client import HaError, HaState
 from energy_optimizer.service import Service
 from energy_optimizer.store import (
     ControlAction,
@@ -299,6 +299,76 @@ async def test_reconcile_startup_falls_back_when_remote_ems_on(monkeypatch) -> N
         pending = session.get(ControlAction, "pending-1")
         assert pending is not None
         assert pending.result == "abandoned_on_restart"
+
+
+async def test_reconcile_startup_falls_back_when_ha_read_fails(monkeypatch) -> None:
+    """HA reachability loss at restart is unsafe until local EMS is explicitly restored."""
+    data = _settings().model_dump()
+    data.update(mode="control", battery_control_enabled=True, ha_token="token")
+    settings = Settings.model_construct(**data)
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+
+    class FailingHa:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def get_state(self, entity_id: str):
+            raise HaError(f"cannot read {entity_id}")
+
+    monkeypatch.setattr("energy_optimizer.service.HaClient", FailingHa)
+
+    async def fallback(reason: str, command_id=None):
+        return {"result": "fallback_recorded", "reason": reason, "command_id": command_id}
+
+    monkeypatch.setattr(service, "fallback_battery", fallback)
+
+    result = await service.reconcile_battery_on_startup()
+
+    assert result["result"] == "fallback_recorded"
+    assert result["reason"] == "startup_remote_ems_unknown"
+
+
+async def test_fallback_battery_records_lockout_when_ha_is_unreachable(monkeypatch) -> None:
+    """An unavailable HA must leave auditable, unverified fallback/lockout evidence."""
+    data = _settings().model_dump()
+    data.update(mode="control", battery_control_enabled=True, ha_token="token")
+    settings = Settings.model_construct(**data)
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+
+    class FailingHa:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            raise HaError("HA unreachable")
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+    monkeypatch.setattr("energy_optimizer.service.HaClient", FailingHa)
+
+    result = await service.fallback_battery("watchdog_ha_error")
+
+    assert result["result"] == "fallback_unreachable"
+    with store.session() as session:
+        action = session.get(ControlAction, result["command_id"])
+        state = session.get(ControllerStateRow, "current")
+        assert action is not None
+        assert action.result == "fallback_unreachable"
+        assert action.error_code == "watchdog_ha_error"
+        assert state is not None
+        assert state.state == "LOCKOUT"
+        assert state.last_fallback_verified is False
 
 
 async def test_publish_battery_heartbeat_updates_state() -> None:
