@@ -8,7 +8,6 @@ import pytest
 
 from energy_optimizer.web import auth
 
-
 OIDC_ENV = {
     "OIDC_ENABLED": "true",
     "OIDC_CLIENT_ID": "pv",
