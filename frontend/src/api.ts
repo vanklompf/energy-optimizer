@@ -231,13 +231,34 @@ export interface HourlyComparisonResponse {
   points: HourlyComparisonPoint[];
 }
 
+export interface AuthUser {
+  sub: string;
+  email?: string | null;
+  name?: string | null;
+  preferred_username?: string | null;
+}
+
+export interface AuthMeResponse {
+  authenticated: boolean;
+  oidc_enabled: boolean;
+  user: AuthUser | null;
+}
+
+function redirectToLogin(): never {
+  const next = `${window.location.pathname}${window.location.search}`;
+  window.location.href = `/auth/login?next=${encodeURIComponent(next)}`;
+  throw new Error("Authentication required");
+}
+
 async function getJSON<T>(url: string): Promise<T> {
   const resp = await fetch(url);
+  if (resp.status === 401) redirectToLogin();
   if (!resp.ok) throw new Error(`${url} -> ${resp.status}`);
   return resp.json() as Promise<T>;
 }
 
 export const api = {
+  authMe: () => getJSON<AuthMeResponse>("/api/auth/me"),
   status: () => getJSON<StatusResponse>("/api/status"),
   plan: () => getJSON<PlanResponse>("/api/plan"),
   prices: (pastHours = 12, futureHours = 24) =>
@@ -256,6 +277,7 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
+    if (resp.status === 401) redirectToLogin();
     if (!resp.ok) {
       const error = (await resp.json().catch(() => ({}))) as { detail?: string };
       throw new Error(error.detail ?? `backtest -> ${resp.status}`);

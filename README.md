@@ -46,6 +46,10 @@ docker compose up -d --build
 | http://localhost:8320/ | SPA |
 | http://localhost:8320/healthz | Liveness |
 | http://localhost:8320/api/ | REST |
+| http://localhost:8320/auth/login | OIDC login (when enabled) |
+
+Local development leaves OIDC off. Production on the NAS uses Authentik
+(`OIDC_ENABLED`, `APP_URL`, `SESSION_SECRET`, … — see `.env.example`).
 
 SQLite state lives in `./data` → `/data`.
 

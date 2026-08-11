@@ -180,8 +180,11 @@ Implementation and ordinary CI are non-actuating. Use fake HA clients or a local
 
 Current deployment facts that affect the control design:
 
-- the site sets `energy_optimizer_available_externally: true`, while the FastAPI application has no authentication middleware or dependency;
-- therefore HTTP `arm` and `clear-lockout` endpoints must not be exposed until an authenticated mutation boundary exists;
+- the site sets `energy_optimizer_available_externally: true`; Authentik OIDC
+  gates the UI/API when `energy_optimizer_oidc_enabled` is true, but HTTP `arm`
+  and `clear-lockout` mutation endpoints are still withheld until that control
+  surface is intentionally exposed behind the authenticated boundary;
+
 - the role deploys one Docker container with one `/data` volume, and PvOpti uses one SQLite database there;
 - a SQLite lease protects processes sharing that database, not a second deployment with a different volume, so deployment validation must enforce one replica/site owner.
 

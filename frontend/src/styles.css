@@ -52,9 +52,39 @@ body {
   height: 24px;
 }
 
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
 .tabs {
   display: flex;
   gap: 6px;
+}
+
+.auth-slot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.auth-user {
+  color: var(--muted);
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.auth-logout {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.auth-logout:hover {
+  text-decoration: underline;
 }
 
 .tab {
