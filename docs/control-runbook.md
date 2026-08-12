@@ -105,13 +105,18 @@ HTTP 200 from HA is **never** success by itself.
 
 ## Watchdog test (HA)
 
-With automation still safe to exercise at conservative limits:
+**Heartbeat-expiry path: passed under supervision on 2026-08-12.** Full evidence is
+recorded in [the watchdog interface](./battery-control-watchdog-interface.md#attended-heartbeat-expiry-fallback-evidence).
 
-1. Confirm heartbeat publishing.
-2. Stop PvOpti or block MQTT.
-3. After expiry, confirm Standby → 8.8/9.6 → 100/0 → Remote EMS off + notification.
-4. Confirm no path turns Remote EMS on.
-5. Retained stale “active” must not look healthy.
+The proved scenario was a genuine PvOpti heartbeat followed by deliberate HA ingestion
+loss while Remote EMS had been supervisedly enabled in verified `Standby`. At 99.27 seconds
+of stored-heartbeat age, HA latched one fallback and returned Remote EMS to off. The final
+`Standby`, 8.8/9.6 kW, and 100/0% state was independently confirmed through raw function-03
+register reads.
+
+This does not authorize normal watchdog enablement or PvOpti arming. It also does not cover
+HA-host loss, HA restart, Modbus/network loss, or the reliability of arbitrary number-register
+writes. Keep both automations disabled outside separately authorized attended windows.
 
 Physical validation of HA-host loss remains a separate authorized experiment.
 

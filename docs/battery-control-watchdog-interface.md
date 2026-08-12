@@ -89,9 +89,44 @@ docker compose -f compose.dev.yml run --rm --no-deps app pytest tests/test_watch
 These tests prove expiry, retained-payload rejection, configured 8.8/9.6 and 100/0 restores,
 and that the fake watchdog never enables Remote EMS. They do not contact live HA.
 
+## Attended heartbeat-expiry fallback evidence
+
+**Status: passed on 2026-08-12; this proves only the HA-hosted watchdog path.**
+
+The following bounded, attended test was completed while PvOpti remained `dry_run`,
+battery control remained disabled, and export/discharge remained unauthorized:
+
+1. Recorded both HA and raw function-03 baseline values: Remote EMS `off` / register
+   `40029 = 0`; dormant mode `Standby` / `40031 = 1`; global limits
+   `40032 = 8.8 kW`, `40034 = 9.6 kW`; cut-offs `40047 = 100%`, `40048 = 0%`.
+2. Through the integration's official Options flow only, temporarily set `read_only=false`
+   and exposed the six watchdog target entities. Fresh HA read-back matched the raw
+   baseline before any command was issued.
+3. Observed a genuine non-retained PvOpti heartbeat in HA. Its stored Warsaw local
+   `input_datetime` representation corresponded to the original UTC instant, proving the
+   UTC-to-local conversion does not create the former two-hour false expiry.
+4. With verified `Standby` and the recorded safe limits retained, temporarily enabled
+   Remote EMS. HA and raw function-03 both confirmed `40029 = 1`.
+5. Disabled only HA heartbeat ingestion, leaving PvOpti's lightweight heartbeat publisher
+   running. The stored heartbeat age reached **99.27 seconds**, exceeding the 60-second
+   expiry and spanning multiple 15-second watchdog timer evaluations.
+6. HA invoked the watchdog once, set the fallback latch, and turned Remote EMS off.
+   HA observed the switch off about five seconds after trigger; independent raw diagnostics
+   then confirmed `40029 = 0`, `40031 = 1`, `40032 = 8800`, `40034 = 9600`,
+   `40047 = 1000`, and `40048 = 0`.
+7. The test ended by disabling both automations, restoring `read_only=true` through the
+   same official Options flow, disabling all six control entities, clearing the latch while
+   the automation was disabled, and independently confirming the safe raw baseline.
+
+This is evidence that the repaired timer-driven heartbeat-expiry fallback is bounded and
+returns this plant to the documented local-safe register state. It does **not** prove that
+HA can recover when HA itself, its host, its Modbus path, or its network path is unavailable.
+The equal-to-baseline restore writes are confirmed by their final HA/raw state, but no
+unchanged register value is by itself evidence of a distinct write acknowledgement.
+
 ## Remaining rollout blockers (outside this document)
 
 - Prove HA-host loss recovery (inverter timeout or host-independent actor).
-- Physical validation of process stop/hang, MQTT loss, integration reload, HA restart,
+- Physical validation of process stop/hang, integration reload, HA restart, and
   network/Modbus loss at conservative limits.
 - Reliable number-register acknowledgement before `mode=control`.
