@@ -8,6 +8,8 @@ Related:
 - [Sigenergy control contract](./sigenergy-control-contract.md)
 - [Battery-control context](./battery-control-context.md)
 - [Watchdog interface](./battery-control-watchdog-interface.md)
+- [Attended 2026-08-14 charge A/B/A evidence](./commissioning/2026-08-14-attended-charge-aba.md)
+- [Attended 2026-08-14 Sigen integration-reload fallback](./commissioning/2026-08-14-sigen-integration-reload-fallback.md)
 - [Deployment variables](./deployment-variables.md)
 - [Implementation plan](./plans/2026-08-08_001527-pvopti-actual-energy-control.md)
 
