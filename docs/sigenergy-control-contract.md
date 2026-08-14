@@ -85,7 +85,7 @@ Options advertised by the installed entity:
 
 Sigenergy Modbus Protocol V2.9 defines registers 40032/40034 as global maximum charge/discharge limits with ranges from zero to rated power. They apply globally regardless of EMS mode. A 0.5 kW charge limit produced 0.497–0.498 kW battery charging, verifying maximum-limit behavior on this installation.
 
-The integration does not poll/read these holding registers correctly on this installation: entity state remained the fallback `0.0` after successful writes. HTTP success and HA entity state are therefore not proof of register state. PvOpti must not depend on number-entity read-back until the integration is fixed; physical power verification and conservative site clamps are mandatory.
+The stock integration did not poll/read these holding registers reliably on this installation. The deployed overlay serializes holding-register probes and keeps input- and holding-register caches separate; the exact overlay identified below produced fresh HA readings that matched independent raw reads during the attended 0.5 kW A/B/A test. Reliability is therefore promoted only for that exact HA/overlay identity and command semantics—not for arbitrary Sigen versions or entities.
 
 The HA entity advertises a 100 kW maximum even though the installed ESS ratings are 8.8 kW charge and 9.6 kW discharge. The HA maximum is not a safe site capability.
 
@@ -96,7 +96,7 @@ The HA entity advertises a 100 kW maximum even though the installed ESS ratings 
 | Charge cut-off | `number.sigen_plant_ess_charge_cut_off_state_of_charge` | 100.0 | 0 | 100 | 0.01 | % |
 | Discharge cut-off | `number.sigen_plant_ess_discharge_cut_off_state_of_charge` | 0.0 | 0 | 100 | 0.01 | % |
 
-Writes were accepted, but these entities have the same unreliable read-back issue as the power limits. Enforcement at the configured cut-off boundary, persistence across inverter restart, and interaction with the Sigen/BMS safety buffer remain untested.
+Writes on the stock integration initially shared the same unreliable read-back issue as the power limits. Under the version-bound overlay, fresh cut-off readings also matched independent raw function-03 reads during attended commissioning. Enforcement at the configured cut-off boundary, persistence across inverter restart, and interaction with the Sigen/BMS safety buffer remain untested.
 
 ## Registry and reload behavior
 
@@ -154,16 +154,17 @@ Production automation must retain a separate explicit arming gate; changing this
 
 ### Global ESS-limit semantics and HA read-back defect
 
-Sigenergy Modbus Protocol V2.9 states that registers 40032/40034 are global maximum charging/discharging limits and take effect regardless of EMS mode. The installed integration's number entities do not provide reliable read-back: their state remained fallback `0.0` after successful writes.
+Sigenergy Modbus Protocol V2.9 states that registers 40032/40034 are global maximum charging/discharging limits and take effect regardless of EMS mode. The stock installed integration's number entities did not provide reliable holding-register read-back: their state remained fallback `0.0` after successful writes. The deployed overlay later corrected this by serializing probes and separating holding/input cache keys. Fresh number states then matched independent raw reads during the attended 0.5 kW A/B/A evidence. Promotion remains version-bound to HA 2026.8.1, overlay commit `fd238d2`, `modbus.py` SHA-256 `f17b7bbc66d33513b0dec66223ad90d2e9e9d7dad3d1cbc489d8409a448f5101`, and the recorded command semantics.
 
 This caused an important characterization incident: a cleanup write of `0.0` physically disabled ordinary local battery charge/discharge even though the entity state appeared unchanged. The effect was detected through physical telemetry (battery near zero and household load imported from grid). Writing the installed ratings—8.8 kW charge and 9.6 kW discharge—restored local self-consumption after approximately five seconds.
 
 Required contract:
 
-- never treat the HA number-entity state as command acknowledgement;
-- never "restore" these registers from their displayed `0.0` state;
+- treat number-state acknowledgement as reliable only for the recorded HA/overlay/evidence identity; any identity drift resets the gate to false;
+- require a fresh post-write timestamp and exact value; reject cached, unavailable, malformed, or fallback-zero states;
+- never "restore" these registers from an unverified displayed state;
 - maintain explicit configured safe/local values outside HA state;
-- verify each write through bounded physical battery/grid response;
+- keep bounded physical battery/grid verification and conservative site clamps mandatory even when register acknowledgement passes;
 - on cleanup restore 8.8/9.6 kW and 100/0% cut-offs for this installation, then verify local behavior.
 
 ### Verified Standby behavior
@@ -232,7 +233,8 @@ The following remain explicitly unverified:
 - low-power forced discharge to household load without deliberate export;
 - every mode except `Standby` and `Command Charging (Grid First)`;
 - persistence across inverter/gateway reboot;
-- behavior during HA restart or Sigen integration reload while Remote EMS is active;
+- behavior during HA restart while Remote EMS is active;
+- Sigen integration reload while Remote EMS is active: passed attended on 2026-08-14 for the bounded 0.5 kW charge-only path after correcting the entity-readiness race;
 - Modbus loss, network loss, application/container stop, and service timeout after physical actuation;
 - autonomous command expiry;
 - an independent watchdog capable of restoring local control when HA/PvOpti cannot;
@@ -246,7 +248,7 @@ No unattended live-control adapter may be armed while the failure-path and watch
 
 The next separately authorized maintenance window should focus on failure containment, not export:
 
-1. fix or bypass the integration's missing holding-register read-back so requested limits can be independently acknowledged;
+1. number-register acknowledgement is now promoted only for the version-bound 2026-08-14 charge evidence; revalidate and reset the gate on any HA/overlay/command-semantic drift;
 2. establish an independent watchdog/fallback actor;
 3. test low-power discharge below current household load, with zero-export monitoring and immediate Standby fallback;
 4. test HA integration reload and HA restart while in Standby before testing them during a low-power command;

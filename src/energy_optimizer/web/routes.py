@@ -127,6 +127,9 @@ def _battery_control_status(request: Request, now: dt.datetime) -> dict:
         ),
         "export_enabled": settings.battery_export_enabled,
         "number_register_ack_reliable": settings.battery_control_number_register_ack_reliable,
+        "number_register_ack_evidence_id": (
+            settings.battery_control_number_register_ack_evidence_id or None
+        ),
         "gates_ok": gates_ok,
         "effective_state": effective,
         "controller_state": state.state,

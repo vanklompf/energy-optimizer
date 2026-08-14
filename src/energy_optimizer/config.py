@@ -17,6 +17,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Documented expected runtime arm token. Leave EO_BATTERY_CONTROL_ARM_TOKEN empty in
 # examples; control mode requires an exact match and never infers arming from mode alone.
 BATTERY_CONTROL_EXPECTED_ARM_TOKEN = "pvopti-battery-control-armed"
+BATTERY_CONTROL_EXPECTED_ACK_EVIDENCE_ID = (
+    "ha-2026.8.1+sigen-overlay-fd238d2-"
+    "f17b7bbc66d33513b0dec66223ad90d2e9e9d7dad3d1cbc489d8409a448f5101+"
+    "grid-charge-0.5kw"
+)
 
 # Exact Remote EMS option strings from docs/sigenergy-control-contract.md.
 SIGENERGY_MODE_PCS_REMOTE_CONTROL = "PCS Remote Control"
@@ -55,9 +60,7 @@ SIGENERGY_SELECTABLE_MODES: frozenset[str] = frozenset(
     }
 )
 
-BATTERY_CONTROL_DIRECTIONS: frozenset[str] = frozenset(
-    {"FALLBACK", "IDLE", "CHARGE", "DISCHARGE"}
-)
+BATTERY_CONTROL_DIRECTIONS: frozenset[str] = frozenset({"FALLBACK", "IDLE", "CHARGE", "DISCHARGE"})
 
 
 class PvPlane(BaseModel):
@@ -191,8 +194,9 @@ class Settings(BaseSettings):
     battery_control_grid_charge_enabled: bool = False
     battery_control_authorize_discharge: bool = False
     battery_control_authorize_export: bool = False
-    # Contract: HA number entities do not acknowledge register writes on this install.
+    # Acknowledgement is promoted only against a recorded, version-bound field-evidence ID.
     battery_control_number_register_ack_reliable: bool = False
+    battery_control_number_register_ack_evidence_id: str = ""
     battery_control_supported_directions: list[str] = Field(
         default_factory=lambda: ["FALLBACK", "IDLE", "CHARGE"]
     )
@@ -452,9 +456,7 @@ class Settings(BaseSettings):
 
     def _validate_battery_control_armed(self) -> None:
         if not self.battery_control_enabled:
-            raise ValueError(
-                "mode=control requires battery_control_enabled as an independent gate"
-            )
+            raise ValueError("mode=control requires battery_control_enabled as an independent gate")
         if self.battery_control_arm_token != BATTERY_CONTROL_EXPECTED_ARM_TOKEN:
             raise ValueError(
                 "mode=control requires battery_control_arm_token to match the documented "
@@ -464,6 +466,14 @@ class Settings(BaseSettings):
             raise ValueError(
                 "mode=control requires reliable number-register acknowledgement "
                 "(battery_control_number_register_ack_reliable)"
+            )
+        if (
+            self.battery_control_number_register_ack_evidence_id
+            != BATTERY_CONTROL_EXPECTED_ACK_EVIDENCE_ID
+        ):
+            raise ValueError(
+                "mode=control requires the exact reviewed number-register acknowledgement "
+                "evidence identity (battery_control_number_register_ack_evidence_id)"
             )
 
     @field_validator("pv_planes", mode="before")
