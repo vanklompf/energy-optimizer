@@ -168,7 +168,8 @@ async def test_refresh_meter_values_persists_authoritative_billing_intervals(mon
     store = Store(":memory:")
     store.create_all()
     service = Service(settings, store)
-    start = dt.datetime(2026, 8, 7, 7, 0, tzinfo=dt.UTC)
+    # Keep the fixture inside refresh_meter_values' rolling reconciliation window.
+    start = utcnow().replace(minute=0, second=0, microsecond=0) - dt.timedelta(hours=2)
 
     class FakePstrykClient:
         calls = 0
