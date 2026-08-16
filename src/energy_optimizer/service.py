@@ -420,7 +420,7 @@ class Service:
             reason = f"stale_plan:{exc}"[:60]
             return await self.fallback_battery(reason, command_id=command_id)
 
-        safety, evidence = self._evaluate_battery_authorization(
+        safety, evidence = await self._evaluate_battery_authorization(
             intent,
             now=now,
             interval_start=interval_start,
@@ -1190,7 +1190,35 @@ class Service:
         )
 
     # --- helpers -----------------------------------------------------------
-    def _evaluate_battery_authorization(
+    async def _watchdog_health(self, now: dt.datetime) -> tuple[bool, str]:
+        """Read independent HA readiness and acknowledgement, failing closed on any gap."""
+        s = self.settings
+        if not (
+            s.ha_token
+            and s.battery_control_watchdog_health_entity
+            and s.battery_control_watchdog_ack_entity
+        ):
+            return False, "watchdog_mapping_missing"
+        try:
+            async with HaClient(s.ha_url, s.ha_token, verify_ssl=s.ha_verify_ssl) as ha:
+                states = await ha.get_states(
+                    [
+                        s.battery_control_watchdog_health_entity,
+                        s.battery_control_watchdog_ack_entity,
+                    ]
+                )
+        except Exception as exc:
+            logger.warning("watchdog health check unavailable: %s", exc)
+            return False, "watchdog_health_unavailable"
+        return watchdog_health_from_ha(
+            states.get(s.battery_control_watchdog_health_entity),
+            states.get(s.battery_control_watchdog_ack_entity),
+            now=now,
+            timezone=s.tz,
+            expiry_seconds=s.battery_control_heartbeat_expiry_seconds,
+        )
+
+    async def _evaluate_battery_authorization(
         self,
         intent,
         *,
@@ -1260,12 +1288,19 @@ class Service:
             if heartbeat_at is not None
             else None
         )
-        # Local publish freshness is not HA watchdog confirmation; fail closed unless both.
-        watchdog_healthy = heartbeat_is_healthy(
-            heartbeat,
-            now=now,
-            expiry_seconds=s.battery_control_heartbeat_expiry_seconds,
-        ) and bool(s.battery_control_watchdog_health_entity)
+        # A local publish timestamp is insufficient: HA must also report that its
+        # independent fallback is ready and has ingested a current heartbeat.
+        watchdog_healthy = False
+        watchdog_reason = "watchdog_not_evaluated_dry_run"
+        if s.mode == "control" and s.battery_control_enabled:
+            ha_watchdog_healthy, watchdog_reason = await self._watchdog_health(now)
+            watchdog_healthy = heartbeat_is_healthy(
+                heartbeat,
+                now=now,
+                expiry_seconds=s.battery_control_heartbeat_expiry_seconds,
+            ) and ha_watchdog_healthy
+            if not watchdog_healthy and watchdog_reason == "ok":
+                watchdog_reason = "local_heartbeat_stale"
 
         soc_at_boundary = False
         if soc_pct is not None:
@@ -1334,6 +1369,7 @@ class Service:
             "soc_age_seconds": soc_age,
             "corroborating_power_fresh": corroborating,
             "watchdog_healthy": watchdog_healthy,
+            "watchdog_reason": watchdog_reason,
             "heartbeat_at": heartbeat_at.isoformat() if heartbeat_at is not None else None,
             "lease_held": lease_held,
             "would_authorize": not remaining,
@@ -1605,6 +1641,36 @@ class Service:
             )
         except Exception as exc:  # pragma: no cover - network dependent
             logger.warning("MQTT publish failed: %s", exc)
+
+
+def watchdog_health_from_ha(
+    readiness: HaState | None,
+    acknowledgement: HaState | None,
+    *,
+    now: dt.datetime,
+    timezone: str,
+    expiry_seconds: float,
+) -> tuple[bool, str]:
+    """Validate HA-side watchdog readiness plus its observed heartbeat acknowledgement.
+
+    The acknowledgement is an HA ``input_datetime`` intentionally written by the
+    independent MQTT-ingestion automation. It is therefore evidence that HA, not
+    just PvOpti's local database, is receiving current heartbeats.
+    """
+    if readiness is None or readiness.state != "on":
+        return False, "watchdog_not_ready"
+    if acknowledgement is None or acknowledgement.state in {"unknown", "unavailable", "none", ""}:
+        return False, "watchdog_ack_missing"
+    try:
+        acknowledged_at = dt.datetime.strptime(
+            acknowledgement.state, "%Y-%m-%d %H:%M:%S"
+        ).replace(tzinfo=ZoneInfo(timezone))
+    except (TypeError, ValueError):
+        return False, "watchdog_ack_invalid"
+    age = (now - acknowledged_at.astimezone(dt.UTC)).total_seconds()
+    if age < 0 or age > expiry_seconds:
+        return False, "watchdog_ack_stale"
+    return True, "ok"
 
 
 def _soc_pct_or_reserve(soc_pct: float | None, reserve_pct: float) -> float:

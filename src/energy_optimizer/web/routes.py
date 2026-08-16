@@ -55,7 +55,7 @@ def _settings(request: Request) -> Settings:
     return request.app.state.settings
 
 
-def _battery_control_status(request: Request, now: dt.datetime) -> dict:
+async def _battery_control_status(request: Request, now: dt.datetime) -> dict:
     """Read-only battery controller observability. Never exposes arm tokens or secrets."""
     store = _store(request)
     settings = _settings(request)
@@ -118,6 +118,8 @@ def _battery_control_status(request: Request, now: dt.datetime) -> dict:
         except json.JSONDecodeError:
             physical = None
 
+    watchdog_healthy, watchdog_reason = await service._watchdog_health(now)
+
     return {
         "mode": settings.mode,
         "battery_control_enabled": settings.battery_control_enabled,
@@ -139,7 +141,8 @@ def _battery_control_status(request: Request, now: dt.datetime) -> dict:
             "expires_at": lease_expires.isoformat() if lease_expires else None,
             "self_owner_id": getattr(service, "controller_owner_id", None),
         },
-        "watchdog_healthy": False,
+        "watchdog_healthy": watchdog_healthy,
+        "watchdog_reason": watchdog_reason,
         "heartbeat_age_seconds": heartbeat_age,
         "heartbeat_expiry_seconds": settings.battery_control_heartbeat_expiry_seconds,
         "current_intent": intent,
@@ -190,7 +193,7 @@ def _control_action_dict(action: ControlAction | None) -> dict | None:
 
 
 @router.get("/status")
-def get_status(request: Request) -> dict:
+async def get_status(request: Request) -> dict:
     store = _store(request)
     settings = _settings(request)
     now = dt.datetime.now(tz=dt.UTC)
@@ -226,7 +229,7 @@ def get_status(request: Request) -> dict:
             settings,
             override_active=request.app.state.service.ev_charge_to_100_active,
         ),
-        "battery_control": _battery_control_status(request, now),
+        "battery_control": await _battery_control_status(request, now),
     }
 
 

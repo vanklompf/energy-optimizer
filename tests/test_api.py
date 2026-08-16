@@ -61,6 +61,7 @@ def test_status_empty(client: TestClient) -> None:
     assert bc["gates_ok"] is False
     assert bc["effective_state"] == "DRY_RUN"
     assert bc["watchdog_healthy"] is False
+    assert bc["watchdog_reason"] == "watchdog_mapping_missing"
     assert bc["arm_token_configured"] is False
     assert bc["number_register_ack_reliable"] is False
     assert bc["number_register_ack_evidence_id"] is None

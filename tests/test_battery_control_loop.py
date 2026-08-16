@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from energy_optimizer.config import Settings
 from energy_optimizer.control_store import try_acquire_lease
 from energy_optimizer.ha_client import HaError, HaState
-from energy_optimizer.service import Service
+from energy_optimizer.service import Service, watchdog_health_from_ha
 from energy_optimizer.store import (
     ControlAction,
     ControllerStateRow,
@@ -41,6 +41,106 @@ def _settings(**overrides) -> Settings:
     )
     base.update(overrides)
     return Settings(**base)
+
+
+def test_watchdog_health_requires_ready_signal_and_fresh_ha_ack() -> None:
+    now = dt.datetime(2026, 8, 16, 17, 0, tzinfo=dt.UTC)
+    health = HaState("binary_sensor.pvopti_battery_control_watchdog_ready", "on", now, {})
+    # HA input_datetime stores local Europe/Warsaw wall-clock values.
+    ack = HaState("input_datetime.pvopti_battery_control_last_heartbeat", "2026-08-16 19:00:00", now, {})
+
+    healthy, reason = watchdog_health_from_ha(
+        health,
+        ack,
+        now=now,
+        timezone="Europe/Warsaw",
+        expiry_seconds=60,
+    )
+
+    assert healthy is True
+    assert reason == "ok"
+
+
+def test_watchdog_health_fails_closed_for_stale_or_unready_ha_ack() -> None:
+    now = dt.datetime(2026, 8, 16, 17, 2, tzinfo=dt.UTC)
+    ready = HaState("binary_sensor.pvopti_battery_control_watchdog_ready", "on", now, {})
+    stale_ack = HaState("input_datetime.pvopti_battery_control_last_heartbeat", "2026-08-16 19:00:00", now, {})
+    not_ready = HaState("binary_sensor.pvopti_battery_control_watchdog_ready", "off", now, {})
+    fresh_ack = HaState("input_datetime.pvopti_battery_control_last_heartbeat", "2026-08-16 19:02:00", now, {})
+
+    assert watchdog_health_from_ha(ready, stale_ack, now=now, timezone="Europe/Warsaw", expiry_seconds=60) == (False, "watchdog_ack_stale")
+    assert watchdog_health_from_ha(not_ready, fresh_ack, now=now, timezone="Europe/Warsaw", expiry_seconds=60) == (False, "watchdog_not_ready")
+
+
+async def test_service_watchdog_health_requires_independent_ha_ready_and_ack(monkeypatch) -> None:
+    settings = _settings().model_copy(
+        update={
+            "ha_token": "token",
+            "battery_control_watchdog_health_entity": "binary_sensor.pvopti_battery_control_watchdog_ready",
+            "battery_control_watchdog_ack_entity": "input_datetime.pvopti_battery_control_last_heartbeat",
+        }
+    )
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+    now = dt.datetime(2026, 8, 16, 17, 0, tzinfo=dt.UTC)
+
+    class FakeHa:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def get_states(self, entity_ids):
+            assert entity_ids == [
+                settings.battery_control_watchdog_health_entity,
+                settings.battery_control_watchdog_ack_entity,
+            ]
+            return {
+                settings.battery_control_watchdog_health_entity: HaState(entity_ids[0], "on", now, {}),
+                settings.battery_control_watchdog_ack_entity: HaState(entity_ids[1], "2026-08-16 19:00:00", now, {}),
+            }
+
+    monkeypatch.setattr("energy_optimizer.service.HaClient", FakeHa)
+
+    assert await service._watchdog_health(now) == (True, "ok")
+
+
+async def test_service_watchdog_health_fails_closed_when_ha_read_is_unavailable(monkeypatch) -> None:
+    settings = _settings().model_copy(
+        update={
+            "ha_token": "token",
+            "battery_control_watchdog_health_entity": "binary_sensor.pvopti_battery_control_watchdog_ready",
+            "battery_control_watchdog_ack_entity": "input_datetime.pvopti_battery_control_last_heartbeat",
+        }
+    )
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+
+    class FailingHa:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def get_states(self, entity_ids):
+            raise HaError("HA unavailable")
+
+    monkeypatch.setattr("energy_optimizer.service.HaClient", FailingHa)
+
+    assert await service._watchdog_health(dt.datetime(2026, 8, 16, 17, 0, tzinfo=dt.UTC)) == (
+        False,
+        "watchdog_health_unavailable",
+    )
 
 
 async def test_control_battery_shadow_records_real_intent_without_ha(monkeypatch) -> None:
