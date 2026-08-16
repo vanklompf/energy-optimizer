@@ -10,10 +10,10 @@ This is **not** authorization to enable live Remote EMS control.
 | Heartbeat publish + expiry payload | PvOpti | MQTT `energy_optimizer/battery_control/heartbeat` (**non-retained**), DB `last_heartbeat_at` |
 | Fake watchdog unit tests | PvOpti | `src/energy_optimizer/watchdog.py`, `tests/test_watchdog.py` |
 | HA automation, emergency helper, notifications, HA startup reconcile | AnsibleNasConfigs / ansible-nas | site `homeassistant/` packages |
-| Host-independent watchdog (or proven inverter timeout) | Separate safety workstream | Required before unattended live control |
+| Host-independent watchdog (or proven inverter timeout) | Separate safety workstream | Required before unattended live control; not a charge-only progression blocker under the documented residual-risk acceptance |
 
 An HA automation is independent of the PvOpti process but **not** independent of the HA host.
-Until a host-loss bound is proven, `watchdog_healthy` remains false and live arming stays blocked.
+The separate residual-risk acceptance permits charge-only progression without a host-loss bound, but only while the verified HA-side watchdog, lockout, reconnection reconciliation, and restoration evidence remain in place. It does not authorize unattended control, discharge, or export.
 
 ## MQTT heartbeat contract
 
@@ -126,7 +126,7 @@ unchanged register value is by itself evidence of a distinct write acknowledgeme
 
 ## Remaining rollout blockers (outside this document)
 
-- Prove HA-host loss recovery (inverter timeout or host-independent actor).
-- Physical validation of process stop/hang, integration reload, HA restart, and
-  network/Modbus loss at conservative limits.
-- Reliable number-register acknowledgement before `mode=control`.
+- Deploy and verify the HA readiness/acknowledgement mapping used by `watchdog_healthy`; it must fail closed whenever the fallback actor is disabled, latched, unavailable, or has not ingested a current heartbeat.
+- Complete best-effort path-loss monitoring, lockout, reconnect reconciliation, and incident/audit evidence under the accepted residual-risk scope.
+- Complete the attended charge-only control interval and financial reconciliation gates before any time-limited autonomous charge-only trial.
+- Host-independent recovery remains required before unattended control and all future discharge/export stages.
