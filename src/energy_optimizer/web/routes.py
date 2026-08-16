@@ -14,6 +14,7 @@ from ..config import BATTERY_CONTROL_EXPECTED_ARM_TOKEN, Settings
 from ..control_store import (
     DEFAULT_SITE_KEY,
     ensure_controller_state,
+    is_locked_out,
 )
 from ..ev import EV_FULL_TARGET_SOC_PCT
 from ..optimiser import IntervalInput, optimise
@@ -67,6 +68,7 @@ async def _battery_control_status(request: Request, now: dt.datetime) -> dict:
     )
     with store.session() as session:
         state = ensure_controller_state(session)
+        lockout_active = is_locked_out(session, now=now)
         lease = session.get(ControllerLease, DEFAULT_SITE_KEY)
         last_action = session.execute(
             select(ControlAction).order_by(ControlAction.created_at.desc()).limit(1)
@@ -88,9 +90,6 @@ async def _battery_control_status(request: Request, now: dt.datetime) -> dict:
     heartbeat_at = state.last_heartbeat_at
     heartbeat_age = (
         max(0.0, (now - _aware(heartbeat_at)).total_seconds()) if heartbeat_at else None
-    )
-    lockout_active = bool(
-        state.lockout_until is not None and _aware(state.lockout_until) > now
     )
     effective = "DISARMED"
     if lockout_active:

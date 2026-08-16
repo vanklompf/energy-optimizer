@@ -632,28 +632,41 @@ class Service:
                 "verified": False,
             }
 
+        verified = bool(outcome.control.physical_verified)
+        requires_lockout = bool(getattr(outcome, "lockout", False)) or not verified
         with self.store.session() as session:
             finalize_action(
                 session,
                 command_id,
                 observed_state=(
-                    outcome.control.observed_state.value
-                    if outcome.control.observed_state
-                    else "FALLBACK"
+                    "LOCKOUT"
+                    if requires_lockout
+                    else (
+                        outcome.control.observed_state.value
+                        if outcome.control.observed_state
+                        else "FALLBACK"
+                    )
                 ),
-                physical={"verified": outcome.control.physical_verified},
+                physical={"verified": verified},
                 result="fallback",
                 error_code=reason,
                 latency_ms=outcome.control.latency_ms,
             )
             state = ensure_controller_state(session)
             state.last_fallback_at = utcnow()
-            state.last_fallback_verified = bool(outcome.control.physical_verified)
-            state.state = (
-                outcome.control.observed_state.value
-                if outcome.control.observed_state
-                else "FALLBACK"
-            )
+            state.last_fallback_verified = verified
+            if requires_lockout:
+                set_lockout(
+                    session,
+                    reason="fallback_unverified",
+                    duration_seconds=s.battery_control_lockout_duration_seconds,
+                )
+            else:
+                state.state = (
+                    outcome.control.observed_state.value
+                    if outcome.control.observed_state
+                    else "FALLBACK"
+                )
         return {
             "result": "fallback",
             "command_id": command_id,

@@ -9,6 +9,7 @@ from sqlalchemy import delete
 from energy_optimizer.config import Settings
 from energy_optimizer.store import (
     ControlAction,
+    ControllerStateRow,
     EvControlStatus,
     EvPlanStep,
     EvTelemetry,
@@ -66,6 +67,22 @@ def test_status_empty(client: TestClient) -> None:
     assert bc["number_register_ack_reliable"] is False
     assert bc["number_register_ack_evidence_id"] is None
 
+
+def test_status_reports_expired_path_loss_lockout_as_active(client: TestClient) -> None:
+    """Permanent path-loss lockouts must remain visible after their timed lease expires."""
+    store = client.app.state.store
+    with store.session() as session:
+        state = session.get(ControllerStateRow, "current")
+        assert state is not None
+        state.state = "LOCKOUT"
+        state.lockout_reason = "path_recovered_restore_verified"
+        state.lockout_until = dt.datetime.now(tz=dt.UTC) - dt.timedelta(seconds=1)
+
+    body = client.get("/api/status").json()["battery_control"]
+
+    assert body["effective_state"] == "LOCKOUT"
+    assert body["lockout"]["active"] is True
+    assert body["lockout"]["reason"] == "path_recovered_restore_verified"
 
 def test_control_actions_history_is_read_only(client: TestClient) -> None:
     store = client.app.state.store

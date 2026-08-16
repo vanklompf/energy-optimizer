@@ -437,6 +437,56 @@ async def test_reconcile_startup_falls_back_when_ha_read_fails(monkeypatch) -> N
     assert result["reason"] == "startup_remote_ems_unknown"
 
 
+
+
+async def test_fallback_battery_locks_out_when_ha_is_reachable_but_restore_is_unverified(
+    monkeypatch,
+) -> None:
+    """A reachable HA does not make an unverified local restore safe to resume from."""
+    data = _settings().model_dump()
+    data.update(mode="control", battery_control_enabled=True, ha_token="token")
+    settings = Settings.model_construct(**data)
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+
+    class ReachableHa:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+    class UnverifiedController:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def fallback(self, *args, **kwargs):
+            return SimpleNamespace(
+                control=SimpleNamespace(
+                    observed_state=SimpleNamespace(value="FALLBACK"),
+                    physical_verified=False,
+                    latency_ms=1.0,
+                )
+            )
+
+    monkeypatch.setattr("energy_optimizer.service.HaClient", ReachableHa)
+    monkeypatch.setattr("energy_optimizer.sigenergy_control.SigenergyController", UnverifiedController)
+
+    result = await service.fallback_battery("unit_test_unverified")
+
+    assert result["result"] == "fallback"
+    assert result["verified"] is False
+    with store.session() as session:
+        state = session.get(ControllerStateRow, "current")
+        assert state is not None
+        assert state.state == "LOCKOUT"
+        assert state.lockout_reason == "fallback_unverified"
+
+
 async def test_fallback_battery_records_lockout_when_ha_is_unreachable(monkeypatch) -> None:
     """An unavailable HA must leave auditable, unverified fallback/lockout evidence."""
     data = _settings().model_dump()
