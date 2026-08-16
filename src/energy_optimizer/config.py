@@ -14,15 +14,6 @@ from typing import Literal, Self
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Documented expected runtime arm token. Leave EO_BATTERY_CONTROL_ARM_TOKEN empty in
-# examples; control mode requires an exact match and never infers arming from mode alone.
-BATTERY_CONTROL_EXPECTED_ARM_TOKEN = "pvopti-battery-control-armed"
-BATTERY_CONTROL_EXPECTED_ACK_EVIDENCE_ID = (
-    "ha-2026.8.1+sigen-overlay-fd238d2-"
-    "f17b7bbc66d33513b0dec66223ad90d2e9e9d7dad3d1cbc489d8409a448f5101+"
-    "grid-charge-0.5kw"
-)
-
 # Exact Remote EMS option strings from docs/sigenergy-control-contract.md.
 SIGENERGY_MODE_PCS_REMOTE_CONTROL = "PCS Remote Control"
 SIGENERGY_MODE_STANDBY = "Standby"
@@ -186,17 +177,12 @@ class Settings(BaseSettings):
     ev_battery_full_soc_pct: float = Field(default=95.0, ge=50.0, le=100.0)
 
     # --- Stationary battery control (fail-safe; independent of planner flags) ---
-    # Two-key gate: mode=control AND battery_control_enabled AND matching arm token.
+    # Live actuation requires mode=control AND battery_control_enabled.
     # EO_ALLOW_GRID_CHARGING / EO_ALLOW_BATTERY_EXPORT remain planner-only.
     battery_control_enabled: bool = False
-    battery_control_arm_token: str = ""
     battery_export_enabled: bool = False
     battery_control_grid_charge_enabled: bool = False
     battery_control_authorize_discharge: bool = False
-    battery_control_authorize_export: bool = False
-    # Acknowledgement is promoted only against a recorded, version-bound field-evidence ID.
-    battery_control_number_register_ack_reliable: bool = False
-    battery_control_number_register_ack_evidence_id: str = ""
     battery_control_supported_directions: list[str] = Field(
         default_factory=lambda: ["FALLBACK", "IDLE", "CHARGE"]
     )
@@ -218,14 +204,9 @@ class Settings(BaseSettings):
 
     battery_control_mode_standby: str = SIGENERGY_MODE_STANDBY
     battery_control_mode_charge_grid_first: str = SIGENERGY_MODE_COMMAND_CHARGING_GRID_FIRST
-    battery_control_mode_charge_pv_first: str = SIGENERGY_MODE_COMMAND_CHARGING_PV_FIRST
-    battery_control_mode_discharge_pv_first: str = SIGENERGY_MODE_COMMAND_DISCHARGING_PV_FIRST
-    battery_control_mode_discharge_ess_first: str = SIGENERGY_MODE_COMMAND_DISCHARGING_ESS_FIRST
-    battery_control_mode_max_self_consumption: str = SIGENERGY_MODE_MAXIMUM_SELF_CONSUMPTION
     # Active command mode used when charging under Remote EMS.
     battery_control_command_mode: str = SIGENERGY_MODE_COMMAND_CHARGING_GRID_FIRST
     battery_control_fallback_mode: str = SIGENERGY_MODE_STANDBY
-    battery_control_require_remote_ems_off: bool = True
 
     # Explicit local-restore values; never populate from HA number-entity fallback states.
     battery_control_local_charge_limit_kw: float = 8.8
@@ -241,23 +222,19 @@ class Settings(BaseSettings):
     battery_control_min_soc_pct: float = Field(default=15.0, ge=0, le=100)
     battery_control_max_soc_pct: float = Field(default=98.0, ge=0, le=100)
     battery_control_charge_cutoff_margin_pct: float = Field(default=0.5, ge=0, le=100)
-    battery_control_discharge_cutoff_margin_pct: float = Field(default=0.5, ge=0, le=100)
 
     battery_control_cadence_seconds: float = Field(default=30.0, ge=0)
     battery_control_max_plan_age_seconds: float = Field(default=900.0, ge=0)
     battery_control_max_telemetry_age_seconds: float = Field(default=120.0, ge=0)
-    battery_control_command_settle_seconds: float = Field(default=2.0, ge=0)
     battery_control_command_poll_seconds: float = Field(default=1.0, ge=0)
     battery_control_command_timeout_seconds: float = Field(default=30.0, ge=0)
     # Contract: physical Standby/command verification deadline is at least 15 seconds.
     battery_control_physical_verify_timeout_seconds: float = Field(default=15.0, ge=0)
     battery_control_heartbeat_interval_seconds: float = Field(default=15.0, ge=0)
     battery_control_heartbeat_expiry_seconds: float = Field(default=60.0, ge=0)
-    battery_control_min_dwell_seconds: float = Field(default=60.0, ge=0)
     battery_control_standby_neutral_band_kw: float = Field(default=0.12, ge=0)
     battery_control_deadband_kw: float = Field(default=0.12, ge=0)
     battery_control_max_power_step_kw: float = Field(default=0.5, ge=0)
-    battery_control_max_ramp_kw_per_s: float = Field(default=0.5, ge=0)
     battery_control_retry_limit: int = Field(default=2, ge=0)
     battery_control_lockout_duration_seconds: float = Field(default=3600.0, ge=0)
     battery_control_activation_margin_pln_kwh: float = Field(default=0.05, ge=0)
@@ -270,13 +247,6 @@ class Settings(BaseSettings):
     )
     pv_forecast_provider: Literal["forecast_solar", "solcast", "none"] = "forecast_solar"
     solcast_api_key: str = ""
-
-    # --- InfluxDB bootstrap (optional, read-only) ---
-    influxdb_bootstrap_enabled: bool = False
-    influxdb_url: str = ""
-    influxdb_token: str = ""
-    influxdb_org: str = ""
-    influxdb_bucket: str = "ha_raw"
 
     # --- Derived ---
     @property
@@ -304,6 +274,11 @@ class Settings(BaseSettings):
     @property
     def step_hours(self) -> float:
         return self.step_minutes / 60.0
+
+    @property
+    def battery_actuation_live(self) -> bool:
+        """True only when both live-control gates are on."""
+        return self.mode == "control" and self.battery_control_enabled
 
     @field_validator("battery_round_trip_efficiency")
     @classmethod
@@ -337,14 +312,6 @@ class Settings(BaseSettings):
         mode_fields = {
             "battery_control_mode_standby": self.battery_control_mode_standby,
             "battery_control_mode_charge_grid_first": self.battery_control_mode_charge_grid_first,
-            "battery_control_mode_charge_pv_first": self.battery_control_mode_charge_pv_first,
-            "battery_control_mode_discharge_pv_first": self.battery_control_mode_discharge_pv_first,
-            "battery_control_mode_discharge_ess_first": (
-                self.battery_control_mode_discharge_ess_first
-            ),
-            "battery_control_mode_max_self_consumption": (
-                self.battery_control_mode_max_self_consumption
-            ),
             "battery_control_command_mode": self.battery_control_command_mode,
             "battery_control_fallback_mode": self.battery_control_fallback_mode,
         }
@@ -371,10 +338,6 @@ class Settings(BaseSettings):
         if self.battery_control_authorize_discharge and "DISCHARGE" not in directions:
             raise ValueError(
                 "authorize_discharge requires DISCHARGE in battery_control_supported_directions"
-            )
-        if self.battery_control_authorize_export and not self.battery_export_enabled:
-            raise ValueError(
-                "authorize_export requires battery_export_enabled physical actuation gate"
             )
 
     def _validate_battery_control_entities(self) -> None:
@@ -421,8 +384,6 @@ class Settings(BaseSettings):
             raise ValueError("battery_control_deadband_kw must be positive")
         if self.battery_control_max_power_step_kw <= 0:
             raise ValueError("battery_control_max_power_step_kw must be positive")
-        if self.battery_control_max_ramp_kw_per_s <= 0:
-            raise ValueError("battery_control_max_ramp_kw_per_s must be positive")
         if self.battery_control_physical_verify_timeout_seconds < 15.0:
             raise ValueError(
                 "battery_control_physical_verify_timeout_seconds must be at least 15 "
@@ -457,24 +418,6 @@ class Settings(BaseSettings):
     def _validate_battery_control_armed(self) -> None:
         if not self.battery_control_enabled:
             raise ValueError("mode=control requires battery_control_enabled as an independent gate")
-        if self.battery_control_arm_token != BATTERY_CONTROL_EXPECTED_ARM_TOKEN:
-            raise ValueError(
-                "mode=control requires battery_control_arm_token to match the documented "
-                "expected arm token"
-            )
-        if not self.battery_control_number_register_ack_reliable:
-            raise ValueError(
-                "mode=control requires reliable number-register acknowledgement "
-                "(battery_control_number_register_ack_reliable)"
-            )
-        if (
-            self.battery_control_number_register_ack_evidence_id
-            != BATTERY_CONTROL_EXPECTED_ACK_EVIDENCE_ID
-        ):
-            raise ValueError(
-                "mode=control requires the exact reviewed number-register acknowledgement "
-                "evidence identity (battery_control_number_register_ack_evidence_id)"
-            )
 
     @field_validator("pv_planes", mode="before")
     @classmethod

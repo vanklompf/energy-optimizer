@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo
 
 from .config import Settings
+from .ha_client import HaState
 
 
 @dataclass(frozen=True, slots=True)
@@ -231,3 +233,33 @@ class HeartbeatSilenceTracker:
         if age < 0 or age > expiry_seconds:
             return WatchdogDecision(False, "heartbeat_expired", True)
         return WatchdogDecision(True, "ok", False)
+
+
+def watchdog_health_from_ha(
+    readiness: HaState | None,
+    acknowledgement: HaState | None,
+    *,
+    now: dt.datetime,
+    timezone: str,
+    expiry_seconds: float,
+) -> tuple[bool, str]:
+    """Validate HA-side watchdog readiness plus its observed heartbeat acknowledgement.
+
+    The acknowledgement is an HA ``input_datetime`` intentionally written by the
+    independent MQTT-ingestion automation. It is therefore evidence that HA, not
+    just PvOpti's local database, is receiving current heartbeats.
+    """
+    if readiness is None or readiness.state != "on":
+        return False, "watchdog_not_ready"
+    if acknowledgement is None or acknowledgement.state in {"unknown", "unavailable", "none", ""}:
+        return False, "watchdog_ack_missing"
+    try:
+        acknowledged_at = dt.datetime.strptime(
+            acknowledgement.state, "%Y-%m-%d %H:%M:%S"
+        ).replace(tzinfo=ZoneInfo(timezone))
+    except (TypeError, ValueError):
+        return False, "watchdog_ack_invalid"
+    age = (now - acknowledged_at.astimezone(dt.UTC)).total_seconds()
+    if age < 0 or age > expiry_seconds:
+        return False, "watchdog_ack_stale"
+    return True, "ok"

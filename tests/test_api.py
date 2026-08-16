@@ -63,26 +63,25 @@ def test_status_empty(client: TestClient) -> None:
     assert bc["effective_state"] == "DRY_RUN"
     assert bc["watchdog_healthy"] is False
     assert bc["watchdog_reason"] == "watchdog_mapping_missing"
-    assert bc["arm_token_configured"] is False
-    assert bc["number_register_ack_reliable"] is False
-    assert bc["number_register_ack_evidence_id"] is None
+    assert "arm_token_configured" not in bc
+    assert "number_register_ack_reliable" not in bc
 
 
-def test_status_reports_expired_path_loss_lockout_as_active(client: TestClient) -> None:
-    """Permanent path-loss lockouts must remain visible after their timed lease expires."""
+def test_status_reports_expired_lockout_as_cleared(client: TestClient) -> None:
+    """Backoff lockouts expire automatically; they are not sticky after lockout_until."""
     store = client.app.state.store
+    now = dt.datetime.now(tz=dt.UTC)
     with store.session() as session:
         state = session.get(ControllerStateRow, "current")
         assert state is not None
         state.state = "LOCKOUT"
-        state.lockout_reason = "path_recovered_restore_verified"
-        state.lockout_until = dt.datetime.now(tz=dt.UTC) - dt.timedelta(seconds=1)
+        state.lockout_reason = "fallback_unverified"
+        state.lockout_until = now - dt.timedelta(seconds=1)
 
     body = client.get("/api/status").json()["battery_control"]
 
-    assert body["effective_state"] == "LOCKOUT"
-    assert body["lockout"]["active"] is True
-    assert body["lockout"]["reason"] == "path_recovered_restore_verified"
+    assert body["lockout"]["active"] is False
+    assert body["effective_state"] != "LOCKOUT"
 
 def test_control_actions_history_is_read_only(client: TestClient) -> None:
     store = client.app.state.store
@@ -115,9 +114,9 @@ def test_control_actions_history_is_read_only(client: TestClient) -> None:
     assert actions[0]["result"] == "shadow"
     assert actions[0]["requested_state"] == "CHARGE"
     assert actions[0]["observed_state"] == "DISARMED"
-    # No public arm/clear mutation endpoints.
-    assert client.post("/api/control/arm").status_code in {404, 405, 422}
-    assert client.post("/api/control/disarm").status_code in {404, 405, 422}
+    # Mutation endpoints exist for enable/disable and lockout-clear.
+    assert client.post("/api/control/actuation", json={"enabled": False}).status_code == 200
+    assert client.post("/api/control/lockout/clear").status_code == 200
 
 
 def test_status_exposes_latest_pstryk_billing_interval(client: TestClient) -> None:

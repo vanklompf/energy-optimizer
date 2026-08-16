@@ -173,16 +173,6 @@ def clear_lockout(session: Session, *, now: dt.datetime | None = None) -> Contro
     return row
 
 
-PATH_LOSS_LOCKOUT_REASONS = frozenset(
-    {
-        "fallback_ha_unreachable",
-        "path_loss_recovery_attempting",
-        "path_loss_recovery_attempted_unverified",
-        "path_recovered_restore_verified",
-    }
-)
-
-
 def claim_path_loss_recovery(
     session: Session, *, now: dt.datetime | None = None
 ) -> bool:
@@ -201,14 +191,31 @@ def claim_path_loss_recovery(
         )
     )
     session.flush()
-    return result.rowcount == 1
+    return getattr(result, "rowcount", 0) == 1
+
+
+def expire_lockout_if_due(
+    session: Session, *, now: dt.datetime | None = None
+) -> ControllerStateRow:
+    """Clear an expired backoff so the control loop can retry."""
+    now = _aware(now or utcnow())
+    row = ensure_controller_state(session)
+    if row.lockout_until is None:
+        return row
+    if _aware(row.lockout_until) > now:
+        return row
+    row.lockout_until = None
+    row.lockout_reason = None
+    row.consecutive_failures = 0
+    if row.state == "LOCKOUT":
+        row.state = "DISARMED"
+    row.updated_at = now
+    return row
 
 
 def is_locked_out(session: Session, *, now: dt.datetime | None = None) -> bool:
     now = _aware(now or utcnow())
     row = ensure_controller_state(session)
-    if row.lockout_reason in PATH_LOSS_LOCKOUT_REASONS:
-        return True
     return bool(row.lockout_until is not None and _aware(row.lockout_until) > now)
 
 

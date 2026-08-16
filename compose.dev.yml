@@ -1,4 +1,4 @@
-# Development against real HA/Pstryk (read-only, safe: dry_run only).
+# Development against real HA/Pstryk (read-only by default: EO_MODE=dry_run).
 # Source is bind-mounted for hot reload; the `dev` image target carries dev deps + tests.
 #
 #   cp .env.example .env
@@ -20,7 +20,7 @@ services:
       - path: .env
         required: false
     environment:
-      EO_MODE: dry_run
+      EO_MODE: ${EO_MODE:-dry_run}
       EO_DB: /data/energy_optimizer.sqlite
       EO_HTTP_HOST: 0.0.0.0
       EO_HTTP_PORT: "8320"

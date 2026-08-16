@@ -37,6 +37,14 @@ from .ha_client import (
 logger = logging.getLogger(__name__)
 
 _STABLE_GOOD_SAMPLES = 3
+_NUMBER_WRITE_SENT = frozenset(
+    {
+        AckStatus.ACKNOWLEDGED,
+        AckStatus.IDEMPOTENT_NOOP,
+        AckStatus.VALUE_COERCED,
+        AckStatus.UNACKNOWLEDGED,  # HA number display defect; physical verify is authoritative
+    }
+)
 
 
 @dataclass(slots=True)
@@ -197,15 +205,6 @@ class SigenergyController:
                 return await self._failure_fallback(
                     command_id, "standby_after_enable_failed", t0, cancel_event
                 )
-        else:
-            # Already in Remote EMS — still refuse to continue without reliable limit ack path.
-            if not self._ha.number_register_ack_reliable:
-                return self._fail(
-                    command_id,
-                    ControllerState.ARMED_IDLE,
-                    "UNACKNOWLEDGED_LIMIT",
-                    t0,
-                )
 
         if not await self._wait_neutral(cancel_event=cancel_event):
             return await self._failure_fallback(
@@ -232,22 +231,15 @@ class SigenergyController:
             intent.requested_power_kw,
             self._settings.battery_control_max_charge_kw,
         )
-        if self._ha.number_register_ack_reliable:
-            ack = await self._tracked_number(
-                self._settings.battery_control_charge_limit_entity,
-                charge_limit,
-                cancel_event=cancel_event,
+        ack = await self._tracked_number(
+            self._settings.battery_control_charge_limit_entity,
+            charge_limit,
+            cancel_event=cancel_event,
+        )
+        if ack.status not in _NUMBER_WRITE_SENT:
+            return await self._failure_fallback(
+                command_id, "charge_limit_unacknowledged", t0, cancel_event
             )
-            if ack.status not in {
-                AckStatus.ACKNOWLEDGED,
-                AckStatus.IDEMPOTENT_NOOP,
-                AckStatus.VALUE_COERCED,
-            }:
-                return await self._failure_fallback(
-                    command_id, "charge_limit_unacknowledged", t0, cancel_event
-                )
-        else:
-            return self._fail(command_id, ControllerState.ARMED_IDLE, "UNACKNOWLEDGED_LIMIT", t0)
 
         selected = await self._tracked_select(self.mode_select, mode, cancel_event=cancel_event)
         if selected.status not in {AckStatus.ACKNOWLEDGED, AckStatus.IDEMPOTENT_NOOP}:
@@ -296,9 +288,9 @@ class SigenergyController:
     ) -> SigenergyControlResult:
         """Plan-independent fallback: Standby → restore local limits → Remote EMS off.
 
-        ``physical_verified=True`` requires Standby ack, bounded neutral, reliable limit
-        restores, Remote EMS off ack, and observed local behavior. Remote-off alone never
-        counts as verified safe.
+        ``physical_verified=True`` requires Standby ack, bounded neutral, local-limit
+        writes (HA number display is not trusted), Remote EMS off ack, and observed
+        local behavior. Remote-off alone never counts as verified safe.
         """
         self._service_calls = []
         self._ack_results = []
@@ -330,24 +322,19 @@ class SigenergyController:
                 command_id, reason, "fallback_neutral_timeout", t0, evidence, lockout=True
             )
 
-        restores_verified = False
-        if self._ha.number_register_ack_reliable:
-            restore_failure = await self._restore_local_limits_verified(cancel_event=cancel_event)
-            evidence["restore_failure"] = restore_failure
-            if restore_failure is not None:
-                await self._tracked_switch(self.remote_switch, False, cancel_event=cancel_event)
-                return self._fallback_incomplete(
-                    command_id,
-                    reason,
-                    f"fallback_restore_failed:{restore_failure}"[:60],
-                    t0,
-                    evidence,
-                    lockout=True,
-                )
-            restores_verified = True
-        else:
-            await self._restore_local_limits(cancel_event=cancel_event)
-            evidence["restore_failure"] = "number_register_ack_unreliable"
+        restore_failure = await self._restore_local_limits_verified(cancel_event=cancel_event)
+        evidence["restore_failure"] = restore_failure
+        if restore_failure is not None:
+            await self._tracked_switch(self.remote_switch, False, cancel_event=cancel_event)
+            return self._fallback_incomplete(
+                command_id,
+                reason,
+                f"fallback_restore_failed:{restore_failure}"[:60],
+                t0,
+                evidence,
+                lockout=True,
+            )
+        restores_verified = True
 
         off = await self._tracked_switch(self.remote_switch, False, cancel_event=cancel_event)
         evidence["remote_off_ack"] = off.status.value
@@ -399,32 +386,6 @@ class SigenergyController:
         self, *, cancel_event: asyncio.Event | None
     ) -> SigenergyControlResult | None:
         """Write explicit local/global limits. Never use HA displayed 0.0 as originals."""
-        if not self._ha.number_register_ack_reliable:
-            # Record the blocker and refuse to continue into live command.
-            self._ack_results.append(
-                AckResult(
-                    AckStatus.UNACKNOWLEDGED,
-                    self._settings.battery_control_charge_limit_entity,
-                    self._settings.battery_control_local_charge_limit_kw,
-                    None,
-                    "UNACKNOWLEDGED_LIMIT",
-                )
-            )
-            return SigenergyControlResult(
-                control=ControlResult(
-                    command_id=str(uuid.uuid4()),
-                    requested_state=ControllerState.PREFLIGHT,
-                    observed_state=ControllerState.DISARMED,
-                    entity_readback={},
-                    physical_verified=False,
-                    retries=0,
-                    latency_ms=0.0,
-                    failure_reason="UNACKNOWLEDGED_LIMIT",
-                    lockout_reason=None,
-                ),
-                service_calls=list(self._service_calls),
-                ack_results=list(self._ack_results),
-            )
         pairs = [
             (
                 self._settings.battery_control_charge_limit_entity,
@@ -445,11 +406,7 @@ class SigenergyController:
         ]
         for entity_id, value in pairs:
             ack = await self._tracked_number(entity_id, value, cancel_event=cancel_event)
-            if ack.status not in {
-                AckStatus.ACKNOWLEDGED,
-                AckStatus.IDEMPOTENT_NOOP,
-                AckStatus.VALUE_COERCED,
-            }:
+            if ack.status not in _NUMBER_WRITE_SENT:
                 return SigenergyControlResult(
                     control=ControlResult(
                         command_id=str(uuid.uuid4()),
@@ -486,11 +443,7 @@ class SigenergyController:
         """Return entity_id on first failed restore ack, else None."""
         for entity_id, value in self._local_restore_pairs():
             ack = await self._tracked_number(entity_id, value, cancel_event=cancel_event)
-            if ack.status not in {
-                AckStatus.ACKNOWLEDGED,
-                AckStatus.IDEMPOTENT_NOOP,
-                AckStatus.VALUE_COERCED,
-            }:
+            if ack.status not in _NUMBER_WRITE_SENT:
                 return entity_id
         return None
 
@@ -655,8 +608,11 @@ class SigenergyController:
         cutoff = intent.cutoff_soc_pct - s.battery_control_charge_cutoff_margin_pct
         if physical.soc_pct >= cutoff:
             return "soc_cutoff_breached"
+        # Ignore HA displayed 0.0 (known number-register defect); a real non-zero
+        # mismatch still fails closed.
         if (
             physical.charge_limit_kw is not None
+            and abs(physical.charge_limit_kw) > 0.05
             and abs(physical.charge_limit_kw - commanded_charge_limit_kw) > 0.05
         ):
             return "charge_limit_mismatch"

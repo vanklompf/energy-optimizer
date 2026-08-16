@@ -1,7 +1,7 @@
 """Safety rules: plan status plus independent live-control authorization.
 
 Plan statuses (``OK`` / ``LOW_CONFIDENCE`` / ``BLOCKED``) remain for recommendations.
-``control_authorized`` is decided separately and is never derived from ``control_enabled``.
+``control_authorized`` is decided separately and is never inferred from planner flags.
 """
 
 from __future__ import annotations
@@ -11,9 +11,6 @@ import math
 from dataclasses import dataclass, field
 from enum import StrEnum
 from zoneinfo import ZoneInfo
-
-# Hardcoded off until controlled mode is fully designed and armed via settings gates.
-CONTROL_ENABLED = False
 
 
 class Status(StrEnum):
@@ -57,7 +54,6 @@ class SafetyInputs:
     soc_update_age_seconds: float | None = None
     soc_at_boundary: bool = False
     corroborating_power_fresh: bool = True
-    number_register_ack_reliable: bool = False
     battery_control_enabled: bool = False
     mode_is_control: bool = False
     economic_action: bool = False  # charge/export arbitrage; idle/fallback are non-economic
@@ -68,7 +64,7 @@ class SafetyReport:
     status: Status
     blockers: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-    control_enabled: bool = CONTROL_ENABLED
+    control_enabled: bool = False
     control_authorized: bool = False
     control_blockers: list[str] = field(default_factory=list)
 
@@ -115,7 +111,7 @@ def evaluate(inputs: SafetyInputs) -> SafetyReport:
         status=status,
         blockers=blockers,
         warnings=warnings,
-        control_enabled=CONTROL_ENABLED,
+        control_enabled=inputs.mode_is_control and inputs.battery_control_enabled,
         control_authorized=control_authorized,
         control_blockers=control_blockers,
     )
@@ -129,8 +125,6 @@ def _control_blockers(inputs: SafetyInputs, *, plan_status: Status) -> list[str]
         blockers.append("mode_not_control")
     if not inputs.battery_control_enabled:
         blockers.append("battery_control_disabled")
-    if not inputs.number_register_ack_reliable:
-        blockers.append("number_register_ack_unreliable")
     if not inputs.lease_held:
         blockers.append("lease_not_held")
     if not inputs.watchdog_healthy:

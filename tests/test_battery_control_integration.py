@@ -9,7 +9,6 @@ import pytest
 from energy_optimizer.battery_control import BatteryControlIntent, ControlDirection
 from energy_optimizer.config import Settings
 from energy_optimizer.control_store import try_acquire_lease
-from energy_optimizer.ha_client import AckStatus
 from energy_optimizer.service import Service
 from energy_optimizer.sigenergy_control import SigenergyController
 from energy_optimizer.store import PlanStep, Run, Store, utcnow
@@ -32,9 +31,7 @@ def _settings(**overrides) -> Settings:
         battery_control_max_charge_kw=8.8,
         battery_control_max_discharge_kw=9.6,
         battery_control_grid_charge_enabled=True,
-        battery_control_number_register_ack_reliable=True,
         battery_control_physical_verify_timeout_seconds=15.0,
-        battery_control_command_settle_seconds=0.0,
         battery_control_command_poll_seconds=0.01,
         battery_control_command_timeout_seconds=1.0,
         battery_soc_min_pct=15.0,
@@ -99,8 +96,8 @@ def _seed_plan(store: Store, now: dt.datetime, *, grid_to_batt: float = 0.5) -> 
 
 
 @pytest.mark.asyncio
-async def test_charge_happy_path_and_unacked_limit_blocks(monkeypatch) -> None:
-    settings = _settings(battery_control_number_register_ack_reliable=True)
+async def test_charge_happy_path(monkeypatch) -> None:
+    settings = _settings()
     ha = EmulatedHa(
         states={
             settings.battery_control_remote_ems_switch_entity: ha_state(
@@ -157,33 +154,6 @@ async def test_charge_happy_path_and_unacked_limit_blocks(monkeypatch) -> None:
     )
     ok = await controller.apply_intent(_intent())
     assert ok.control.failure_reason is None or ok.control.physical_verified
-
-    blocked_settings = _settings(battery_control_number_register_ack_reliable=False)
-    ha2 = EmulatedHa(
-        states={
-            blocked_settings.battery_control_remote_ems_switch_entity: ha_state(
-                blocked_settings.battery_control_remote_ems_switch_entity, "off"
-            ),
-            blocked_settings.battery_control_mode_select_entity: ha_state(
-                blocked_settings.battery_control_mode_select_entity,
-                "Standby",
-                attributes={"options": ["Standby", "Command Charging (Grid First)"]},
-            ),
-        },
-        number_register_ack_reliable=False,
-    )
-    blocked = SigenergyController(
-        ha2,  # type: ignore[arg-type]
-        blocked_settings,
-        physical=EmulatedPhysical([phys(0.0), phys(0.05)]),
-        sleep=_sleep,
-        monotonic=mono,
-    )
-    result = await blocked.apply_intent(_intent())
-    assert result.control.failure_reason is not None
-    assert result.control.physical_verified is False or "UNACKNOWLEDGED" in (
-        result.control.failure_reason or ""
-    ) or any(a.status == AckStatus.UNACKNOWLEDGED for a in result.ack_results)
 
 
 @pytest.mark.asyncio
@@ -304,7 +274,7 @@ async def test_service_dry_run_and_lease_conflict_and_startup_fallback(monkeypat
     async def recorded_fallback(reason, command_id=None):
         return {"result": "fallback", "reason": reason, "command_id": "x"}
 
-    monkeypatch.setattr("energy_optimizer.service.HaClient", FakeHaClient)
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", FakeHaClient)
     monkeypatch.setattr(armed, "fallback_battery", recorded_fallback)
     result = await armed.reconcile_battery_on_startup()
     assert result["reason"] == "startup_remote_ems_on"

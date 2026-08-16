@@ -77,13 +77,10 @@ def test_battery_control_defaults_are_non_actuating() -> None:
     s = Settings(db=":memory:")
     assert s.mode == "dry_run"
     assert s.battery_control_enabled is False
-    assert s.battery_control_arm_token == ""
+    assert s.battery_actuation_live is False
     assert s.battery_export_enabled is False
     assert s.battery_control_grid_charge_enabled is False
     assert s.battery_control_authorize_discharge is False
-    assert s.battery_control_authorize_export is False
-    assert s.battery_control_number_register_ack_reliable is False
-    assert s.battery_control_number_register_ack_evidence_id == ""
     assert "DISCHARGE" not in s.battery_control_supported_directions
     assert s.battery_control_remote_ems_switch_entity == (
         "switch.sigen_plant_remote_ems_controlled_by_home_assistant"
@@ -92,7 +89,6 @@ def test_battery_control_defaults_are_non_actuating() -> None:
     assert s.battery_control_mode_standby == "Standby"
     assert s.battery_control_mode_charge_grid_first == "Command Charging (Grid First)"
     assert s.battery_control_fallback_mode == "Standby"
-    assert s.battery_control_require_remote_ems_off is True
     assert s.battery_control_local_charge_limit_kw == 8.8
     assert s.battery_control_local_discharge_limit_kw == 9.6
     assert s.battery_control_local_charge_cutoff_pct == 100.0
@@ -106,17 +102,10 @@ def test_battery_control_defaults_are_non_actuating() -> None:
 
 def _armed_control_kwargs(**overrides: object) -> dict[str, object]:
     """Minimal kwargs that satisfy control-mode startup validation."""
-    from energy_optimizer.config import BATTERY_CONTROL_EXPECTED_ARM_TOKEN
-
     base: dict[str, object] = {
         "db": ":memory:",
         "mode": "control",
         "battery_control_enabled": True,
-        "battery_control_arm_token": BATTERY_CONTROL_EXPECTED_ARM_TOKEN,
-        "battery_control_number_register_ack_reliable": True,
-        "battery_control_number_register_ack_evidence_id": (
-            "ha-2026.8.1+sigen-overlay-fd238d2-f17b7bbc66d33513b0dec66223ad90d2e9e9d7dad3d1cbc489d8409a448f5101+grid-charge-0.5kw"
-        ),
         "battery_control_grid_charge_enabled": True,
         "battery_control_supported_directions": ["FALLBACK", "IDLE", "CHARGE"],
     }
@@ -124,34 +113,11 @@ def _armed_control_kwargs(**overrides: object) -> dict[str, object]:
     return base
 
 
-def test_control_mode_requires_both_gates_and_ack() -> None:
-    from energy_optimizer.config import BATTERY_CONTROL_EXPECTED_ARM_TOKEN
-
+def test_control_mode_requires_enabled_gate() -> None:
     Settings(**_armed_control_kwargs())  # type: ignore[arg-type]
 
     with pytest.raises(ValueError, match="battery_control_enabled"):
         Settings(**_armed_control_kwargs(battery_control_enabled=False))  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="arm_token"):
-        Settings(**_armed_control_kwargs(battery_control_arm_token=""))  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="arm_token"):
-        Settings(
-            **_armed_control_kwargs(battery_control_arm_token="wrong-token")  # type: ignore[arg-type]
-        )
-    with pytest.raises(ValueError, match="number.register|acknowledgement|ack"):
-        Settings(
-            **_armed_control_kwargs(battery_control_number_register_ack_reliable=False)  # type: ignore[arg-type]
-        )
-    with pytest.raises(ValueError, match="evidence|identity|version"):
-        Settings(
-            **_armed_control_kwargs(battery_control_number_register_ack_evidence_id="")  # type: ignore[arg-type]
-        )
-    with pytest.raises(ValueError, match="evidence|identity|reviewed"):
-        Settings(
-            **_armed_control_kwargs(
-                battery_control_number_register_ack_evidence_id="unreviewed-drift"
-            )  # type: ignore[arg-type]
-        )
-    assert BATTERY_CONTROL_EXPECTED_ARM_TOKEN
 
 
 @pytest.mark.parametrize(

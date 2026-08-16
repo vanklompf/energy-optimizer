@@ -17,6 +17,9 @@ from energy_optimizer.store import (
     utcnow,
 )
 
+_WATCHDOG_READY = "binary_sensor.pvopti_battery_control_watchdog_ready"
+_WATCHDOG_ACK = "input_datetime.pvopti_battery_control_last_heartbeat"
+
 
 def _settings(**overrides) -> Settings:
     base = dict(
@@ -45,9 +48,9 @@ def _settings(**overrides) -> Settings:
 
 def test_watchdog_health_requires_ready_signal_and_fresh_ha_ack() -> None:
     now = dt.datetime(2026, 8, 16, 17, 0, tzinfo=dt.UTC)
-    health = HaState("binary_sensor.pvopti_battery_control_watchdog_ready", "on", now, {})
+    health = HaState(_WATCHDOG_READY, "on", now, {})
     # HA input_datetime stores local Europe/Warsaw wall-clock values.
-    ack = HaState("input_datetime.pvopti_battery_control_last_heartbeat", "2026-08-16 19:00:00", now, {})
+    ack = HaState(_WATCHDOG_ACK, "2026-08-16 19:00:00", now, {})
 
     healthy, reason = watchdog_health_from_ha(
         health,
@@ -63,21 +66,25 @@ def test_watchdog_health_requires_ready_signal_and_fresh_ha_ack() -> None:
 
 def test_watchdog_health_fails_closed_for_stale_or_unready_ha_ack() -> None:
     now = dt.datetime(2026, 8, 16, 17, 2, tzinfo=dt.UTC)
-    ready = HaState("binary_sensor.pvopti_battery_control_watchdog_ready", "on", now, {})
-    stale_ack = HaState("input_datetime.pvopti_battery_control_last_heartbeat", "2026-08-16 19:00:00", now, {})
-    not_ready = HaState("binary_sensor.pvopti_battery_control_watchdog_ready", "off", now, {})
-    fresh_ack = HaState("input_datetime.pvopti_battery_control_last_heartbeat", "2026-08-16 19:02:00", now, {})
+    ready = HaState(_WATCHDOG_READY, "on", now, {})
+    stale_ack = HaState(_WATCHDOG_ACK, "2026-08-16 19:00:00", now, {})
+    not_ready = HaState(_WATCHDOG_READY, "off", now, {})
+    fresh_ack = HaState(_WATCHDOG_ACK, "2026-08-16 19:02:00", now, {})
 
-    assert watchdog_health_from_ha(ready, stale_ack, now=now, timezone="Europe/Warsaw", expiry_seconds=60) == (False, "watchdog_ack_stale")
-    assert watchdog_health_from_ha(not_ready, fresh_ack, now=now, timezone="Europe/Warsaw", expiry_seconds=60) == (False, "watchdog_not_ready")
+    assert watchdog_health_from_ha(
+        ready, stale_ack, now=now, timezone="Europe/Warsaw", expiry_seconds=60
+    ) == (False, "watchdog_ack_stale")
+    assert watchdog_health_from_ha(
+        not_ready, fresh_ack, now=now, timezone="Europe/Warsaw", expiry_seconds=60
+    ) == (False, "watchdog_not_ready")
 
 
 async def test_service_watchdog_health_requires_independent_ha_ready_and_ack(monkeypatch) -> None:
     settings = _settings().model_copy(
         update={
             "ha_token": "token",
-            "battery_control_watchdog_health_entity": "binary_sensor.pvopti_battery_control_watchdog_ready",
-            "battery_control_watchdog_ack_entity": "input_datetime.pvopti_battery_control_last_heartbeat",
+            "battery_control_watchdog_health_entity": _WATCHDOG_READY,
+            "battery_control_watchdog_ack_entity": _WATCHDOG_ACK,
         }
     )
     store = Store(":memory:")
@@ -101,21 +108,27 @@ async def test_service_watchdog_health_requires_independent_ha_ready_and_ack(mon
                 settings.battery_control_watchdog_ack_entity,
             ]
             return {
-                settings.battery_control_watchdog_health_entity: HaState(entity_ids[0], "on", now, {}),
-                settings.battery_control_watchdog_ack_entity: HaState(entity_ids[1], "2026-08-16 19:00:00", now, {}),
+                settings.battery_control_watchdog_health_entity: HaState(
+                    entity_ids[0], "on", now, {}
+                ),
+                settings.battery_control_watchdog_ack_entity: HaState(
+                    entity_ids[1], "2026-08-16 19:00:00", now, {}
+                ),
             }
 
-    monkeypatch.setattr("energy_optimizer.service.HaClient", FakeHa)
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", FakeHa)
 
     assert await service._watchdog_health(now) == (True, "ok")
 
 
-async def test_service_watchdog_health_fails_closed_when_ha_read_is_unavailable(monkeypatch) -> None:
+async def test_service_watchdog_health_fails_closed_when_ha_read_is_unavailable(
+    monkeypatch,
+) -> None:
     settings = _settings().model_copy(
         update={
             "ha_token": "token",
-            "battery_control_watchdog_health_entity": "binary_sensor.pvopti_battery_control_watchdog_ready",
-            "battery_control_watchdog_ack_entity": "input_datetime.pvopti_battery_control_last_heartbeat",
+            "battery_control_watchdog_health_entity": _WATCHDOG_READY,
+            "battery_control_watchdog_ack_entity": _WATCHDOG_ACK,
         }
     )
     store = Store(":memory:")
@@ -135,7 +148,7 @@ async def test_service_watchdog_health_fails_closed_when_ha_read_is_unavailable(
         async def get_states(self, entity_ids):
             raise HaError("HA unavailable")
 
-    monkeypatch.setattr("energy_optimizer.service.HaClient", FailingHa)
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", FailingHa)
 
     assert await service._watchdog_health(dt.datetime(2026, 8, 16, 17, 0, tzinfo=dt.UTC)) == (
         False,
@@ -177,7 +190,7 @@ async def test_control_battery_shadow_records_real_intent_without_ha(monkeypatch
         def __init__(self, *args, **kwargs) -> None:
             ha_calls.append("init")
 
-    monkeypatch.setattr("energy_optimizer.service.HaClient", BoomHa)
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", BoomHa)
 
     result = await service.control_battery(now=now)
     assert result["result"] == "shadow"
@@ -210,7 +223,7 @@ async def test_control_battery_shadow_without_plan_still_skips_ha(monkeypatch) -
         def __init__(self, *args, **kwargs) -> None:
             ha_calls.append("init")
 
-    monkeypatch.setattr("energy_optimizer.service.HaClient", BoomHa)
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", BoomHa)
 
     result = await service.control_battery()
     assert result["result"] == "shadow"
@@ -230,7 +243,6 @@ async def test_control_battery_stale_plan_falls_back_without_ha(monkeypatch) -> 
     data.update(
         mode="control",
         battery_control_enabled=True,
-        battery_control_number_register_ack_reliable=True,
         ha_token="token",
     )
     settings = Settings.model_construct(**data)
@@ -270,7 +282,7 @@ async def test_control_battery_stale_plan_falls_back_without_ha(monkeypatch) -> 
                 )
             )
 
-    monkeypatch.setattr("energy_optimizer.service.HaClient", FakeHa)
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", FakeHa)
     monkeypatch.setattr(
         "energy_optimizer.sigenergy_control.SigenergyController", FakeController
     )
@@ -386,7 +398,7 @@ async def test_reconcile_startup_falls_back_when_remote_ems_on(monkeypatch) -> N
         async def get_state(self, entity_id):
             return HaState(entity_id, "on", utcnow(), {})
 
-    monkeypatch.setattr("energy_optimizer.service.HaClient", FakeHa)
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", FakeHa)
 
     async def _recorded_fallback(reason, command_id=None):
         return {"result": "fallback_recorded", "reason": reason, "command_id": "fb"}
@@ -424,7 +436,7 @@ async def test_reconcile_startup_falls_back_when_ha_read_fails(monkeypatch) -> N
         async def get_state(self, entity_id: str):
             raise HaError(f"cannot read {entity_id}")
 
-    monkeypatch.setattr("energy_optimizer.service.HaClient", FailingHa)
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", FailingHa)
 
     async def fallback(reason: str, command_id=None):
         return {"result": "fallback_recorded", "reason": reason, "command_id": command_id}
@@ -473,8 +485,10 @@ async def test_fallback_battery_locks_out_when_ha_is_reachable_but_restore_is_un
                 )
             )
 
-    monkeypatch.setattr("energy_optimizer.service.HaClient", ReachableHa)
-    monkeypatch.setattr("energy_optimizer.sigenergy_control.SigenergyController", UnverifiedController)
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", ReachableHa)
+    monkeypatch.setattr(
+        "energy_optimizer.sigenergy_control.SigenergyController", UnverifiedController
+    )
 
     result = await service.fallback_battery("unit_test_unverified")
 
@@ -506,7 +520,7 @@ async def test_fallback_battery_records_lockout_when_ha_is_unreachable(monkeypat
         async def __aexit__(self, *args) -> None:
             return None
 
-    monkeypatch.setattr("energy_optimizer.service.HaClient", FailingHa)
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", FailingHa)
 
     result = await service.fallback_battery("watchdog_ha_error")
 
@@ -530,7 +544,6 @@ async def test_path_loss_reconciliation_retries_safe_fallback_once_when_ha_retur
     data.update(
         mode="control",
         battery_control_enabled=True,
-        battery_control_arm_token="pvopti-battery-control-armed",
         ha_token="token",
     )
     settings = Settings.model_construct(**data)
@@ -581,13 +594,12 @@ async def test_path_loss_reconciliation_retries_safe_fallback_once_when_ha_retur
 async def test_expired_path_loss_recovery_uses_only_off_local_fallback_actions(
     monkeypatch,
 ) -> None:
-    """Reconnect recovery must not let an expired lockout resume the current plan."""
+    """Reconnect recovery must not resume the current plan during the backoff."""
     now = dt.datetime(2026, 8, 8, 12, 7, tzinfo=dt.UTC)
     data = _settings().model_dump()
     data.update(
         mode="control",
         battery_control_enabled=True,
-        battery_control_arm_token="pvopti-battery-control-armed",
         ha_token="token",
     )
     settings = Settings.model_construct(**data)
@@ -619,8 +631,8 @@ async def test_expired_path_loss_recovery_uses_only_off_local_fallback_actions(
                 key="current",
                 state="LOCKOUT",
                 lockout_reason="fallback_ha_unreachable",
-                # Deliberately expired: path-loss reasons must remain latched.
-                lockout_until=now - dt.timedelta(seconds=1),
+                # Active backoff: OFF-only restore, no economic actuation.
+                lockout_until=now + dt.timedelta(hours=1),
             )
         )
 
@@ -698,13 +710,13 @@ async def test_expired_path_loss_recovery_uses_only_off_local_fallback_actions(
                 )
             )
 
-    monkeypatch.setattr("energy_optimizer.service.HaClient", FakeHa)
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", FakeHa)
     monkeypatch.setattr(
         "energy_optimizer.sigenergy_control.SigenergyController", FallbackOnlyController
     )
 
     recovered = await service.control_battery(now=now)
-    later = await service.control_battery(now=now + dt.timedelta(days=1))
+    later = await service.control_battery(now=now + dt.timedelta(minutes=1))
 
     assert recovered["result"] == "reconnect_restore_verified"
     assert later["result"] == "lockout"
@@ -766,13 +778,12 @@ async def test_expired_path_loss_recovery_uses_only_off_local_fallback_actions(
 async def test_unverified_path_loss_recovery_is_attempted_once_and_stays_locked(
     monkeypatch,
 ) -> None:
-    """An unverified reconnect fallback never clears the path-loss lockout."""
+    """An unverified reconnect fallback does not retry during the remaining backoff."""
     now = dt.datetime(2026, 8, 8, 12, 7, tzinfo=dt.UTC)
     data = _settings().model_dump()
     data.update(
         mode="control",
         battery_control_enabled=True,
-        battery_control_arm_token="pvopti-battery-control-armed",
         ha_token="token",
     )
     settings = Settings.model_construct(**data)
@@ -785,7 +796,7 @@ async def test_unverified_path_loss_recovery_is_attempted_once_and_stays_locked(
                 key="current",
                 state="LOCKOUT",
                 lockout_reason="fallback_ha_unreachable",
-                lockout_until=now - dt.timedelta(seconds=1),
+                lockout_until=now + dt.timedelta(hours=1),
             )
         )
 
@@ -798,7 +809,7 @@ async def test_unverified_path_loss_recovery_is_attempted_once_and_stays_locked(
     monkeypatch.setattr(service, "fallback_battery", unverified_fallback)
 
     first = await service.control_battery(now=now)
-    repeated = await service.control_battery(now=now + dt.timedelta(days=1))
+    repeated = await service.control_battery(now=now + dt.timedelta(minutes=1))
 
     assert first["result"] == "reconnect_restore_unverified"
     assert repeated["result"] == "lockout"
@@ -813,13 +824,12 @@ async def test_unverified_path_loss_recovery_is_attempted_once_and_stays_locked(
 async def test_unreachable_path_loss_recovery_is_attempted_once_and_stays_locked(
     monkeypatch,
 ) -> None:
-    """A failed reconnect cannot retry indefinitely after its original timeout expires."""
+    """A failed reconnect cannot retry indefinitely during the backoff."""
     now = dt.datetime(2026, 8, 8, 12, 7, tzinfo=dt.UTC)
     data = _settings().model_dump()
     data.update(
         mode="control",
         battery_control_enabled=True,
-        battery_control_arm_token="pvopti-battery-control-armed",
         ha_token="token",
     )
     settings = Settings.model_construct(**data)
@@ -832,7 +842,7 @@ async def test_unreachable_path_loss_recovery_is_attempted_once_and_stays_locked
                 key="current",
                 state="LOCKOUT",
                 lockout_reason="fallback_ha_unreachable",
-                lockout_until=now - dt.timedelta(seconds=1),
+                lockout_until=now + dt.timedelta(hours=1),
             )
         )
 
@@ -848,10 +858,10 @@ async def test_unreachable_path_loss_recovery_is_attempted_once_and_stays_locked
         async def __aexit__(self, *args) -> None:
             return None
 
-    monkeypatch.setattr("energy_optimizer.service.HaClient", UnreachableHa)
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", UnreachableHa)
 
     first = await service.control_battery(now=now)
-    repeated = await service.control_battery(now=now + dt.timedelta(days=1))
+    repeated = await service.control_battery(now=now + dt.timedelta(minutes=1))
 
     assert first["result"] == "reconnect_restore_unverified"
     assert repeated["result"] == "lockout"

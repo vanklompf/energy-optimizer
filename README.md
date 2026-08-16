@@ -85,16 +85,12 @@ Stationary battery control defaults to non-actuating: `EO_MODE=dry_run` and
 `EO_BATTERY_CONTROL_ENABLED=false`. Live actuation needs `EO_MODE=control` and
 `EO_BATTERY_CONTROL_ENABLED=true`, plus the direction flags for the behaviors you want
 (`EO_BATTERY_CONTROL_GRID_CHARGE_ENABLED`, `EO_BATTERY_CONTROL_AUTHORIZE_DISCHARGE`,
-`EO_BATTERY_EXPORT_ENABLED` / `EO_BATTERY_CONTROL_AUTHORIZE_EXPORT`), and valid
-entity/limit/timing config. The planner flags `EO_ALLOW_GRID_CHARGING` /
-`EO_ALLOW_BATTERY_EXPORT` only affect what the plan may recommend; they do not by
-themselves actuate the inverter. See the [roadmap](./docs/ROADMAP.md) for the go-live
-path and the [Sigenergy control contract](./docs/sigenergy-control-contract.md) before
-enabling control.
-
-> Note: the current build additionally requires an arm token and number-register
-> acknowledgement evidence to enter `control` mode. The [roadmap](./docs/ROADMAP.md)
-> Stage 0 removes those in favor of the simple `EO_MODE` + enable-flag gating above.
+`EO_BATTERY_EXPORT_ENABLED`), and valid entity/limit/timing config. The planner flags
+`EO_ALLOW_GRID_CHARGING` / `EO_ALLOW_BATTERY_EXPORT` only affect what the plan may
+recommend; they do not by themselves actuate the inverter. Compose reads `EO_MODE`
+from `.env` and defaults to `dry_run`. See the [roadmap](./docs/ROADMAP.md) for the
+go-live path and the [Sigenergy control contract](./docs/sigenergy-control-contract.md)
+before enabling control.
 
 ## Deployment
 

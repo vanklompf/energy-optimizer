@@ -22,6 +22,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
+from .reports import generate_recent_daily_reports
 from .service import Service
 
 logger = logging.getLogger(__name__)
@@ -171,6 +172,16 @@ def build_scheduler(service: Service) -> AsyncIOScheduler:
         max_instances=1,
         coalesce=True,
     )
-    # Daily report placeholder job runs at 00:15 local; report generation is Phase 4.
-    scheduler.add_job(_optimise, CronTrigger(hour=0, minute=15), id="daily_report", max_instances=1)
+    async def _daily_report() -> None:
+        try:
+            generate_recent_daily_reports(service.store, service.settings)
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("daily report job failed")
+
+    scheduler.add_job(
+        _daily_report,
+        CronTrigger(hour=0, minute=15),
+        id="daily_report",
+        max_instances=1,
+    )
     return scheduler

@@ -6,23 +6,24 @@ import pytest
 from sqlalchemy import select
 
 from energy_optimizer.config import Settings
-from energy_optimizer.ev import EvRequirements
-from energy_optimizer.ev_control import EvControlDecision
+from energy_optimizer.ev import EvRequirements, apply_ev_shortfall_warning
+from energy_optimizer.ev_control import (
+    EvControlDecision,
+    apply_ev_relay_decision,
+    ev_fault_status,
+    ev_live_state,
+    relay_failure_backoff_decision,
+)
 from energy_optimizer.ha_client import HaState
+from energy_optimizer.planning import (
+    has_complete_telemetry_coverage,
+    hourly_from_map,
+    regular_state_samples,
+    soc_pct_or_reserve,
+)
 from energy_optimizer.pstryk_client import MeterFrame
 from energy_optimizer.safety import SafetyReport, Status
-from energy_optimizer.service import (
-    Service,
-    _apply_ev_relay_decision,
-    _apply_ev_shortfall_warning,
-    _ev_fault_status,
-    _ev_live_state,
-    _has_complete_telemetry_coverage,
-    _hourly_from_map,
-    _regular_state_samples,
-    _relay_failure_backoff_decision,
-    _soc_pct_or_reserve,
-)
+from energy_optimizer.service import Service
 from energy_optimizer.store import (
     EvControlStatus,
     EvPlanStep,
@@ -42,8 +43,8 @@ async def _no_sleep(_seconds: float) -> None:
 
 
 def test_zero_soc_is_not_replaced_by_the_operating_reserve() -> None:
-    assert _soc_pct_or_reserve(0.0, 15.0) == 0.0
-    assert _soc_pct_or_reserve(None, 15.0) == 15.0
+    assert soc_pct_or_reserve(0.0, 15.0) == 0.0
+    assert soc_pct_or_reserve(None, 15.0) == 15.0
 
 
 def test_telemetry_coverage_requires_every_hour_in_the_bootstrap_window() -> None:
@@ -68,14 +69,14 @@ def test_telemetry_coverage_requires_every_hour_in_the_bootstrap_window() -> Non
                 )
             )
     with store.session() as session:
-        assert _has_complete_telemetry_coverage(session, start, end) is True
+        assert has_complete_telemetry_coverage(session, start, end) is True
 
     # A 20-minute hole makes the affected hour unsuitable for settlement reconciliation.
     with store.session() as session:
         for minute in (35, 40, 45):
             session.query(Telemetry).filter_by(ts=start + dt.timedelta(minutes=minute)).delete()
     with store.session() as session:
-        assert _has_complete_telemetry_coverage(session, start, end) is False
+        assert has_complete_telemetry_coverage(session, start, end) is False
 
 
 def _settings() -> Settings:
@@ -115,7 +116,7 @@ def test_departure_shortfall_is_exposed_as_low_confidence_warning() -> None:
         target_shortfall_slots=7,
     )
 
-    _apply_ev_shortfall_warning(report, requirements, step_minutes=15)
+    apply_ev_shortfall_warning(report, requirements, step_minutes=15)
 
     assert report.status == Status.LOW_CONFIDENCE
     assert report.warnings == [
@@ -126,7 +127,7 @@ def test_departure_shortfall_is_exposed_as_low_confidence_warning() -> None:
 
 def test_stale_ev_telemetry_makes_relay_state_unknown() -> None:
     now = utcnow()
-    live = _ev_live_state(
+    live = ev_live_state(
         EvTelemetry(
             ts=now - dt.timedelta(minutes=11),
             soc_pct=40,
@@ -327,7 +328,7 @@ def test_hourly_from_map_sums_substeps_into_hours() -> None:
         base + dt.timedelta(minutes=45): 0.25,
         base + dt.timedelta(hours=1): 1.0,
     }
-    hourly = _hourly_from_map(values)
+    hourly = hourly_from_map(values)
     assert hourly[base] == 1.0
     assert hourly[base + dt.timedelta(hours=1)] == 1.0
 
@@ -343,7 +344,7 @@ def test_regular_state_samples_holds_recorder_values_at_five_minute_steps() -> N
             attributes={},
         )
 
-    samples = _regular_state_samples(
+    samples = regular_state_samples(
         [state(0, "2.0"), state(30, "4.0"), state(45, "unknown")],
         hour,
         hour + dt.timedelta(hours=1),
@@ -359,9 +360,9 @@ def test_ev_fault_status_fails_closed_for_unavailable_protection_sensor() -> Non
     off = HaState("binary_sensor.guard", "off", now, {})
     unavailable = HaState("binary_sensor.guard", "unavailable", now, {})
 
-    assert _ev_fault_status([off, off]) == (False, False)
-    assert _ev_fault_status([off, unavailable]) == (True, True)
-    assert _ev_fault_status([off, None]) == (True, True)
+    assert ev_fault_status([off, off]) == (False, False)
+    assert ev_fault_status([off, unavailable]) == (True, True)
+    assert ev_fault_status([off, None]) == (True, True)
 
 
 async def test_collect_ev_telemetry_persists_vehicle_and_charger_state(monkeypatch) -> None:
@@ -756,7 +757,7 @@ async def test_relay_waits_for_settle_period_then_polls_until_confirmation(monke
     monkeypatch.setattr("energy_optimizer.service.asyncio.sleep", fake_sleep)
     decision = EvControlDecision(True, "turn_on", "forecast-backed opportunistic charging")
 
-    result = await _apply_ev_relay_decision(
+    result = await apply_ev_relay_decision(
         FakeHaClient(),
         "switch.garage",
         decision,
@@ -786,7 +787,7 @@ def test_confirmed_fallback_off_suppresses_relay_retry_during_backoff() -> None:
     )
     candidate = EvControlDecision(True, "turn_on", "optimiser selected current charging slot")
 
-    decision = _relay_failure_backoff_decision(candidate, previous, now, 30)
+    decision = relay_failure_backoff_decision(candidate, previous, now, 30)
 
     assert decision.desired_on is False
     assert decision.action == "none"
@@ -806,7 +807,7 @@ def test_unconfirmed_fallback_keeps_requesting_fail_safe_off_during_backoff() ->
     )
     candidate = EvControlDecision(True, "turn_on", "optimiser selected current charging slot")
 
-    decision = _relay_failure_backoff_decision(candidate, previous, now, 30)
+    decision = relay_failure_backoff_decision(candidate, previous, now, 30)
 
     assert decision.desired_on is False
     assert decision.action == "turn_off"

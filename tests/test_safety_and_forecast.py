@@ -111,7 +111,6 @@ def _authorized_control_inputs(now: dt.datetime, **overrides: object) -> SafetyI
         soc_update_age_seconds=20.0,
         soc_at_boundary=False,
         corroborating_power_fresh=True,
-        number_register_ack_reliable=True,
         battery_control_enabled=True,
         mode_is_control=True,
         economic_action=True,
@@ -125,7 +124,6 @@ def _authorized_control_inputs(now: dt.datetime, **overrides: object) -> SafetyI
     [
         ("mode_is_control", False, "mode_not_control"),
         ("battery_control_enabled", False, "battery_control_disabled"),
-        ("number_register_ack_reliable", False, "number_register_ack_unreliable"),
         ("lease_held", False, "lease_not_held"),
         ("watchdog_healthy", False, "watchdog_unhealthy"),
         ("manual_override_active", True, "manual_override_active"),
@@ -156,7 +154,7 @@ def test_control_authorized_when_all_gates_pass() -> None:
     assert report.status == Status.OK
     assert report.control_authorized is True
     assert report.control_blockers == []
-    assert report.control_enabled is False  # never derived from authorization
+    assert report.control_enabled is True
 
 
 def test_idle_fallback_skips_forecast_confidence() -> None:

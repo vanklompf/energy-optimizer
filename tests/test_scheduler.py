@@ -41,6 +41,19 @@ def test_scheduler_registers_serialized_battery_control_and_heartbeat() -> None:
     assert str(heartbeat.trigger) == "interval[0:00:15]"
 
 
+def test_scheduler_daily_report_is_not_an_optimise_rerun() -> None:
+    settings = Settings(db=":memory:", mqtt_enabled=False)
+    store = Store(":memory:")
+    store.create_all()
+    scheduler = build_scheduler(Service(settings, store))
+
+    job = scheduler.get_job("daily_report")
+    assert job is not None
+    assert "hour='0'" in str(job.trigger)
+    assert "minute='15'" in str(job.trigger)
+    assert job.func is not scheduler.get_job("optimise").func
+
+
 async def test_startup_and_optimise_refresh_ev_before_planning_and_control() -> None:
     calls: list[str] = []
 

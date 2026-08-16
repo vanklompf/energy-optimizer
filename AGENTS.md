@@ -3,7 +3,7 @@
 ## Safety Boundary
 
 - Ordinary development, tests, and CI must be non-actuating. Never use live Home Assistant credentials, contact the live inverter, enable writable entities, deploy infrastructure, arm control, or run commissioning procedures. Use the HA emulator/fakes and dummy credentials.
-- Live stationary-battery control exists despite the README's older "dry-run only" wording. Both Compose files explicitly force `EO_MODE=dry_run`; do not weaken that override. Planner options such as `EO_ALLOW_GRID_CHARGING` and `EO_ALLOW_BATTERY_EXPORT` do not authorize physical control.
+- Live stationary-battery control exists despite the README's older "dry-run only" wording. Compose defaults `EO_MODE` to `dry_run` via `${EO_MODE:-dry_run}` so going live is a config change. Planner options such as `EO_ALLOW_GRID_CHARGING` and `EO_ALLOW_BATTERY_EXPORT` do not authorize physical control.
 - `tools/sigen_raw_diagnostic.py` is an operator commissioning tool that performs real Modbus/HA reads. Do not run it as part of development or verification.
 - Before changing battery-control behavior or configuration gates, read `docs/DESIGN.md`, `docs/ROADMAP.md`, and `docs/sigenergy-control-contract.md`. Older handoff docs (`battery-control-context.md`, `control-runbook.md`, etc.) now live in `docs/archive/` and are historical only.
 

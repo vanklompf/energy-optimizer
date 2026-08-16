@@ -125,7 +125,6 @@ class HaClient:
         client: httpx.AsyncClient | None = None,
         timeout: float = 15.0,
         max_retries: int = 3,
-        number_register_ack_reliable: bool = False,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._token = token
@@ -134,8 +133,6 @@ class HaClient:
         self._verify_ssl = verify_ssl
         self._client = client
         self._owns_client = client is None
-        # Contract: installed HA number entities do not acknowledge register writes.
-        self.number_register_ack_reliable = number_register_ack_reliable
 
     async def __aenter__(self) -> HaClient:
         if self._client is None:
@@ -252,15 +249,6 @@ class HaClient:
     ) -> AckResult:
         """Set a number entity and classify acknowledgement (never trust fallback 0.0 alone)."""
         t0 = time.perf_counter()
-        if not self.number_register_ack_reliable:
-            return AckResult(
-                status=AckStatus.UNACKNOWLEDGED,
-                entity_id=entity_id,
-                requested=value,
-                observed=None,
-                detail="number_register_ack_unreliable",
-                latency_ms=_ms(t0),
-            )
         before = await self.get_state(entity_id)
         if before is None or before.state in _UNAVAILABLE:
             return AckResult(

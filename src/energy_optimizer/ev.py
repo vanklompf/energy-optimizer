@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
 from .config import Settings
+from .safety import SafetyReport, Status
 
 EV_FULL_TARGET_SOC_PCT = 100.0
 
@@ -99,3 +100,18 @@ def build_ev_requirements(
         minimum_shortfall_slots=max(0, minimum_required - available_soon),
         target_shortfall_slots=max(0, target_required - target_slots),
     )
+
+
+def apply_ev_shortfall_warning(
+    report: SafetyReport, requirements: EvRequirements, step_minutes: int
+) -> None:
+    """Expose an infeasible departure target while retaining charge-now fallback slots."""
+    shortfall = requirements.minimum_shortfall_slots
+    if shortfall <= 0:
+        return
+    report.warnings.append(
+        f"EV departure target infeasible by {shortfall} slots "
+        f"({shortfall * step_minutes} minutes); charging every available pre-departure slot"
+    )
+    if report.status == Status.OK:
+        report.status = Status.LOW_CONFIDENCE

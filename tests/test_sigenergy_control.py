@@ -195,17 +195,23 @@ def _controller(ha: FakeHa, physical: FakePhysical, settings: Settings | None = 
     async def _sleep(_s: float) -> None:
         return None
 
+    ticks = {"n": 0.0}
+
+    def monotonic() -> float:
+        ticks["n"] += 1.0
+        return ticks["n"]
+
     return SigenergyController(
         ha,  # type: ignore[arg-type]
         settings or _settings(),
         physical=physical,
         sleep=_sleep,
-        monotonic=lambda: 0.0,
+        monotonic=monotonic,
     )
 
 
 @pytest.mark.asyncio
-async def test_unacknowledged_limit_blocks_before_remote_enable() -> None:
+async def test_unacknowledged_number_readback_does_not_block_remote_enable() -> None:
     settings = _settings()
     ha = FakeHa(
         states={
@@ -223,8 +229,8 @@ async def test_unacknowledged_limit_blocks_before_remote_enable() -> None:
     physical = FakePhysical([_phys(-0.05)])
     controller = _controller(ha, physical, settings)
     result = await controller.apply_intent(_intent())
-    assert result.control.failure_reason == "UNACKNOWLEDGED_LIMIT"
-    assert not any(call[0] == "switch" and call[1] == "turn_on" for call in result.service_calls)
+    assert result.control.failure_reason != "UNACKNOWLEDGED_LIMIT"
+    assert any(call[0] == "number" for call in result.service_calls)
 
 
 @pytest.mark.asyncio
@@ -345,9 +351,9 @@ async def test_fallback_turns_remote_ems_off() -> None:
     result = await controller.fallback("test")
     assert ("switch", "turn_off") in [(d, s) for d, s, _ in result.service_calls]
     assert ha.states[settings.battery_control_remote_ems_switch_entity].state == "off"
-    # Unreliable number ack path cannot claim verified recovery.
-    assert result.control.physical_verified is False
-    assert result.control.observed_state.value == "LOCKOUT"
+    # HA number display defect is not treated as a failed restore.
+    assert result.control.physical_verified is True
+    assert result.control.observed_state.value == "DISARMED"
 
 
 @pytest.mark.asyncio
@@ -612,4 +618,4 @@ async def test_fallback_ignores_cancel_and_still_turns_remote_ems_off() -> None:
     call_kinds = [(domain, service) for domain, service, _ in result.service_calls]
     assert ("switch", "turn_off") in call_kinds
     assert ha.states[settings.battery_control_remote_ems_switch_entity].state == "off"
-    assert result.control.physical_verified is False
+    assert result.control.physical_verified is True

@@ -140,16 +140,6 @@ async def test_call_service_posts_to_home_assistant() -> None:
 
 
 @respx.mock
-async def test_set_number_unacknowledged_when_capability_disabled() -> None:
-    async with HaClient(
-        "http://ha.local:8123", "secret", number_register_ack_reliable=False
-    ) as client:
-        result = await client.set_number("number.sigen_plant_ess_max_charging_limit", 0.5)
-    assert result.status == AckStatus.UNACKNOWLEDGED
-    assert result.detail == "number_register_ack_unreliable"
-
-
-@respx.mock
 async def test_set_number_fallback_zero_after_http_200_is_unacknowledged() -> None:
     entity = "number.sigen_plant_ess_max_charging_limit"
     respx.get(f"http://ha.local:8123/api/states/{entity}").mock(
@@ -177,9 +167,7 @@ async def test_set_number_fallback_zero_after_http_200_is_unacknowledged() -> No
     respx.post("http://ha.local:8123/api/services/number/set_value").mock(
         return_value=httpx.Response(200, json=[])
     )
-    async with HaClient(
-        "http://ha.local:8123", "secret", number_register_ack_reliable=True
-    ) as client:
+    async with HaClient("http://ha.local:8123", "secret") as client:
         result = await client.set_number(entity, 0.5, timeout_s=0.5, poll_interval_s=0.01)
     assert result.status == AckStatus.UNACKNOWLEDGED
     assert result.detail == "fallback_zero_readback"
@@ -216,9 +204,7 @@ async def test_set_number_matching_readback_with_unchanged_timestamp_is_unacknow
         return_value=httpx.Response(200, json=[])
     )
 
-    async with HaClient(
-        "http://ha.local:8123", "secret", number_register_ack_reliable=True
-    ) as client:
+    async with HaClient("http://ha.local:8123", "secret") as client:
         result = await client.set_number(entity, 0.5, timeout_s=0.5, poll_interval_s=0.01)
 
     assert result.status == AckStatus.UNACKNOWLEDGED
@@ -255,9 +241,7 @@ async def test_set_number_unavailable_post_write_readback_times_out_unacknowledg
         return_value=httpx.Response(200, json=[])
     )
 
-    async with HaClient(
-        "http://ha.local:8123", "secret", number_register_ack_reliable=True
-    ) as client:
+    async with HaClient("http://ha.local:8123", "secret") as client:
         result = await client.set_number(entity, 0.5, timeout_s=0.0, poll_interval_s=0.01)
 
     assert result.status == AckStatus.TIMEOUT

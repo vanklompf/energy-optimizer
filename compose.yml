@@ -1,4 +1,4 @@
-# Production-style run (dry_run). This is the primary way to run the app.
+# Production-style run. EO_MODE defaults to dry_run and is overridable from .env.
 #
 #   cp .env.example .env      # then fill in secrets
 #   docker compose up -d --build
@@ -17,7 +17,7 @@ services:
       - path: .env
         required: false
     environment:
-      EO_MODE: dry_run
+      EO_MODE: ${EO_MODE:-dry_run}
       EO_DB: /data/energy_optimizer.sqlite
       EO_HTTP_HOST: 0.0.0.0
       EO_HTTP_PORT: "8320"
