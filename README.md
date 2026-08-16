@@ -1,30 +1,32 @@
 # energy-optimizer
 
-Solar + battery + optional EV/PHEV optimisation for a Sigen system on Pstryk dynamic
-pricing. Sigen control stays **dry-run only** (recommendations via MQTT). An opt-in
-controller can switch a fixed-power charger through Home Assistant with fail-safe OFF
-and anti-cycling delays.
+Single-site home energy manager for a Sigen PV + battery system with optional EV/PHEV
+charging, on the Pstryk dynamic-pricing tariff. A MILP optimiser plans battery
+charge/discharge, grid import/export, and EV charging to minimise the electricity bill.
+
+The full battery-control stack is implemented but **actuation is gated by `EO_MODE`**:
+it defaults to `dry_run` (plan + MQTT recommendations, no inverter writes). Setting
+`EO_MODE=control` actuates the plan through Home Assistant (Sigen Remote EMS), subject
+to a small fail-closed safety layer. EV relay control is a separate opt-in
+(`EO_EV_CONTROL_ENABLED`) with fail-safe OFF and anti-cycling delays.
 
 Settled Pstryk meter values are the sole source for billed import/export, savings,
 backtests, and historical load calibration. PvOpti deliberately does not fall back to
-Sigen grid counters when Pstryk has not settled an interval. Sigen remains in use only
-for live behind-the-meter power, PV, battery, and SoC telemetry needed by the controller.
-Counterfactuals require contiguous hourly settlement and price data plus coverage-checked,
-time-integrated PV and battery telemetry; incomplete hours are reported instead of being
-zero-filled or compressed out of time.
+Sigen grid counters when Pstryk has not settled an interval. Sigen is used only for
+live behind-the-meter power, PV, battery, and SoC telemetry. Counterfactuals require
+contiguous hourly settlement and price data plus coverage-checked, time-integrated
+telemetry; incomplete hours are reported instead of being zero-filled.
 
-See [`DESIGN.md`](./DESIGN.md) for the design. Config reference: [`.env.example`](./.env.example).
+Documentation:
 
-Battery-control implementation handoff:
+- [design](./docs/DESIGN.md) — architecture, data flows, optimiser, safety model
+- [roadmap to production](./docs/ROADMAP.md) — assumptions, simplification plan, staged go-live
+- [verified Sigenergy control contract](./docs/sigenergy-control-contract.md) — empirical inverter/HA behavior
+- [`.env.example`](./.env.example) — configuration reference
+- [`docs/archive/`](./docs/archive/) — superseded plans/designs, kept for history only
 
-- [implementation plan](./docs/plans/2026-08-08_001527-pvopti-actual-energy-control.md)
-- [site and external-system context](./docs/battery-control-context.md)
-- [verified Sigenergy control contract](./docs/sigenergy-control-contract.md)
-- [deployment variable contract](./docs/deployment-variables.md)
-- [watchdog interface](./docs/battery-control-watchdog-interface.md)
-- [live-control operator runbook](./docs/control-runbook.md)
-
-The implementation plan is non-actuating: ordinary coding, tests, and CI must not contact or control the live inverter.
+Ordinary coding, tests, and CI are non-actuating: they must not contact or control the
+live inverter (use the HA emulator/fakes).
 
 ## Docker-first
 
@@ -79,13 +81,20 @@ EV control (`EO_EV_CONTROL_ENABLED`) is off by default. When on, the optimiser g
 slots. Relay OFF for unplugged/unavailable/fault; `EO_EV_CHARGE_TO_100_ENTITY` forces
 immediate full charge when ON.
 
-Stationary battery control defaults to non-actuating: `EO_MODE=dry_run`,
-`EO_BATTERY_CONTROL_ENABLED=false`, empty `EO_BATTERY_CONTROL_ARM_TOKEN`, and
-`EO_BATTERY_EXPORT_ENABLED=false`. `EO_MODE=control` also requires the documented arm
-token, reliable number-register acknowledgement, and the entity/timing validation in
-`.env.example`. Planner flags `EO_ALLOW_GRID_CHARGING` / `EO_ALLOW_BATTERY_EXPORT` do
-not arm physical battery control. See the Sigenergy control contract before changing
-any of these.
+Stationary battery control defaults to non-actuating: `EO_MODE=dry_run` and
+`EO_BATTERY_CONTROL_ENABLED=false`. Live actuation needs `EO_MODE=control` and
+`EO_BATTERY_CONTROL_ENABLED=true`, plus the direction flags for the behaviors you want
+(`EO_BATTERY_CONTROL_GRID_CHARGE_ENABLED`, `EO_BATTERY_CONTROL_AUTHORIZE_DISCHARGE`,
+`EO_BATTERY_EXPORT_ENABLED` / `EO_BATTERY_CONTROL_AUTHORIZE_EXPORT`), and valid
+entity/limit/timing config. The planner flags `EO_ALLOW_GRID_CHARGING` /
+`EO_ALLOW_BATTERY_EXPORT` only affect what the plan may recommend; they do not by
+themselves actuate the inverter. See the [roadmap](./docs/ROADMAP.md) for the go-live
+path and the [Sigenergy control contract](./docs/sigenergy-control-contract.md) before
+enabling control.
+
+> Note: the current build additionally requires an arm token and number-register
+> acknowledgement evidence to enter `control` mode. The [roadmap](./docs/ROADMAP.md)
+> Stage 0 removes those in favor of the simple `EO_MODE` + enable-flag gating above.
 
 ## Deployment
 
