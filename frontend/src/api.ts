@@ -76,10 +76,9 @@ export interface BatteryControlAction {
 export interface BatteryControlStatus {
   mode: string;
   battery_control_enabled: boolean;
-  arm_token_configured: boolean;
-  arm_token_matches: boolean;
   export_enabled: boolean;
-  number_register_ack_reliable: boolean;
+  grid_charge_enabled?: boolean;
+  discharge_enabled?: boolean;
   gates_ok: boolean;
   effective_state: string;
   controller_state: string;
@@ -257,6 +256,20 @@ async function getJSON<T>(url: string): Promise<T> {
   return resp.json() as Promise<T>;
 }
 
+async function postJSON<T>(url: string, body: unknown): Promise<T> {
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (resp.status === 401) redirectToLogin();
+  if (!resp.ok) {
+    const error = (await resp.json().catch(() => ({}))) as { detail?: string };
+    throw new Error(error.detail ?? `${url} -> ${resp.status}`);
+  }
+  return resp.json() as Promise<T>;
+}
+
 export const api = {
   authMe: () => getJSON<AuthMeResponse>("/api/auth/me"),
   status: () => getJSON<StatusResponse>("/api/status"),
@@ -267,6 +280,16 @@ export const api = {
   hourlyComparison: (hours = 48) =>
     getJSON<HourlyComparisonResponse>(`/api/comparison/hourly?hours=${hours}`),
   dailyReports: () => getJSON<{ reports: Record<string, unknown>[] }>("/api/reports/daily"),
+  setActuation: (enabled: boolean) =>
+    postJSON<{ mode: string; battery_control_enabled: boolean; control_enabled: boolean }>(
+      "/api/control/actuation",
+      { enabled },
+    ),
+  clearLockout: () =>
+    postJSON<{ cleared: boolean; state: string; lockout_active: boolean }>(
+      "/api/control/lockout/clear",
+      {},
+    ),
   backtest: async (body: {
     start: string;
     end: string;

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, type AuthMeResponse } from "./api";
+import { usePolling } from "./hooks";
 import NowView from "./views/NowView";
 import SavingsView from "./views/SavingsView";
 
@@ -13,6 +14,9 @@ const TABS: { id: Tab; label: string }[] = [
 export default function App() {
   const [tab, setTab] = useState<Tab>("now");
   const [auth, setAuth] = useState<AuthMeResponse | null>(null);
+  const { data: status } = usePolling(api.status, 15000);
+  const mode = status?.mode ?? "dry_run";
+  const live = Boolean(status?.control_enabled);
 
   useEffect(() => {
     let active = true;
@@ -39,7 +43,7 @@ export default function App() {
         <div className="brand">
           <img src="/favicon.svg" alt="" className="logo" width={24} height={24} />
           <span>Energy Optimizer</span>
-          <span className="badge badge-dryrun">dry_run</span>
+          <span className={`badge ${live ? "badge-ok" : "badge-dryrun"}`}>{mode}</span>
         </div>
         <div className="topbar-right">
           <nav className="tabs">
