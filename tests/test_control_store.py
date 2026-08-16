@@ -5,6 +5,7 @@ import datetime as dt
 import pytest
 
 from energy_optimizer.control_store import (
+    claim_path_loss_recovery,
     clear_lockout,
     finalize_action,
     is_locked_out,
@@ -93,6 +94,18 @@ def test_concurrent_lease_acquisition(store: Store) -> None:
             if try_acquire_lease(session, owner_id=owner, ttl_seconds=60, now=now):
                 winners += 1
     assert winners == 1
+
+
+def test_path_loss_lockout_is_persistent_and_recovery_is_claimed_once(store: Store) -> None:
+    now = dt.datetime(2026, 8, 8, 12, 0, tzinfo=dt.UTC)
+    with store.session() as session:
+        set_lockout(session, reason="fallback_ha_unreachable", duration_seconds=1, now=now)
+        assert is_locked_out(session, now=now + dt.timedelta(days=1)) is True
+        assert claim_path_loss_recovery(session, now=now) is True
+        assert claim_path_loss_recovery(session, now=now) is False
+        assert is_locked_out(session, now=now + dt.timedelta(days=1)) is True
+        clear_lockout(session, now=now)
+        assert is_locked_out(session, now=now) is False
 
 
 def test_lockout_persistence(store: Store) -> None:

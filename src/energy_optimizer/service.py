@@ -363,9 +363,14 @@ class Service:
             return await self.fallback_battery("force_fallback", command_id=command_id)
 
         with self.store.session() as session:
-            if is_locked_out(session, now=now):
+            locked_out = is_locked_out(session, now=now)
+            state = ensure_controller_state(session)
+            path_loss_recovery_needed = (
+                locked_out and state.lockout_reason == "fallback_ha_unreachable"
+            )
+            if locked_out and not path_loss_recovery_needed:
                 return {"result": "lockout", "command_id": command_id}
-            if not try_acquire_lease(
+            if not locked_out and not try_acquire_lease(
                 session,
                 owner_id=self.controller_owner_id,
                 ttl_seconds=s.battery_control_heartbeat_expiry_seconds,
@@ -378,7 +383,9 @@ class Service:
                     now=now,
                 )
                 return {"result": "lease_conflict", "command_id": command_id}
-            ensure_controller_state(session)
+
+        if path_loss_recovery_needed:
+            return await self.reconcile_path_loss_recovery()
 
         shadow = s.mode != "control" or not s.battery_control_enabled
 
@@ -581,7 +588,12 @@ class Service:
                 state.last_fallback_at = utcnow()
                 state.last_fallback_verified = False
                 state.state = "DISARMED"
-            return {"result": "fallback_recorded", "command_id": command_id, "reason": reason}
+            return {
+                "result": "fallback_recorded",
+                "command_id": command_id,
+                "reason": reason,
+                "verified": False,
+            }
 
         try:
             async with HaClient(
@@ -612,7 +624,12 @@ class Service:
                     duration_seconds=s.battery_control_lockout_duration_seconds,
                     now=now,
                 )
-            return {"result": "fallback_unreachable", "command_id": command_id, "reason": reason}
+            return {
+                "result": "fallback_unreachable",
+                "command_id": command_id,
+                "reason": reason,
+                "verified": False,
+            }
 
         with self.store.session() as session:
             finalize_action(
@@ -636,7 +653,46 @@ class Service:
                 if outcome.control.observed_state
                 else "FALLBACK"
             )
-        return {"result": "fallback", "command_id": command_id, "reason": reason}
+        return {
+            "result": "fallback",
+            "command_id": command_id,
+            "reason": reason,
+            "verified": bool(outcome.control.physical_verified),
+        }
+
+    async def reconcile_path_loss_recovery(self) -> dict[str, object]:
+        """Make one OFF-only restore attempt after an HA-path-loss lockout.
+
+        The lockout remains latched even after a verified restore. This never resumes
+        economic control; an operator must explicitly review and re-arm.
+        """
+        from .control_store import claim_path_loss_recovery, ensure_controller_state
+
+        s = self.settings
+        if s.mode != "control" or not s.battery_control_enabled or not s.battery_control_arm_token:
+            return {"result": "reconnect_reconcile_disarmed"}
+
+        with self.store.session() as session:
+            state = ensure_controller_state(session)
+            if state.lockout_reason != "fallback_ha_unreachable":
+                return {"result": "reconnect_reconcile_not_needed"}
+            if not claim_path_loss_recovery(session):
+                return {"result": "reconnect_recovery_already_claimed"}
+
+        result = await self.fallback_battery("reconnect_after_path_loss")
+        verified = bool(result.get("verified"))
+        with self.store.session() as session:
+            state = ensure_controller_state(session)
+            state.state = "LOCKOUT"
+            state.lockout_reason = (
+                "path_recovered_restore_verified"
+                if result.get("result") == "fallback" and verified
+                else "path_loss_recovery_attempted_unverified"
+            )
+            state.updated_at = utcnow()
+            if result.get("result") == "fallback" and verified:
+                return {"result": "reconnect_restore_verified", "fallback": result}
+        return {"result": "reconnect_restore_unverified", "fallback": result}
 
     async def reconcile_battery_on_startup(self) -> dict[str, object]:
         """Never trust persisted desired state; fall back if Remote EMS is unexpectedly on."""

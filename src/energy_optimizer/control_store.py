@@ -7,7 +7,7 @@ import json
 import uuid
 from dataclasses import asdict, is_dataclass
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from .store import ControlAction, ControllerLease, ControllerStateRow, utcnow
@@ -173,9 +173,42 @@ def clear_lockout(session: Session, *, now: dt.datetime | None = None) -> Contro
     return row
 
 
+PATH_LOSS_LOCKOUT_REASONS = frozenset(
+    {
+        "fallback_ha_unreachable",
+        "path_loss_recovery_attempting",
+        "path_loss_recovery_attempted_unverified",
+        "path_recovered_restore_verified",
+    }
+)
+
+
+def claim_path_loss_recovery(
+    session: Session, *, now: dt.datetime | None = None
+) -> bool:
+    """Atomically claim the one OFF-only reconnect recovery attempt."""
+    now = _aware(now or utcnow())
+    result = session.execute(
+        update(ControllerStateRow)
+        .where(
+            ControllerStateRow.key == CONTROLLER_STATE_KEY,
+            ControllerStateRow.lockout_reason == "fallback_ha_unreachable",
+        )
+        .values(
+            state="LOCKOUT",
+            lockout_reason="path_loss_recovery_attempting",
+            updated_at=now,
+        )
+    )
+    session.flush()
+    return result.rowcount == 1
+
+
 def is_locked_out(session: Session, *, now: dt.datetime | None = None) -> bool:
     now = _aware(now or utcnow())
     row = ensure_controller_state(session)
+    if row.lockout_reason in PATH_LOSS_LOCKOUT_REASONS:
+        return True
     return bool(row.lockout_until is not None and _aware(row.lockout_until) > now)
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+from types import SimpleNamespace
 
 from energy_optimizer.config import Settings
 from energy_optimizer.control_store import try_acquire_lease
@@ -369,6 +370,347 @@ async def test_fallback_battery_records_lockout_when_ha_is_unreachable(monkeypat
         assert state is not None
         assert state.state == "LOCKOUT"
         assert state.last_fallback_verified is False
+
+
+async def test_path_loss_reconciliation_retries_safe_fallback_once_when_ha_returns(
+    monkeypatch,
+) -> None:
+    """A path-loss lockout must request one verified safe restore when HA returns."""
+    data = _settings().model_dump()
+    data.update(
+        mode="control",
+        battery_control_enabled=True,
+        battery_control_arm_token="pvopti-battery-control-armed",
+        ha_token="token",
+    )
+    settings = Settings.model_construct(**data)
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+
+    with store.session() as session:
+        state = ControllerStateRow(
+            key="current",
+            state="LOCKOUT",
+            lockout_reason="fallback_ha_unreachable",
+            lockout_until=utcnow() + dt.timedelta(hours=1),
+        )
+        session.add(state)
+
+    calls: list[str] = []
+
+    async def fallback(reason: str, command_id=None):
+        calls.append(reason)
+        with store.session() as session:
+            state = session.get(ControllerStateRow, "current")
+            assert state is not None
+            state.last_fallback_verified = True
+        return {
+            "result": "fallback",
+            "reason": reason,
+            "command_id": command_id,
+            "verified": True,
+        }
+
+    monkeypatch.setattr(service, "fallback_battery", fallback)
+
+    result = await service.reconcile_path_loss_recovery()
+    repeated = await service.reconcile_path_loss_recovery()
+
+    assert result["result"] == "reconnect_restore_verified"
+    assert repeated["result"] == "reconnect_reconcile_not_needed"
+    assert calls == ["reconnect_after_path_loss"]
+    with store.session() as session:
+        state = session.get(ControllerStateRow, "current")
+        assert state is not None
+        assert state.state == "LOCKOUT"
+        assert state.lockout_reason == "path_recovered_restore_verified"
+        assert state.last_fallback_verified is True
+
+
+async def test_expired_path_loss_recovery_uses_only_off_local_fallback_actions(
+    monkeypatch,
+) -> None:
+    """Reconnect recovery must not let an expired lockout resume the current plan."""
+    now = dt.datetime(2026, 8, 8, 12, 7, tzinfo=dt.UTC)
+    data = _settings().model_dump()
+    data.update(
+        mode="control",
+        battery_control_enabled=True,
+        battery_control_arm_token="pvopti-battery-control-armed",
+        ha_token="token",
+    )
+    settings = Settings.model_construct(**data)
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+    with store.session() as session:
+        session.add(
+            Run(
+                run_id="would-actuate-if-unlocked",
+                ts=now,
+                mode="control",
+                horizon_hours=48,
+                known_price_hours=24,
+                status="ok",
+            )
+        )
+        session.add(
+            PlanStep(
+                run_id="would-actuate-if-unlocked",
+                interval_start=now.replace(minute=0),
+                dt_hours=0.25,
+                grid_to_battery_kwh=0.5,
+                grid_to_load_kwh=0.5,
+            )
+        )
+        session.add(
+            ControllerStateRow(
+                key="current",
+                state="LOCKOUT",
+                lockout_reason="fallback_ha_unreachable",
+                # Deliberately expired: path-loss reasons must remain latched.
+                lockout_until=now - dt.timedelta(seconds=1),
+            )
+        )
+
+    actuator_calls: list[tuple[str, str, dict]] = []
+    controller_methods: list[str] = []
+
+    class FakeHa:
+        number_register_ack_reliable = True
+
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def select_option(self, entity_id: str, option: str, **kwargs) -> object:
+            actuator_calls.append(
+                ("select", "select_option", {"entity_id": entity_id, "option": option})
+            )
+            return object()
+
+        async def set_number(self, entity_id: str, value: float, **kwargs) -> object:
+            actuator_calls.append(("number", "set_value", {"entity_id": entity_id, "value": value}))
+            return object()
+
+        async def turn_switch(self, entity_id: str, on: bool, **kwargs) -> object:
+            actuator_calls.append(
+                ("switch", "turn_on" if on else "turn_off", {"entity_id": entity_id})
+            )
+            return object()
+
+    class FallbackOnlyController:
+        def __init__(self, ha, settings) -> None:
+            self.ha = ha
+            self.settings = settings
+
+        async def apply_intent(self, intent):
+            controller_methods.append("apply_intent")
+            raise AssertionError("normal plan actuation must be unreachable during recovery")
+
+        async def fallback(self, reason: str, *, command_id=None):
+            controller_methods.append("fallback")
+            await self.ha.select_option(
+                self.settings.battery_control_mode_select_entity,
+                self.settings.battery_control_fallback_mode,
+            )
+            for entity_id, value in (
+                (
+                    self.settings.battery_control_charge_limit_entity,
+                    self.settings.battery_control_local_charge_limit_kw,
+                ),
+                (
+                    self.settings.battery_control_discharge_limit_entity,
+                    self.settings.battery_control_local_discharge_limit_kw,
+                ),
+                (
+                    self.settings.battery_control_charge_cutoff_entity,
+                    self.settings.battery_control_local_charge_cutoff_pct,
+                ),
+                (
+                    self.settings.battery_control_discharge_cutoff_entity,
+                    self.settings.battery_control_local_discharge_cutoff_pct,
+                ),
+            ):
+                await self.ha.set_number(entity_id, value)
+            await self.ha.turn_switch(self.settings.battery_control_remote_ems_switch_entity, False)
+            return SimpleNamespace(
+                control=SimpleNamespace(
+                    observed_state=SimpleNamespace(value="DISARMED"),
+                    physical_verified=True,
+                    latency_ms=1.0,
+                )
+            )
+
+    monkeypatch.setattr("energy_optimizer.service.HaClient", FakeHa)
+    monkeypatch.setattr(
+        "energy_optimizer.sigenergy_control.SigenergyController", FallbackOnlyController
+    )
+
+    recovered = await service.control_battery(now=now)
+    later = await service.control_battery(now=now + dt.timedelta(days=1))
+
+    assert recovered["result"] == "reconnect_restore_verified"
+    assert later["result"] == "lockout"
+    assert controller_methods == ["fallback"]
+    assert actuator_calls == [
+        (
+            "select",
+            "select_option",
+            {
+                "entity_id": settings.battery_control_mode_select_entity,
+                "option": settings.battery_control_fallback_mode,
+            },
+        ),
+        (
+            "number",
+            "set_value",
+            {
+                "entity_id": settings.battery_control_charge_limit_entity,
+                "value": settings.battery_control_local_charge_limit_kw,
+            },
+        ),
+        (
+            "number",
+            "set_value",
+            {
+                "entity_id": settings.battery_control_discharge_limit_entity,
+                "value": settings.battery_control_local_discharge_limit_kw,
+            },
+        ),
+        (
+            "number",
+            "set_value",
+            {
+                "entity_id": settings.battery_control_charge_cutoff_entity,
+                "value": settings.battery_control_local_charge_cutoff_pct,
+            },
+        ),
+        (
+            "number",
+            "set_value",
+            {
+                "entity_id": settings.battery_control_discharge_cutoff_entity,
+                "value": settings.battery_control_local_discharge_cutoff_pct,
+            },
+        ),
+        (
+            "switch",
+            "turn_off",
+            {"entity_id": settings.battery_control_remote_ems_switch_entity},
+        ),
+    ]
+    assert not any(action == "turn_on" for _, action, _ in actuator_calls)
+    with store.session() as session:
+        state = session.get(ControllerStateRow, "current")
+        assert state is not None
+        assert state.lockout_reason == "path_recovered_restore_verified"
+
+
+async def test_unverified_path_loss_recovery_is_attempted_once_and_stays_locked(
+    monkeypatch,
+) -> None:
+    """An unverified reconnect fallback never clears the path-loss lockout."""
+    now = dt.datetime(2026, 8, 8, 12, 7, tzinfo=dt.UTC)
+    data = _settings().model_dump()
+    data.update(
+        mode="control",
+        battery_control_enabled=True,
+        battery_control_arm_token="pvopti-battery-control-armed",
+        ha_token="token",
+    )
+    settings = Settings.model_construct(**data)
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+    with store.session() as session:
+        session.add(
+            ControllerStateRow(
+                key="current",
+                state="LOCKOUT",
+                lockout_reason="fallback_ha_unreachable",
+                lockout_until=now - dt.timedelta(seconds=1),
+            )
+        )
+
+    fallback_attempts: list[str] = []
+
+    async def unverified_fallback(reason: str, *, command_id=None):
+        fallback_attempts.append(reason)
+        return {"result": "fallback", "reason": reason, "verified": False}
+
+    monkeypatch.setattr(service, "fallback_battery", unverified_fallback)
+
+    first = await service.control_battery(now=now)
+    repeated = await service.control_battery(now=now + dt.timedelta(days=1))
+
+    assert first["result"] == "reconnect_restore_unverified"
+    assert repeated["result"] == "lockout"
+    assert fallback_attempts == ["reconnect_after_path_loss"]
+    with store.session() as session:
+        state = session.get(ControllerStateRow, "current")
+        assert state is not None
+        assert state.state == "LOCKOUT"
+        assert state.lockout_reason == "path_loss_recovery_attempted_unverified"
+
+
+async def test_unreachable_path_loss_recovery_is_attempted_once_and_stays_locked(
+    monkeypatch,
+) -> None:
+    """A failed reconnect cannot retry indefinitely after its original timeout expires."""
+    now = dt.datetime(2026, 8, 8, 12, 7, tzinfo=dt.UTC)
+    data = _settings().model_dump()
+    data.update(
+        mode="control",
+        battery_control_enabled=True,
+        battery_control_arm_token="pvopti-battery-control-armed",
+        ha_token="token",
+    )
+    settings = Settings.model_construct(**data)
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+    with store.session() as session:
+        session.add(
+            ControllerStateRow(
+                key="current",
+                state="LOCKOUT",
+                lockout_reason="fallback_ha_unreachable",
+                lockout_until=now - dt.timedelta(seconds=1),
+            )
+        )
+
+    connection_attempts: list[str] = []
+
+    class UnreachableHa:
+        def __init__(self, *args, **kwargs) -> None:
+            connection_attempts.append("constructed")
+
+        async def __aenter__(self):
+            raise HaError("still unreachable")
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+    monkeypatch.setattr("energy_optimizer.service.HaClient", UnreachableHa)
+
+    first = await service.control_battery(now=now)
+    repeated = await service.control_battery(now=now + dt.timedelta(days=1))
+
+    assert first["result"] == "reconnect_restore_unverified"
+    assert repeated["result"] == "lockout"
+    assert connection_attempts == ["constructed"]
+    with store.session() as session:
+        state = session.get(ControllerStateRow, "current")
+        assert state is not None
+        assert state.state == "LOCKOUT"
+        assert state.lockout_reason == "path_loss_recovery_attempted_unverified"
 
 
 async def test_publish_battery_heartbeat_updates_state() -> None:
