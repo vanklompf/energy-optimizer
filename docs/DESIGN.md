@@ -28,7 +28,7 @@ reference is the empirically verified
 | Battery | Sigen, 18.08 kWh, 8.8 kW charge / 9.6 kW discharge |
 | Inverter/site | Sigen Hybrid 6.0 TP2: import 11 kW, export 6.6 kW, inverter 6.0 kW |
 | Pricing | Pstryk dynamic hourly tariff (day-ahead horizon, asymmetric) |
-| Infra | Home Assistant, Mosquitto (MQTT), optional InfluxDB bootstrap, reverse proxy |
+| Infra | Home Assistant, Mosquitto (MQTT), reverse proxy |
 
 Battery/PV/SoC/power come from Home Assistant (Sigen integration), read-only:
 
@@ -198,6 +198,7 @@ FastAPI serves the SPA and a read-oriented REST API:
 GET  /api/status /api/prices /api/plan /api/runs /api/reports/daily
 GET  /api/savings /api/comparison/hourly
 GET  /api/control/actions /api/control/shadow-observations
+POST /api/control/actuation /api/control/lockout/clear
 POST /api/backtest
 GET  /healthz
 ```

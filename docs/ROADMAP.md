@@ -11,8 +11,10 @@ scripts (now in [`archive/`](./archive/)). Read [`DESIGN.md`](./DESIGN.md) first
 
 - Deployed in `EO_MODE=dry_run`. The optimiser runs and publishes
   recommendations; no inverter writes happen.
-- The full battery-control stack is implemented and tested (~226 tests) but gated
-  off. EV relay control is implemented and opt-in.
+- Stage 0 is implemented: live battery actuation is gated on `mode == "control"`
+  and `battery_control_enabled` only. Lockouts auto-expire after cooldown and can
+  be cleared from the API. Compose reads `EO_MODE` from `.env` (default `dry_run`).
+- EV relay control is implemented and opt-in.
 - Attended 0.5 kW grid-charge was physically characterized (see
   `commissioning/`). Discharge and export have **never** been physically tested
   against this inverter.
@@ -59,9 +61,10 @@ Numbers that justify the Stage 0 passes below:
   `test_sigenergy_control.py` (615) encoding the current gate semantics.
 
 Success criteria for Stage 0 overall: **no module over ~800 lines**, and **every
-`EO_*` setting is read by application code**.
+`EO_*` setting is read by application code**. Stage 0 is done; remaining work is
+attended commissioning (Stage 1).
 
-## Stage 0a — de-gate and delete dead config (next session, after review)
+## Stage 0a — de-gate and delete dead config (done)
 
 Docs-only work is already done. This is the first code change; review as a normal
 PR. Keep the local gate green throughout: `make test`, `make lint`,
@@ -117,7 +120,7 @@ Update surrounding files: `compose.yml` / `compose.dev.yml` to read `EO_MODE`
 from `.env` (default `dry_run`), `.env.example`, `AGENTS.md`, and `README.md`
 (including removing the interim arm-token note) to match the simplified model.
 
-## Stage 0b — de-clutter (behavior-preserving refactor)
+## Stage 0b — de-clutter (done)
 
 Pure refactoring, no behavior change. Can land either before Stage 1 or after
 go-live if you would rather commission first.
@@ -132,7 +135,7 @@ go-live if you would rather commission first.
 - Split [`web/routes.py`](../src/energy_optimizer/web/routes.py) (~988 lines) by
   concern if it stays over the size target.
 
-## Stage 0c — fix known gaps
+## Stage 0c — known gaps (done)
 
 - Daily report job in [`scheduler.py`](../src/energy_optimizer/scheduler.py)
   currently just re-runs `_optimise`; implement a real daily report or remove the
@@ -174,7 +177,4 @@ spread / grid-charge margin thresholds for real-world results.
 
 ## Known-missing functionality (tracked across stages)
 
-- Real daily-report job (Stage 0c).
-- Live-mode badge in the SPA (Stage 0c).
-- Control-mutation API endpoints for enable/disable and lockout-clear (Stage 0c).
 - Physically verified discharge and export (Stage 1).
