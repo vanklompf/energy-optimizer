@@ -18,6 +18,7 @@ from dataclasses import asdict
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, select
+from sqlalchemy.orm import Session
 
 from .config import Settings
 from .ev import (
@@ -890,18 +891,9 @@ class Service:
         start = (now - dt.timedelta(days=days)).replace(minute=0, second=0, microsecond=0)
         completed_end = now.replace(minute=0, second=0, microsecond=0)
         with self.store.session() as session:
-            probe = (
-                session.execute(
-                    select(Telemetry.ts)
-                    .where(Telemetry.ts >= start)
-                    .where(Telemetry.ts < start + dt.timedelta(hours=1))
-                    .limit(4)
-                )
-                .scalars()
-                .all()
-            )
-        if len(probe) >= 4:
-            logger.info("Coverage-capable telemetry history already present; skipping bootstrap")
+            coverage_complete = _has_complete_telemetry_coverage(session, start, completed_end)
+        if coverage_complete:
+            logger.info("Complete telemetry history already present; skipping bootstrap")
             return 0
         entities = {
             "soc_pct": ENTITY_SOC,
@@ -1859,6 +1851,31 @@ def _hourly_from_map(values: dict[dt.datetime, float]) -> dict[dt.datetime, floa
         hour = _aware(ts).replace(minute=0, second=0, microsecond=0)
         out[hour] = out.get(hour, 0.0) + value
     return out
+
+
+def _has_complete_telemetry_coverage(
+    session: Session, start: dt.datetime, end: dt.datetime
+) -> bool:
+    """Whether every completed UTC hour has integrable PV/battery telemetry.
+
+    A few samples at the beginning of a window do not establish a safe financial
+    reconciliation history: one later recorder gap invalidates that hour. Keep the
+    bootstrap read-only but fill any incomplete window on the next restart.
+    """
+    start = _aware(start).replace(minute=0, second=0, microsecond=0)
+    end = _aware(end).replace(minute=0, second=0, microsecond=0)
+    if end <= start:
+        return True
+    rows = session.execute(
+        select(Telemetry).where(Telemetry.ts >= start).where(Telemetry.ts < end)
+    ).scalars().all()
+    covered = complete_hourly_energy(rows)
+    hour = start
+    while hour < end:
+        if hour not in covered:
+            return False
+        hour += dt.timedelta(hours=1)
+    return True
 
 
 def _regular_state_samples(

@@ -17,6 +17,7 @@ from energy_optimizer.service import (
     _apply_ev_shortfall_warning,
     _ev_fault_status,
     _ev_live_state,
+    _has_complete_telemetry_coverage,
     _hourly_from_map,
     _regular_state_samples,
     _relay_failure_backoff_decision,
@@ -43,6 +44,38 @@ async def _no_sleep(_seconds: float) -> None:
 def test_zero_soc_is_not_replaced_by_the_operating_reserve() -> None:
     assert _soc_pct_or_reserve(0.0, 15.0) == 0.0
     assert _soc_pct_or_reserve(None, 15.0) == 15.0
+
+
+def test_telemetry_coverage_requires_every_hour_in_the_bootstrap_window() -> None:
+    store = Store(":memory:")
+    store.create_all()
+    start = dt.datetime(2026, 8, 1, tzinfo=dt.UTC)
+    end = start + dt.timedelta(hours=2)
+
+    with store.session() as session:
+        for minutes in range(0, 120, 5):
+            session.add(
+                Telemetry(
+                    ts=start + dt.timedelta(minutes=minutes),
+                    soc_pct=50.0,
+                    pv_kw=0.5,
+                    load_kw=1.0,
+                    grid_import_kw=0.5,
+                    grid_export_kw=0.0,
+                    batt_charge_kw=0.0,
+                    batt_discharge_kw=0.0,
+                    stale=False,
+                )
+            )
+    with store.session() as session:
+        assert _has_complete_telemetry_coverage(session, start, end) is True
+
+    # A 20-minute hole makes the affected hour unsuitable for settlement reconciliation.
+    with store.session() as session:
+        for minute in (35, 40, 45):
+            session.query(Telemetry).filter_by(ts=start + dt.timedelta(minutes=minute)).delete()
+    with store.session() as session:
+        assert _has_complete_telemetry_coverage(session, start, end) is False
 
 
 def _settings() -> Settings:
