@@ -17,7 +17,8 @@ Record one dated note per checkpoint in this directory. Existing notes
 [export ESS First 0.5 kW](./2026-08-17-attended-export-ess-first-0p5.md),
 [charge 2/4/8.8 kW](./2026-08-17-attended-charge-2-4-8p8.md),
 [charge 4 kW / 1d plateau](./2026-08-18-attended-charge-4-8p8.md),
-[discharge PV First 1.0/1.8 kW](./2026-08-18-attended-discharge-pv-first.md)) are the format
+[discharge PV First 1.0/1.8 kW](./2026-08-18-attended-discharge-pv-first.md),
+[fallback stop/pause while discharging](./2026-08-18-fallback-stop-pause-discharge.md)) are the format
 to follow; a template is at the end of this file.
 
 ## What changed for Stage 1

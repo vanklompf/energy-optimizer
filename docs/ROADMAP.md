@@ -257,11 +257,11 @@ Status: **done** = evidence note exists; **partial** = narrower scope passed;
 | **4** | **Fallback** | partial |
 | 4a | Heartbeat expiry | done — 2026-08-12 (charge only) |
 | 4b | Sigen integration reload | done — [2026-08-14](./commissioning/2026-08-14-sigen-integration-reload-fallback.md) (charge only) |
-| 4c | Process stop (`docker stop`) | open |
-| 4d | Process hang (`docker pause`) | open |
+| 4c | Process stop (`docker stop`) | done — [2026-08-18](./commissioning/2026-08-18-fallback-stop-pause-discharge.md) (discharge only) |
+| 4d | Process hang (`docker pause`) | done — same note (discharge only) |
 | 4e | Home Assistant restart | open |
 | 4f | Modbus / network path loss | open |
-| 4g | Repeat 4a-4f while **discharging**, not just charging | open |
+| 4g | Repeat 4a-4f while **discharging**, not just charging | partial — 4c/4d discharge done (same note); 4a/4b/4e/4f on discharge still open |
 
 Sub-test 2a's ceiling is net load, not gross load: with PV producing, commanding
 more than `load - pv` exports and correctly trips `unplanned_export`. Prefer a
