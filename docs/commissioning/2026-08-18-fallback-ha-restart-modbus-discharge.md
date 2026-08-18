@@ -23,11 +23,11 @@ is `dry_run`.
 ## 4e — Home Assistant restart
 
 - **A before:** raw Remote EMS `0`, mode `1`, 8.8/9.6 kW, 100/0%.
-- **B (21:18:34Z):** raw Remote EMS `1`, mode `5`, limits 8.8/1.0 kW,
-  cut-offs 100/2%; request `173f372e-8e14-43fc-ae1b-286844ee27e1`. PvOpti
-  `last_action` reported `blocked watchdog_unhealthy` even though the
-  watchdog later read ready and the inverter was discharging ~1 kW; **raw
-  is the evidence**.
+- **B (21:18:10Z last=`ok` `9c98f38b…`, still live at the 21:18:34Z
+  restart):** raw Remote EMS `1`, mode `5`, limits 8.8/1.0 kW, cut-offs
+  100/2%. The next cycle at 21:18:40Z is `blocked watchdog_unhealthy` /
+  `fallback_unreachable` because HA is down; **raw is the physical
+  evidence**.
 - **Fault:** `docker restart homeassistant` at **21:18:34Z**; container up
   **21:18:44Z**.
 - **During HA down (21:18:56Z):** raw still Remote EMS `1`, mode `5`,
