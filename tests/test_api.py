@@ -119,6 +119,59 @@ def test_control_actions_history_is_read_only(client: TestClient) -> None:
     assert client.post("/api/control/lockout/clear").status_code == 200
 
 
+def test_disabling_actuation_fallbacks_before_disarming(client: TestClient) -> None:
+    settings = client.app.state.settings
+    settings.mode = "control"
+    settings.battery_control_enabled = True
+    seen: list[tuple[str, bool]] = []
+
+    async def fake_fallback(reason: str, *, command_id: str | None = None) -> dict:
+        seen.append((reason, settings.battery_control_enabled))
+        return {"result": "fallback", "verified": True, "command_id": command_id or ""}
+
+    client.app.state.service.fallback_battery = fake_fallback  # type: ignore[method-assign]
+    resp = client.post("/api/control/actuation", json={"enabled": False})
+    assert resp.status_code == 200
+    assert seen == [("actuation_disabled", True)]
+    assert settings.battery_control_enabled is False
+    assert resp.json()["control_enabled"] is False
+
+
+def test_manual_charge_endpoint_arms_bounded_request(client: TestClient) -> None:
+    settings = client.app.state.settings
+
+    # Refused while the grid-charge gate is closed.
+    refused = client.post("/api/control/manual-charge", json={"target_kw": 2.0})
+    assert refused.status_code == 400
+    assert "grid_charge_enabled" in refused.json()["detail"]
+
+    settings.battery_control_grid_charge_enabled = True
+    armed = client.post(
+        "/api/control/manual-charge", json={"target_kw": 2.0, "duration_seconds": 600}
+    )
+    assert armed.status_code == 200
+    manual = armed.json()["manual_charge"]
+    assert manual["target_kw"] == 2.0
+    assert manual["seconds_remaining"] <= 600
+
+    status = client.get("/api/status").json()["battery_control"]["manual_charge"]
+    assert status["request_id"] == manual["request_id"]
+
+    assert client.request("DELETE", "/api/control/manual-charge").status_code == 200
+    assert client.get("/api/status").json()["battery_control"]["manual_charge"] is None
+
+
+def test_manual_charge_rejects_target_above_configured_cap(client: TestClient) -> None:
+    settings = client.app.state.settings
+    settings.battery_control_grid_charge_enabled = True
+
+    resp = client.post("/api/control/manual-charge", json={"target_kw": 9.0})
+
+    assert resp.status_code == 400
+    assert "max_charge_kw" in resp.json()["detail"]
+    assert client.get("/api/status").json()["battery_control"]["manual_charge"] is None
+
+
 def test_status_exposes_latest_pstryk_billing_interval(client: TestClient) -> None:
     store = client.app.state.store
     start = dt.datetime.now(tz=dt.UTC).replace(minute=0, second=0, microsecond=0) - dt.timedelta(

@@ -135,6 +135,11 @@ async def _battery_control_status(request: Request, now: dt.datetime) -> dict:
 
     watchdog_healthy, watchdog_reason = await service._watchdog_health(now)
 
+    manual_charge = None
+    manual_charge_status = getattr(service, "manual_charge_status", None)
+    if callable(manual_charge_status):
+        manual_charge = manual_charge_status(now)
+
     return {
         "mode": settings.mode,
         "battery_control_enabled": settings.battery_control_enabled,
@@ -155,6 +160,7 @@ async def _battery_control_status(request: Request, now: dt.datetime) -> dict:
         "heartbeat_age_seconds": heartbeat_age,
         "heartbeat_expiry_seconds": settings.battery_control_heartbeat_expiry_seconds,
         "current_intent": intent,
+        "manual_charge": manual_charge,
         "last_action": _control_action_dict(last_action),
         "last_verified_action": _control_action_dict(last_verified),
         "last_fallback_at": (
@@ -267,9 +273,16 @@ async def set_actuation(request: Request, body: ActuationRequest) -> dict:
     """Enable or disable battery actuation for this process (env still wins on restart)."""
     settings = _settings(request)
     service = request.app.state.service
-    settings.battery_control_enabled = body.enabled
     if not body.enabled:
-        await service.fallback_battery("actuation_disabled")
+        service.clear_manual_charge()
+        # Fallback must run while actuation is still live; otherwise
+        # fallback_battery records DISARMED and never writes the inverter.
+        try:
+            await service.fallback_battery("actuation_disabled")
+        finally:
+            settings.battery_control_enabled = False
+    else:
+        settings.battery_control_enabled = True
     return {
         "mode": settings.mode,
         "battery_control_enabled": settings.battery_control_enabled,
@@ -277,9 +290,46 @@ async def set_actuation(request: Request, body: ActuationRequest) -> dict:
     }
 
 
+class ManualChargeBody(BaseModel):
+    target_kw: float
+    duration_seconds: float | None = None
+
+
+@router.post("/control/manual-charge")
+def arm_manual_charge(request: Request, body: ManualChargeBody) -> dict:
+    """Arm one attended grid-charge command (ROADMAP Stage 1 sub-tests 1b-1d).
+
+    The request expires on its own and is dropped on restart. Every gate, blocker,
+    ramp limit, and physical verification still applies to the resulting command.
+    """
+    service = request.app.state.service
+    now = dt.datetime.now(tz=dt.UTC)
+    try:
+        service.request_manual_charge(
+            target_kw=body.target_kw,
+            duration_seconds=body.duration_seconds,
+            now=now,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"armed": True, "manual_charge": service.manual_charge_status(now)}
+
+
+@router.delete("/control/manual-charge")
+def clear_manual_charge(request: Request) -> dict:
+    """Drop an armed request; the next control cycle returns to the plan."""
+    service = request.app.state.service
+    service.clear_manual_charge()
+    return {"armed": False, "manual_charge": None}
+
+
 @router.post("/control/lockout/clear")
 def clear_control_lockout(request: Request) -> dict:
-    """Manually clear an auto-recovering control backoff."""
+    """Manually clear an auto-recovering control backoff.
+
+    This only lifts ``lockout_until``. It does not fallback the inverter or
+    rewrite a live ``ACTIVE_CHARGE`` / ``ACTIVE_DISCHARGE`` state to DISARMED.
+    """
     store = _store(request)
     now = dt.datetime.now(tz=dt.UTC)
     with store.session() as session:

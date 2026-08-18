@@ -8,7 +8,9 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 import logging
+import math
 import uuid
+from dataclasses import dataclass
 
 from sqlalchemy import select
 
@@ -21,6 +23,22 @@ from .watchdog import watchdog_health_from_ha
 
 logger = logging.getLogger(__name__)
 
+# Attended commissioning only (ROADMAP Stage 1 sub-tests 1b-1d). The request lives in
+# process memory and expires on its own so a forgotten arm cannot outlive the window or
+# a restart.
+_MANUAL_CHARGE_DEFAULT_DURATION_SECONDS = 300.0
+_MANUAL_CHARGE_MAX_DURATION_SECONDS = 1800.0
+
+
+@dataclass(frozen=True, slots=True)
+class ManualChargeRequest:
+    """One attended grid-charge request the control loop prefers over the plan."""
+
+    request_id: str
+    target_kw: float
+    requested_at: dt.datetime
+    expires_at: dt.datetime
+
 
 class BatteryMixin:
     """Battery actuation loop. Concrete Service supplies settings/store/MQTT."""
@@ -30,6 +48,7 @@ class BatteryMixin:
     controller_owner_id: str
     _battery_control_lock: asyncio.Lock
     _mqtt: MqttPublisher | None
+    _manual_charge: ManualChargeRequest | None
 
     def _latest_soc_with_age(self, now: dt.datetime) -> tuple[float | None, float | None]:
         raise NotImplementedError
@@ -48,6 +67,99 @@ class BatteryMixin:
 
     def _known_price_hours(self, prices: list[Price], now: dt.datetime) -> float:
         raise NotImplementedError
+
+    # --- attended manual grid charge ---------------------------------------
+    def request_manual_charge(
+        self,
+        *,
+        target_kw: float,
+        duration_seconds: float | None = None,
+        now: dt.datetime | None = None,
+    ) -> ManualChargeRequest:
+        """Arm one bounded grid-charge command for an attended commissioning window.
+
+        The planner only chooses grid charging when the price spread justifies it, so
+        sub-tests 1b-1d otherwise cannot be scheduled. This does not bypass any gate:
+        mode, ``battery_control_enabled``, authorization blockers, the ramp limit, and
+        physical verification all still apply.
+        """
+        s = self.settings
+        now = now or utcnow()
+        duration = (
+            _MANUAL_CHARGE_DEFAULT_DURATION_SECONDS
+            if duration_seconds is None
+            else float(duration_seconds)
+        )
+        if not s.battery_control_grid_charge_enabled:
+            # Arming against a closed gate would make every cycle fail the intent and
+            # fall back, so refuse here instead.
+            raise ValueError("battery_control_grid_charge_enabled is false")
+        if target_kw < s.battery_control_deadband_kw:
+            raise ValueError(
+                f"target_kw must be at least the deadband {s.battery_control_deadband_kw} kW"
+            )
+        if target_kw > s.battery_control_max_charge_kw + 1e-9:
+            raise ValueError(
+                f"target_kw exceeds battery_control_max_charge_kw "
+                f"({s.battery_control_max_charge_kw} kW)"
+            )
+        if duration <= 0 or duration > _MANUAL_CHARGE_MAX_DURATION_SECONDS:
+            raise ValueError(
+                f"duration_seconds must be within 0-{_MANUAL_CHARGE_MAX_DURATION_SECONDS:.0f}"
+            )
+
+        request = ManualChargeRequest(
+            request_id=str(uuid.uuid4()),
+            target_kw=float(target_kw),
+            requested_at=now,
+            expires_at=now + dt.timedelta(seconds=duration),
+        )
+        self._manual_charge = request
+        logger.warning(
+            "manual grid-charge armed: %.2f kW until %s (request %s)",
+            request.target_kw,
+            request.expires_at.isoformat(),
+            request.request_id,
+        )
+        return request
+
+    def clear_manual_charge(self) -> None:
+        """Drop any armed request; the next control cycle returns to the plan."""
+        if self._manual_charge is not None:
+            logger.warning("manual grid-charge cleared: %s", self._manual_charge.request_id)
+        self._manual_charge = None
+
+    def active_manual_charge(self, now: dt.datetime) -> ManualChargeRequest | None:
+        request = self._manual_charge
+        if request is None:
+            return None
+        if now >= request.expires_at:
+            logger.info("manual grid-charge expired: %s", request.request_id)
+            self._manual_charge = None
+            return None
+        return request
+
+    def manual_charge_ramp_seconds(self, target_kw: float) -> float:
+        """Cycles the 0.5 kW/step ramp needs to reach the target from a standstill."""
+        s = self.settings
+        if s.battery_control_max_power_step_kw <= 0:
+            return 0.0
+        steps = math.ceil(target_kw / s.battery_control_max_power_step_kw)
+        return max(0, steps - 1) * s.battery_control_cadence_seconds
+
+    def manual_charge_status(self, now: dt.datetime | None = None) -> dict[str, object] | None:
+        now = now or utcnow()
+        request = self.active_manual_charge(now)
+        if request is None:
+            return None
+        return {
+            "request_id": request.request_id,
+            "target_kw": request.target_kw,
+            "requested_at": request.requested_at.isoformat(),
+            "expires_at": request.expires_at.isoformat(),
+            "seconds_remaining": max(0.0, (request.expires_at - now).total_seconds()),
+            "ramp_estimate_seconds": self.manual_charge_ramp_seconds(request.target_kw),
+        }
 
     # --- battery control ---------------------------------------------------
     def build_battery_control_intent(self, now: dt.datetime | None = None):
@@ -79,31 +191,94 @@ class BatteryMixin:
         selected = select_current_interval(
             starts, now=now, step_minutes=s.step_minutes, tz=s.tz
         )
+        manual = self.active_manual_charge(now)
         if selected is None:
-            raise ValueError("no current plan interval")
-        interval_start, interval_end = selected
-        step = next(st for st in steps if _aware(st.interval_start) == interval_start)
-        flows = PlanFlowSnapshot(
-            interval_start=interval_start,
-            dt_hours=step.dt_hours,
-            pv_to_battery_kwh=step.pv_to_battery_kwh,
-            grid_to_battery_kwh=step.grid_to_battery_kwh,
-            battery_to_load_kwh=step.battery_to_load_kwh,
-            battery_to_grid_kwh=step.battery_to_grid_kwh,
-            battery_to_ev_kwh=0.0,
-            grid_import_kwh=step.grid_to_load_kwh + step.grid_to_battery_kwh,
-            grid_export_kwh=step.pv_to_grid_kwh + step.battery_to_grid_kwh,
-            pv_to_grid_kwh=step.pv_to_grid_kwh,
-        )
+            if manual is None:
+                raise ValueError("no current plan interval")
+            # The optimiser often starts at the next 15-minute slot, so there is a
+            # gap with no current plan interval. A manual charge still has to run.
+            from zoneinfo import ZoneInfo
+
+            zone = ZoneInfo(s.tz)
+            local = now.astimezone(zone)
+            minute = (local.minute // s.step_minutes) * s.step_minutes
+            local_start = local.replace(minute=minute, second=0, microsecond=0)
+            interval_start = local_start.astimezone(dt.UTC)
+            interval_end = interval_start + dt.timedelta(minutes=s.step_minutes)
+            dt_hours = s.step_minutes / 60.0
+        else:
+            interval_start, interval_end = selected
+            step = next(st for st in steps if _aware(st.interval_start) == interval_start)
+            dt_hours = step.dt_hours
+        expiry = interval_end
+        reason_codes: tuple[str, ...] = ()
+        if manual is not None:
+            # Reuse the plan-flow translation so the manual intent carries the same gate
+            # check, cut-off, and expected-import bounds the verifier relies on.
+            flows = PlanFlowSnapshot(
+                interval_start=interval_start,
+                dt_hours=dt_hours,
+                pv_to_battery_kwh=0.0,
+                grid_to_battery_kwh=manual.target_kw * dt_hours,
+                battery_to_load_kwh=0.0,
+                battery_to_grid_kwh=0.0,
+                battery_to_ev_kwh=0.0,
+                grid_import_kwh=manual.target_kw * dt_hours,
+                grid_export_kwh=0.0,
+            )
+            expiry = min(interval_end, manual.expires_at)
+            reason_codes = ("manual_grid_charge_test",)
+        else:
+            flows = PlanFlowSnapshot(
+                interval_start=interval_start,
+                dt_hours=step.dt_hours,
+                pv_to_battery_kwh=step.pv_to_battery_kwh,
+                grid_to_battery_kwh=step.grid_to_battery_kwh,
+                battery_to_load_kwh=step.battery_to_load_kwh,
+                battery_to_grid_kwh=step.battery_to_grid_kwh,
+                battery_to_ev_kwh=0.0,
+                grid_import_kwh=step.grid_to_load_kwh + step.grid_to_battery_kwh,
+                grid_export_kwh=step.pv_to_grid_kwh + step.battery_to_grid_kwh,
+                pv_to_grid_kwh=step.pv_to_grid_kwh,
+            )
         intent = intent_from_plan_flows(
             flows,
             settings=s,
             source_run_id=None if run.run_id is None else abs(hash(run.run_id)) % (10**9),
             now=now,
-            expiry=interval_end,
+            expiry=expiry,
+            reason_codes=reason_codes,
         )
         plan_age = max(0.0, (now - _aware(run.ts)).total_seconds())
         return intent, run.run_id, interval_start, plan_age
+
+    def _previous_control_context(self, now: dt.datetime):
+        """Recover the last direction and battery power for reversal and ramp limits.
+
+        A fresh SigenergyController is built every cycle, so its in-process
+        ``_last_direction`` always starts at IDLE and would skip the neutral dwell on
+        charge/discharge reversal. Persisted controller state survives the cycle, and
+        measured battery power is the physically meaningful ramp baseline. Missing or
+        stale telemetry yields 0.0, which clamps the next command to a single step.
+        """
+        from .battery_control import direction_from_controller_state
+        from .control_store import ensure_controller_state
+
+        s = self.settings
+        with self.store.session() as session:
+            state = ensure_controller_state(session)
+            previous_direction = direction_from_controller_state(state.state)
+            tele = session.execute(
+                select(Telemetry).order_by(Telemetry.ts.desc()).limit(1)
+            ).scalar_one_or_none()
+        previous_power_kw = 0.0
+        if tele is not None:
+            age = max(0.0, (now - _aware(tele.ts)).total_seconds())
+            if age <= s.battery_control_max_telemetry_age_seconds:
+                previous_power_kw = abs(
+                    (tele.batt_charge_kw or 0.0) - (tele.batt_discharge_kw or 0.0)
+                )
+        return previous_direction, previous_power_kw
 
     async def control_battery(
         self, now: dt.datetime | None = None, *, force_fallback: bool = False
@@ -115,6 +290,7 @@ class BatteryMixin:
     async def _control_battery_locked(
         self, *, now: dt.datetime | None, force_fallback: bool
     ) -> dict[str, object]:
+        from .battery_control import clamp_intent_power
         from .control_store import (
             ensure_controller_state,
             expire_lockout_if_due,
@@ -192,6 +368,11 @@ class BatteryMixin:
                 }
             reason = f"stale_plan:{exc}"[:60]
             return await self.fallback_battery(reason, command_id=command_id)
+
+        # Ramp-limit before persisting so the audit records what is actually commanded,
+        # and so dry-run previews the same power the live path would write.
+        previous_direction, previous_power_kw = self._previous_control_context(now)
+        intent = clamp_intent_power(intent, settings=s, previous_power_kw=previous_power_kw)
 
         safety, evidence = await self._evaluate_battery_authorization(
             intent,
@@ -281,7 +462,9 @@ class BatteryMixin:
             verify_ssl=s.ha_verify_ssl,
         ) as ha:
             controller = SigenergyController(ha, s)
-            outcome = await controller.apply_intent(intent)
+            outcome = await controller.apply_intent(
+                intent, previous_direction=previous_direction
+            )
 
         with self.store.session() as session:
             finalize_action(
@@ -703,7 +886,8 @@ class BatteryMixin:
             have_pv_forecast=True,  # live control does not re-fetch forecasts here
             have_load_forecast=True,
             known_price_hours=known_hours,
-            horizon_hours=float(s.optimise_horizon_hours),
+            horizon_hours=known_hours,  # control plans only over published prices
+            min_price_hours=s.optimise_min_price_hours,
             mode_is_control=s.mode == "control",
             battery_control_enabled=s.battery_control_enabled,
             lease_held=lease_held,

@@ -4,9 +4,13 @@ import datetime as dt
 import json
 from types import SimpleNamespace
 
+import pytest
+
+from energy_optimizer.battery_control import ControlDirection
 from energy_optimizer.config import Settings
 from energy_optimizer.control_store import try_acquire_lease
 from energy_optimizer.ha_client import HaError, HaState
+from energy_optimizer.safety import SafetyReport, Status
 from energy_optimizer.service import Service, watchdog_health_from_ha
 from energy_optimizer.store import (
     ControlAction,
@@ -14,6 +18,7 @@ from energy_optimizer.store import (
     PlanStep,
     Run,
     Store,
+    Telemetry,
     utcnow,
 )
 
@@ -328,6 +333,124 @@ async def test_control_battery_selects_containing_interval() -> None:
     assert interval_start == current
     assert intent.direction.value == "CHARGE"
     assert plan_age == 0.0
+
+
+def _export_plan_service(settings: Settings, now: dt.datetime, interval_start: dt.datetime):
+    """Service whose only plan step wants export, which the manual request must override."""
+    store = Store(":memory:")
+    store.create_all()
+    with store.session() as session:
+        session.add(
+            Run(
+                run_id="run-export",
+                ts=now,
+                mode="dry_run",
+                horizon_hours=27,
+                known_price_hours=27,
+                status="ok",
+            )
+        )
+        session.add(
+            PlanStep(
+                run_id="run-export",
+                interval_start=interval_start,
+                dt_hours=0.25,
+                battery_to_grid_kwh=1.5,
+                battery_to_load_kwh=0.04,
+            )
+        )
+    return Service(settings, store)
+
+
+async def test_manual_charge_request_overrides_plan_export_interval() -> None:
+    settings = _settings(step_minutes=15, battery_control_grid_charge_enabled=True)
+    now = dt.datetime(2026, 8, 17, 18, 50, tzinfo=dt.UTC)
+    interval_start = dt.datetime(2026, 8, 17, 18, 45, tzinfo=dt.UTC)
+    service = _export_plan_service(settings, now, interval_start)
+
+    service.request_manual_charge(target_kw=2.0, duration_seconds=600, now=now)
+    intent, run_id, selected_start, _ = service.build_battery_control_intent(now)
+
+    assert intent.direction is ControlDirection.CHARGE
+    assert intent.grid_charge is True
+    assert intent.export is False
+    assert intent.requested_power_kw == 2.0
+    assert intent.reason_codes == ("manual_grid_charge_test",)
+    # Verification depends on these bounds, so the manual intent must carry them.
+    assert intent.expected_grid_direction == "import"
+    assert intent.expected_grid_kw_max == settings.battery_control_max_grid_import_kw
+    assert intent.cutoff_soc_pct == settings.battery_control_max_soc_pct
+    assert run_id == "run-export"
+    assert selected_start == interval_start
+
+
+async def test_manual_charge_runs_when_plan_has_no_current_interval() -> None:
+    settings = _settings(step_minutes=15, battery_control_grid_charge_enabled=True)
+    now = dt.datetime(2026, 8, 17, 19, 16, tzinfo=dt.UTC)
+    future = dt.datetime(2026, 8, 17, 19, 30, tzinfo=dt.UTC)
+    service = _export_plan_service(settings, now, future)
+
+    service.request_manual_charge(target_kw=2.0, duration_seconds=600, now=now)
+    intent, _run_id, interval_start, _plan_age = service.build_battery_control_intent(now)
+
+    assert intent.direction is ControlDirection.CHARGE
+    assert intent.grid_charge is True
+    assert intent.requested_power_kw == 2.0
+    assert interval_start == dt.datetime(2026, 8, 17, 19, 15, tzinfo=dt.UTC)
+
+
+async def test_manual_charge_request_expires_back_to_plan_intent() -> None:
+    settings = _settings(step_minutes=15, battery_control_grid_charge_enabled=True)
+    now = dt.datetime(2026, 8, 17, 18, 46, tzinfo=dt.UTC)
+    interval_start = dt.datetime(2026, 8, 17, 18, 45, tzinfo=dt.UTC)
+    service = _export_plan_service(settings, now, interval_start)
+
+    service.request_manual_charge(target_kw=4.0, duration_seconds=60, now=now)
+    assert service.manual_charge_status(now)["target_kw"] == 4.0
+
+    later = now + dt.timedelta(seconds=120)
+    assert service.active_manual_charge(later) is None
+    assert service.manual_charge_status(later) is None
+    # The plan still wants export, which stays refused while the export gate is off.
+    try:
+        service.build_battery_control_intent(later)
+    except ValueError as exc:
+        assert "battery_export_enabled is false" in str(exc)
+    else:  # pragma: no cover - regression guard
+        raise AssertionError("expected the plan export flow to be refused")
+
+
+async def test_manual_charge_request_rejects_unsafe_arguments() -> None:
+    gated = _settings(battery_control_grid_charge_enabled=False)
+    service = Service(gated, Store(":memory:"))
+    now = utcnow()
+
+    # A closed gate would make every cycle fail the intent and fall back.
+    with pytest.raises(ValueError, match="grid_charge_enabled"):
+        service.request_manual_charge(target_kw=2.0, now=now)
+
+    settings = _settings(battery_control_grid_charge_enabled=True)
+    service = Service(settings, Store(":memory:"))
+    with pytest.raises(ValueError, match="deadband"):
+        service.request_manual_charge(target_kw=0.05, now=now)
+    with pytest.raises(ValueError, match="max_charge_kw"):
+        service.request_manual_charge(target_kw=12.0, now=now)
+    with pytest.raises(ValueError, match="duration_seconds"):
+        service.request_manual_charge(target_kw=2.0, duration_seconds=7200, now=now)
+    assert service.manual_charge_status(now) is None
+
+
+async def test_manual_charge_ramp_estimate_matches_step_and_cadence() -> None:
+    settings = _settings(
+        battery_control_grid_charge_enabled=True,
+        battery_control_max_power_step_kw=0.5,
+        battery_control_cadence_seconds=30.0,
+    )
+    service = Service(settings, Store(":memory:"))
+
+    # 8.8 kW needs 18 half-kW steps, so 17 cycles after the first command.
+    assert service.manual_charge_ramp_seconds(8.8) == 510.0
+    assert service.manual_charge_ramp_seconds(0.5) == 0.0
 
 
 async def test_control_battery_lease_conflict_locks_out() -> None:
@@ -672,7 +795,7 @@ async def test_expired_path_loss_recovery_uses_only_off_local_fallback_actions(
             self.ha = ha
             self.settings = settings
 
-        async def apply_intent(self, intent):
+        async def apply_intent(self, intent, **kwargs):
             controller_methods.append("apply_intent")
             raise AssertionError("normal plan actuation must be unreachable during recovery")
 
@@ -883,3 +1006,194 @@ async def test_publish_battery_heartbeat_updates_state() -> None:
         state = session.get(ControllerStateRow, "current")
         assert state is not None
         assert state.last_heartbeat_at is not None
+
+
+def _ramp_service(store: Store, now: dt.datetime, interval: dt.datetime) -> Service:
+    """Seed a plan asking for 4 kW of charge across a 15-minute interval."""
+    service = Service(_settings(), store)
+    with store.session() as session:
+        session.add(
+            Run(
+                run_id="ramp-run",
+                ts=now,
+                mode="dry_run",
+                horizon_hours=48,
+                known_price_hours=24,
+                status="ok",
+            )
+        )
+        session.add(
+            PlanStep(
+                run_id="ramp-run",
+                interval_start=interval,
+                dt_hours=0.25,
+                pv_to_battery_kwh=1.0,
+                grid_to_load_kwh=0.5,
+            )
+        )
+    return service
+
+
+async def test_control_battery_ramp_limits_plan_power_to_one_step(monkeypatch) -> None:
+    """The loop must apply the ramp limit, not command the plan's full power outright."""
+    now = dt.datetime(2026, 8, 8, 12, 7, tzinfo=dt.UTC)
+    store = Store(":memory:")
+    store.create_all()
+    service = _ramp_service(store, now, dt.datetime(2026, 8, 8, 12, 0, tzinfo=dt.UTC))
+
+    class BoomHa:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("shadow mode must not touch Home Assistant")
+
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", BoomHa)
+
+    result = await service.control_battery(now=now)
+
+    step = service.settings.battery_control_max_power_step_kw
+    assert result["result"] == "shadow"
+    assert result["direction"] == "CHARGE"
+    # No measured battery power, so the ramp baseline is 0 and one step is the whole budget.
+    assert result["requested_power_kw"] == step
+    with store.session() as session:
+        action = session.get(ControlAction, result["command_id"])
+        assert action is not None
+        assert json.loads(action.intent_json or "{}")["requested_power_kw"] == step
+
+
+async def test_control_battery_ramp_baseline_follows_measured_battery_power(
+    monkeypatch,
+) -> None:
+    """Ramp headroom grows from what the battery is physically doing."""
+    now = dt.datetime(2026, 8, 8, 12, 7, tzinfo=dt.UTC)
+    store = Store(":memory:")
+    store.create_all()
+    service = _ramp_service(store, now, dt.datetime(2026, 8, 8, 12, 0, tzinfo=dt.UTC))
+    with store.session() as session:
+        session.add(Telemetry(ts=now, soc_pct=50.0, batt_charge_kw=2.0, batt_discharge_kw=0.0))
+
+    class BoomHa:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("shadow mode must not touch Home Assistant")
+
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", BoomHa)
+
+    result = await service.control_battery(now=now)
+
+    assert result["requested_power_kw"] == 2.0 + service.settings.battery_control_max_power_step_kw
+
+
+async def test_control_battery_ramp_baseline_ignores_stale_telemetry(monkeypatch) -> None:
+    """Stale telemetry is not evidence of current power, so the ramp restarts from zero."""
+    now = dt.datetime(2026, 8, 8, 12, 7, tzinfo=dt.UTC)
+    store = Store(":memory:")
+    store.create_all()
+    service = _ramp_service(store, now, dt.datetime(2026, 8, 8, 12, 0, tzinfo=dt.UTC))
+    stale_age = service.settings.battery_control_max_telemetry_age_seconds + 60
+    with store.session() as session:
+        session.add(
+            Telemetry(
+                ts=now - dt.timedelta(seconds=stale_age),
+                soc_pct=50.0,
+                batt_charge_kw=4.0,
+                batt_discharge_kw=0.0,
+            )
+        )
+
+    class BoomHa:
+        def __init__(self, *args, **kwargs) -> None:
+            raise AssertionError("shadow mode must not touch Home Assistant")
+
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", BoomHa)
+
+    result = await service.control_battery(now=now)
+
+    assert result["requested_power_kw"] == service.settings.battery_control_max_power_step_kw
+
+
+async def test_control_battery_forwards_persisted_direction_across_cycles(
+    monkeypatch,
+) -> None:
+    """A controller built fresh each cycle must still see the previous direction.
+
+    Without this, charge -> discharge reversal never triggers the neutral dwell in
+    production even though the reversal logic itself is correct.
+    """
+    now = dt.datetime(2026, 8, 8, 12, 7, tzinfo=dt.UTC)
+    interval = dt.datetime(2026, 8, 8, 12, 0, tzinfo=dt.UTC)
+    data = _settings().model_dump()
+    data.update(
+        mode="control",
+        battery_control_enabled=True,
+        battery_control_authorize_discharge=True,
+        battery_control_supported_directions=["FALLBACK", "IDLE", "CHARGE", "DISCHARGE"],
+        ha_token="token",
+    )
+    settings = Settings.model_construct(**data)
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+    with store.session() as session:
+        session.add(
+            Run(
+                run_id="reversal-run",
+                ts=now,
+                mode="control",
+                horizon_hours=48,
+                known_price_hours=24,
+                status="ok",
+            )
+        )
+        session.add(
+            PlanStep(
+                run_id="reversal-run",
+                interval_start=interval,
+                dt_hours=0.25,
+                battery_to_load_kwh=1.0,
+            )
+        )
+        session.add(ControllerStateRow(key="current", state="ACTIVE_CHARGE"))
+
+    class FakeHa:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+    seen: dict[str, object] = {}
+
+    class RecordingController:
+        def __init__(self, ha, settings) -> None:
+            pass
+
+        async def apply_intent(self, intent, *, previous_direction=None, cancel_event=None):
+            seen["previous_direction"] = previous_direction
+            return SimpleNamespace(
+                lockout=False,
+                control=SimpleNamespace(
+                    observed_state=SimpleNamespace(value="ACTIVE_DISCHARGE"),
+                    physical_verified=True,
+                    failure_reason=None,
+                    latency_ms=1.0,
+                ),
+            )
+
+    async def _authorized(intent, **kwargs):
+        return (
+            SafetyReport(status=Status.OK, control_enabled=True, control_authorized=True),
+            {"would_authorize": True},
+        )
+
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", FakeHa)
+    monkeypatch.setattr(
+        "energy_optimizer.sigenergy_control.SigenergyController", RecordingController
+    )
+    monkeypatch.setattr(service, "_evaluate_battery_authorization", _authorized)
+
+    result = await service.control_battery(now=now)
+
+    assert result["result"] == "ok"
+    assert seen["previous_direction"] == ControlDirection.CHARGE
