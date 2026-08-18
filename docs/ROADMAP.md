@@ -15,9 +15,11 @@ scripts (now in [`archive/`](./archive/)). Read [`DESIGN.md`](./DESIGN.md) first
   and `battery_control_enabled` only. Lockouts auto-expire after cooldown and can
   be cleared from the API. Compose reads `EO_MODE` from `.env` (default `dry_run`).
 - EV relay control is implemented and opt-in.
-- Attended 0.5 kW grid-charge was physically characterized (see
-  `commissioning/`). Discharge and export have **never** been physically tested
-  against this inverter.
+- Attended 0.5–4 kW grid-charge, PV First discharge-to-load, ESS First
+  battery export at night, and several fallback faults are physically
+  characterized (see `commissioning/`). Remaining Stage 1 gaps: 1d full-rate
+  import, 2d PV First vs ESS First with PV present, 3b/3c export step-up and
+  settlement, and charge-side / Modbus-loss fallback.
 
 ## Assumptions (please review)
 
@@ -249,9 +251,9 @@ Status: **done** = evidence note exists; **partial** = narrower scope passed;
 | 2a | Discharge below *net* load (load minus PV), zero export | done — [2026-08-18](./commissioning/2026-08-18-attended-discharge-pv-first.md) (1.0 kW vs ~2 kW load, PV First) |
 | 2b | Discharge at net load | done — same note (1.8 kW vs 1.98 kW load; left 0.18 kW import rather than sitting on the export deadband) |
 | 2c | Discharge cut-off register holds the configured control reserve (`EO_BATTERY_CONTROL_MIN_SOC_PCT`, relaxed to 2% for commissioning), raw read | done — same note (raw 2.0%) |
-| 2d | Compare `Command Discharging (PV First)` vs `(ESS First)` — now pivotal: 3a showed `ESS First` curtails PV rather than exporting, so this comparison must settle whether either mode exports at all | open |
-| **3** | **Grid export** | failed |
-| 3a | ~0.5 kW deliberate export | failed — [2026-08-17](./commissioning/2026-08-17-attended-export-ess-first-0p5.md) (`ESS First` at a 0.5 kW discharge limit curtailed PV to 0 instead of exporting; HA-direct, so PvOpti's control path was untested) |
+| 2d | Compare `Command Discharging (PV First)` vs `(ESS First)` with PV present — 3a night export passed on `ESS First` from battery; the 17 Aug daylight result still shows `ESS First` at a 0.5 kW limit curtailing PV, so this comparison must settle whether a higher limit exports PV surplus | open |
+| **3** | **Grid export** | partial |
+| 3a | ~0.5 kW deliberate export | done — [2026-08-18](./commissioning/2026-08-18-attended-export-ess-first-0p8.md) (PvOpti `EXPORT` 0.8 kW `ESS First` at night, PV 0: battery 0.8 kW, export 0.36–0.39 kW, import 0). Prior [2026-08-17](./commissioning/2026-08-17-attended-export-ess-first-0p5.md) HA-direct 0.5 kW in daylight curtailed PV and does not contradict this. |
 | 3b | Step toward `max_grid_export_kw`, respect site export limit | open |
 | 3c | Reconcile exported energy against Pstryk settled sell data | open |
 | **4** | **Fallback** | partial |
@@ -284,7 +286,9 @@ spread / grid-charge margin thresholds for real-world results.
 
 ## Known-missing functionality (tracked across stages)
 
-- Physically verified discharge and export (Stage 1).
+- ~~Physically verified discharge and export (Stage 1).~~ Discharge-to-load
+  (PV First) and night battery export (ESS First 0.8 kW) are characterized.
+  Daylight PV-surplus export, 3b step-up, and 3c settlement remain.
 - ~~A manual command path for discharge and export.~~ Done:
   `POST /api/control/manual-command` arms a self-expiring `CHARGE`, `DISCHARGE`, or `EXPORT`
   request, so checkpoints 1, 2, and 3 can each be scheduled instead of waiting for the planner
