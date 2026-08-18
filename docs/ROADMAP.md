@@ -245,10 +245,10 @@ Status: **done** = evidence note exists; **partial** = narrower scope passed;
 | 1b | Step to ~2 kW, verify limit tracking and import coverage | done — [2026-08-17/18](./commissioning/2026-08-17-attended-charge-2-4-8p8.md) |
 | 1c | Step to ~4 kW | done — [2026-08-18](./commissioning/2026-08-18-attended-charge-4-8p8.md) |
 | 1d | Step to site cap, verify against `max_grid_import_kw` | partial — same note (last=`ok` through 6.86 kW command; battery plateaued at 6.36 kW / import 6.87 kW, never reached 8.8 kW) |
-| **2** | **Discharge to house loads** | open |
-| 2a | Discharge below *net* load (load minus PV), zero export | open |
-| 2b | Discharge at net load | open |
-| 2c | Discharge cut-off register holds the configured control reserve (`EO_BATTERY_CONTROL_MIN_SOC_PCT`, relaxed to 2% for commissioning), raw read | open |
+| **2** | **Discharge to house loads** | partial |
+| 2a | Discharge below *net* load (load minus PV), zero export | done — [2026-08-18](./commissioning/2026-08-18-attended-discharge-pv-first.md) (1.0 kW vs ~2 kW load, PV First) |
+| 2b | Discharge at net load | done — same note (1.8 kW vs 1.98 kW load; left 0.18 kW import rather than sitting on the export deadband) |
+| 2c | Discharge cut-off register holds the configured control reserve (`EO_BATTERY_CONTROL_MIN_SOC_PCT`, relaxed to 2% for commissioning), raw read | done — same note (raw 2.0%) |
 | 2d | Compare `Command Discharging (PV First)` vs `(ESS First)` — now pivotal: 3a showed `ESS First` curtails PV rather than exporting, so this comparison must settle whether either mode exports at all | open |
 | **3** | **Grid export** | failed |
 | 3a | ~0.5 kW deliberate export | failed — [2026-08-17](./commissioning/2026-08-17-attended-export-ess-first-0p5.md) (`ESS First` at a 0.5 kW discharge limit curtailed PV to 0 instead of exporting; HA-direct, so PvOpti's control path was untested) |
