@@ -51,6 +51,15 @@ SIGENERGY_SELECTABLE_MODES: frozenset[str] = frozenset(
     }
 )
 
+# Command modes that physically discharge the battery. Export and discharge-to-load
+# are the same family of inverter command; only the expected grid flow differs.
+SIGENERGY_DISCHARGE_MODES: frozenset[str] = frozenset(
+    {
+        SIGENERGY_MODE_COMMAND_DISCHARGING_PV_FIRST,
+        SIGENERGY_MODE_COMMAND_DISCHARGING_ESS_FIRST,
+    }
+)
+
 BATTERY_CONTROL_DIRECTIONS: frozenset[str] = frozenset({"FALLBACK", "IDLE", "CHARGE", "DISCHARGE"})
 
 
@@ -131,7 +140,16 @@ class Settings(BaseSettings):
     minimum_export_spread_pln_kwh: float = 0.30
     grid_charge_margin_pln_kwh: float = 0.30
     terminal_soc_salvage_pln_kwh: float = 0.0
+    # Upper bound on the price window fetched for a plan, not the planning horizon
+    # itself. Pstryk is the sole price source and intervals exist only where it has
+    # published, so the effective horizon is its coverage: roughly 10 h just before
+    # the day-ahead publication and up to ~34 h just after. This bound is kept above
+    # that peak so a published price is never discarded.
     optimise_horizon_hours: int = 48
+    # Pstryk's day-ahead cycle always leaves at least this much forward coverage.
+    # Dropping below it means publication or the fetch job is failing, which is a real
+    # plan-quality problem — unlike the horizon simply being shorter in the morning.
+    optimise_min_price_hours: float = Field(default=8.0, ge=0)
     step_minutes: int = 15
 
     # --- EV / PHEV flexible load and Home Assistant relay control ---
@@ -206,6 +224,11 @@ class Settings(BaseSettings):
     battery_control_mode_charge_grid_first: str = SIGENERGY_MODE_COMMAND_CHARGING_GRID_FIRST
     # Active command mode used when charging under Remote EMS.
     battery_control_command_mode: str = SIGENERGY_MODE_COMMAND_CHARGING_GRID_FIRST
+    # Discharging to house load lets PV serve the load first; deliberate export asks the
+    # ESS to back the exported energy. Both remain settings because neither Sigenergy
+    # discharge mode is physically characterized at this site.
+    battery_control_discharge_command_mode: str = SIGENERGY_MODE_COMMAND_DISCHARGING_PV_FIRST
+    battery_control_export_command_mode: str = SIGENERGY_MODE_COMMAND_DISCHARGING_ESS_FIRST
     battery_control_fallback_mode: str = SIGENERGY_MODE_STANDBY
 
     # Explicit local-restore values; never populate from HA number-entity fallback states.
@@ -222,14 +245,18 @@ class Settings(BaseSettings):
     battery_control_min_soc_pct: float = Field(default=15.0, ge=0, le=100)
     battery_control_max_soc_pct: float = Field(default=98.0, ge=0, le=100)
     battery_control_charge_cutoff_margin_pct: float = Field(default=0.5, ge=0, le=100)
+    battery_control_discharge_cutoff_margin_pct: float = Field(default=0.5, ge=0, le=100)
 
     battery_control_cadence_seconds: float = Field(default=30.0, ge=0)
     battery_control_max_plan_age_seconds: float = Field(default=900.0, ge=0)
     battery_control_max_telemetry_age_seconds: float = Field(default=120.0, ge=0)
+    # SoC emits only on a 0.1% change, so it is bounded by age rather than required to
+    # update within a command's verification window.
+    battery_control_max_soc_age_seconds: float = Field(default=300.0, ge=0)
     battery_control_command_poll_seconds: float = Field(default=1.0, ge=0)
     battery_control_command_timeout_seconds: float = Field(default=30.0, ge=0)
     # Contract: physical Standby/command verification deadline is at least 15 seconds.
-    battery_control_physical_verify_timeout_seconds: float = Field(default=15.0, ge=0)
+    battery_control_physical_verify_timeout_seconds: float = Field(default=30.0, ge=0)
     battery_control_heartbeat_interval_seconds: float = Field(default=15.0, ge=0)
     battery_control_heartbeat_expiry_seconds: float = Field(default=60.0, ge=0)
     battery_control_standby_neutral_band_kw: float = Field(default=0.12, ge=0)
@@ -309,11 +336,16 @@ class Settings(BaseSettings):
         return self
 
     def _validate_battery_control_mode_strings(self) -> None:
+        command_fields = {
+            "battery_control_command_mode": self.battery_control_command_mode,
+            "battery_control_discharge_command_mode": self.battery_control_discharge_command_mode,
+            "battery_control_export_command_mode": self.battery_control_export_command_mode,
+        }
         mode_fields = {
             "battery_control_mode_standby": self.battery_control_mode_standby,
             "battery_control_mode_charge_grid_first": self.battery_control_mode_charge_grid_first,
-            "battery_control_command_mode": self.battery_control_command_mode,
             "battery_control_fallback_mode": self.battery_control_fallback_mode,
+            **command_fields,
         }
         for name, value in mode_fields.items():
             if value not in SIGENERGY_KNOWN_MODES:
@@ -322,10 +354,16 @@ class Settings(BaseSettings):
                 raise ValueError(f"{name} must not use Unknown mode option")
             if value not in SIGENERGY_SELECTABLE_MODES:
                 raise ValueError(f"{name} mode option is not selectable by PvOpti: {value!r}")
-        if self.battery_control_command_mode == self.battery_control_fallback_mode:
-            raise ValueError(
-                "battery_control_command_mode must be distinct from battery_control_fallback_mode"
-            )
+        for name, value in command_fields.items():
+            if value == self.battery_control_fallback_mode:
+                raise ValueError(f"{name} must be distinct from battery_control_fallback_mode")
+        for name in (
+            "battery_control_discharge_command_mode",
+            "battery_control_export_command_mode",
+        ):
+            value = mode_fields[name]
+            if value not in SIGENERGY_DISCHARGE_MODES:
+                raise ValueError(f"{name} must be a Sigenergy discharging mode: {value!r}")
 
     def _validate_battery_control_directions(self) -> None:
         directions = [d.strip().upper() for d in self.battery_control_supported_directions]

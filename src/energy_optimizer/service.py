@@ -83,6 +83,7 @@ class Service(BatteryMixin, PlanningMixin):
         self.ev_charge_to_100_active = False
         self.controller_owner_id = str(uuid.uuid4())
         self._battery_control_lock = asyncio.Lock()
+        self._manual_charge = None
 
     # --- lifecycle ---------------------------------------------------------
     def start_mqtt(self) -> None:
@@ -519,6 +520,9 @@ class Service(BatteryMixin, PlanningMixin):
         )
         have_pv = bool(pv_map)
         have_load = bool(load_map)
+        # Intervals exist only where Pstryk has published, so this is the horizon the
+        # solver actually saw — not the configured fetch bound.
+        effective_horizon_hours = sum(i.dt_hours for i in intervals)
 
         safety = evaluate(
             SafetyInputs(
@@ -528,7 +532,8 @@ class Service(BatteryMixin, PlanningMixin):
                 have_pv_forecast=have_pv,
                 have_load_forecast=have_load,
                 known_price_hours=known_hours,
-                horizon_hours=float(s.optimise_horizon_hours),
+                horizon_hours=effective_horizon_hours,
+                min_price_hours=s.optimise_min_price_hours,
                 mode_is_control=s.mode == "control",
                 battery_control_enabled=s.battery_control_enabled,
                 max_plan_age_seconds=s.battery_control_max_plan_age_seconds,
@@ -599,7 +604,7 @@ class Service(BatteryMixin, PlanningMixin):
                     run_id=run_id,
                     ts=now,
                     mode=s.mode,
-                    horizon_hours=float(s.optimise_horizon_hours),
+                    horizon_hours=effective_horizon_hours,
                     known_price_hours=known_hours,
                     input_state=json.dumps({"soc_pct": soc_start_pct}),
                     solver_input=blob,

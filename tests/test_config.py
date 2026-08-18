@@ -25,6 +25,15 @@ def test_step_hours() -> None:
     assert s.step_hours == 0.25
 
 
+def test_price_window_bound_never_discards_published_prices() -> None:
+    # The bound is a fetch window, not the planning horizon. Pstryk peaks at roughly 34h
+    # of forward coverage just after the day-ahead publication, so the bound must stay
+    # above that or real published prices would be thrown away.
+    s = Settings(db=":memory:")
+    assert s.optimise_horizon_hours >= 36
+    assert 0 < s.optimise_min_price_hours <= 10
+
+
 def test_battery_soc_thresholds_must_be_ordered() -> None:
     with pytest.raises(ValueError, match="hard.*reserve.*maximum"):
         Settings(
@@ -88,6 +97,8 @@ def test_battery_control_defaults_are_non_actuating() -> None:
     assert s.battery_control_mode_select_entity == ("select.sigen_plant_remote_ems_control_mode")
     assert s.battery_control_mode_standby == "Standby"
     assert s.battery_control_mode_charge_grid_first == "Command Charging (Grid First)"
+    assert s.battery_control_discharge_command_mode == "Command Discharging (PV First)"
+    assert s.battery_control_export_command_mode == "Command Discharging (ESS First)"
     assert s.battery_control_fallback_mode == "Standby"
     assert s.battery_control_local_charge_limit_kw == 8.8
     assert s.battery_control_local_discharge_limit_kw == 9.6
@@ -133,6 +144,13 @@ def test_control_mode_requires_enabled_gate() -> None:
         ("battery_control_mode_charge_grid_first", "Not A Real Mode", "mode|option"),
         ("battery_control_fallback_mode", "Unknown", "fallback|Unknown|mode"),
         ("battery_control_command_mode", "Standby", "command.*fallback|distinct|identical"),
+        (
+            "battery_control_discharge_command_mode",
+            "Command Charging (Grid First)",
+            "discharging mode",
+        ),
+        ("battery_control_export_command_mode", "Maximum Self Consumption", "discharging mode"),
+        ("battery_control_discharge_command_mode", "Unknown", "mode|Unknown|option"),
         ("battery_control_max_charge_kw", 0.0, "charge.*kw|positive|non.?positive"),
         ("battery_control_max_discharge_kw", -1.0, "discharge.*kw|positive|non.?positive"),
         ("battery_control_physical_verify_timeout_seconds", 14.9, "15|physical|verify"),

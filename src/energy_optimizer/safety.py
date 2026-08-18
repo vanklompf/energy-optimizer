@@ -27,7 +27,8 @@ class SafetyInputs:
     have_pv_forecast: bool
     have_load_forecast: bool
     known_price_hours: float
-    horizon_hours: float
+    horizon_hours: float  # effective planned coverage; recorded for audit, not a gate
+    min_price_hours: float = 0.0
     # --- live-control inputs (optional; defaults keep planning-only callers working) ---
     plan_status_ok: bool = True
     plan_age_seconds: float | None = None
@@ -92,10 +93,14 @@ def evaluate(inputs: SafetyInputs) -> SafetyReport:
         warnings.append("missing PV forecast; recommendation is low-confidence")
     if not inputs.have_load_forecast:
         warnings.append("missing load forecast; recommendation is low-confidence")
-    if inputs.known_price_hours < inputs.horizon_hours:
+    # Pstryk publishes day-ahead, so forward coverage shrinking through the morning and
+    # jumping again after publication is the normal cycle, not a degraded plan. Only an
+    # abnormally short window indicates a publication or fetch failure. The acting
+    # interval's own price is gated separately in _control_blockers.
+    if inputs.known_price_hours < inputs.min_price_hours:
         warnings.append(
-            f"only {inputs.known_price_hours:.0f}h of real prices; "
-            f"remaining {max(0.0, inputs.horizon_hours - inputs.known_price_hours):.0f}h are padded"
+            f"only {inputs.known_price_hours:.0f}h of Pstryk prices; "
+            f"expected at least {inputs.min_price_hours:.0f}h"
         )
 
     if blockers:

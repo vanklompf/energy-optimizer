@@ -32,7 +32,8 @@ def test_safety_blocks_on_missing_price() -> None:
     assert report.control_authorized is False
 
 
-def test_safety_low_confidence_on_padding() -> None:
+def test_safety_low_confidence_when_price_coverage_is_abnormally_short() -> None:
+    # Below the day-ahead floor means publication or the fetch job is failing.
     report = evaluate(
         SafetyInputs(
             telemetry_stale=False,
@@ -40,12 +41,34 @@ def test_safety_low_confidence_on_padding() -> None:
             have_current_price=True,
             have_pv_forecast=True,
             have_load_forecast=True,
-            known_price_hours=10,
-            horizon_hours=48,
+            known_price_hours=3,
+            horizon_hours=3,
+            min_price_hours=8,
         )
     )
     assert report.status == Status.LOW_CONFIDENCE
+    assert any("Pstryk prices" in w for w in report.warnings)
     assert report.control_authorized is False
+
+
+def test_short_morning_horizon_is_not_a_plan_quality_problem() -> None:
+    # Pstryk publishes day-ahead, so ~11h of forward coverage before the afternoon
+    # publication is the normal cycle. Treating it as low-confidence blocked every
+    # economic command permanently.
+    report = evaluate(
+        SafetyInputs(
+            telemetry_stale=False,
+            telemetry_stale_reasons=[],
+            have_current_price=True,
+            have_pv_forecast=True,
+            have_load_forecast=True,
+            known_price_hours=11,
+            horizon_hours=11,
+            min_price_hours=8,
+        )
+    )
+    assert report.status == Status.OK
+    assert report.warnings == []
 
 
 def test_safety_ok() -> None:

@@ -109,6 +109,57 @@ def test_snapshot_zero_power_sensor_is_not_stale() -> None:
     assert snap.pv_kw == 0.0
 
 
+def test_snapshot_pinned_soc_is_fresh_while_integration_still_reports() -> None:
+    # A full battery pins SoC at 100 and HA stops emitting updates for it. That must not
+    # blind the optimiser while the rest of the Sigen integration is plainly alive.
+    now = dt.datetime(2026, 8, 17, 10, 0, tzinfo=dt.UTC)
+    states = {
+        ENTITY_SOC: _state(ENTITY_SOC, "100.0", 3600, now),
+        ENTITY_BATTERY_POWER: _state(ENTITY_BATTERY_POWER, "-0.7", 30, now),
+        ENTITY_PV_POWER: _state(ENTITY_PV_POWER, "1.4", 30, now),
+        ENTITY_CONSUMED_POWER: _state(ENTITY_CONSUMED_POWER, "2.1", 30, now),
+        ENTITY_GRID_IMPORT_POWER: _state(ENTITY_GRID_IMPORT_POWER, "0.0", 30, now),
+        ENTITY_GRID_EXPORT_POWER: _state(ENTITY_GRID_EXPORT_POWER, "0.0", 30, now),
+        ENTITY_EMS_MODE: _state(ENTITY_EMS_MODE, "Maximum Self Consumption", 3600, now),
+    }
+    snap = build_snapshot(states, now)
+    assert snap.stale is False
+    assert snap.soc_pct == 100.0
+
+
+def test_snapshot_stale_soc_stays_stale_when_whole_integration_is_silent() -> None:
+    # No peer is reporting, so an old SoC really is evidence of a dead feed.
+    now = dt.datetime(2026, 8, 17, 10, 0, tzinfo=dt.UTC)
+    states = {
+        ENTITY_SOC: _state(ENTITY_SOC, "100.0", 3600, now),
+        ENTITY_BATTERY_POWER: _state(ENTITY_BATTERY_POWER, "-0.7", 3600, now),
+        ENTITY_PV_POWER: _state(ENTITY_PV_POWER, "1.4", 3600, now),
+        ENTITY_CONSUMED_POWER: _state(ENTITY_CONSUMED_POWER, "2.1", 3600, now),
+        ENTITY_GRID_IMPORT_POWER: _state(ENTITY_GRID_IMPORT_POWER, "0.5", 3600, now),
+        ENTITY_GRID_EXPORT_POWER: _state(ENTITY_GRID_EXPORT_POWER, "0.3", 3600, now),
+        ENTITY_EMS_MODE: _state(ENTITY_EMS_MODE, "Maximum Self Consumption", 3600, now),
+    }
+    snap = build_snapshot(states, now)
+    assert snap.stale is True
+    assert any("soc" in r for r in snap.stale_reasons)
+
+
+def test_snapshot_unavailable_soc_is_stale_even_with_live_peers() -> None:
+    now = dt.datetime(2026, 8, 17, 10, 0, tzinfo=dt.UTC)
+    states = {
+        ENTITY_SOC: _state(ENTITY_SOC, "unavailable", 10, now),
+        ENTITY_BATTERY_POWER: _state(ENTITY_BATTERY_POWER, "-0.7", 30, now),
+        ENTITY_PV_POWER: _state(ENTITY_PV_POWER, "1.4", 30, now),
+        ENTITY_CONSUMED_POWER: _state(ENTITY_CONSUMED_POWER, "2.1", 30, now),
+        ENTITY_GRID_IMPORT_POWER: _state(ENTITY_GRID_IMPORT_POWER, "0.0", 30, now),
+        ENTITY_GRID_EXPORT_POWER: _state(ENTITY_GRID_EXPORT_POWER, "0.0", 30, now),
+        ENTITY_EMS_MODE: _state(ENTITY_EMS_MODE, "Maximum Self Consumption", 30, now),
+    }
+    snap = build_snapshot(states, now)
+    assert snap.stale is True
+    assert snap.soc_pct is None
+
+
 def test_snapshot_missing_soc_is_stale() -> None:
     now = dt.datetime(2026, 7, 12, 12, 0, tzinfo=dt.UTC)
     states = {

@@ -529,7 +529,7 @@ def build_snapshot(states: dict[str, HaState | None], now: dt.datetime) -> Telem
     charge_kw, discharge_kw = _split_battery_power(batt_kw)
 
     stale_reasons: list[str] = []
-    if _is_stale(soc, now, SOC_STALE_SECONDS):
+    if _is_stale(soc, now, SOC_STALE_SECONDS, peer_fresh=_integration_is_live(states, now)):
         stale_reasons.append("soc telemetry stale (>10min) or missing")
     for name, st in (
         ("battery power", batt),
@@ -565,12 +565,36 @@ def _split_battery_power(batt_kw: float | None) -> tuple[float | None, float | N
     return 0.0, -batt_kw
 
 
+def _integration_is_live(states: dict[str, HaState | None], now: dt.datetime) -> bool:
+    """True when a non-SoC Sigen entity reported recently.
+
+    A full or idle battery pins SoC, so HA stops emitting updates for it. Age alone is
+    then not evidence of a dead feed; another entity from the same integration still
+    moving is. Requiring that proof keeps a genuinely dead SoC feed stale.
+    """
+    for entity_id in (
+        ENTITY_BATTERY_POWER,
+        ENTITY_PV_POWER,
+        ENTITY_CONSUMED_POWER,
+        ENTITY_GRID_IMPORT_POWER,
+        ENTITY_GRID_EXPORT_POWER,
+        ENTITY_EMS_MODE,
+    ):
+        state = states.get(entity_id)
+        if state is None or state.state in _UNAVAILABLE or state.last_updated is None:
+            continue
+        if (now - state.last_updated).total_seconds() <= POWER_STALE_SECONDS:
+            return True
+    return False
+
+
 def _is_stale(
     state: HaState | None,
     now: dt.datetime,
     threshold_s: int,
     *,
     zero_is_fresh: bool = False,
+    peer_fresh: bool = False,
 ) -> bool:
     if state is None or state.state in _UNAVAILABLE:
         return True
@@ -584,7 +608,9 @@ def _is_stale(
     if state.last_updated is None:
         return True
     age = (now - state.last_updated).total_seconds()
-    return age > threshold_s
+    if age <= threshold_s:
+        return False
+    return not peer_fresh
 
 
 def _parse_state(payload: dict[str, Any]) -> HaState:
