@@ -23,7 +23,7 @@ from .battery_control import (
     ControlResult,
     require_neutral_before_reversal,
 )
-from .config import Settings
+from .config import SIGENERGY_DISCHARGE_MODES, Settings
 from .ha_client import (
     ENTITY_BATTERY_POWER,
     ENTITY_GRID_EXPORT_POWER,
@@ -78,7 +78,11 @@ class SigenergyControlResult:
 
 
 class SigenergyController:
-    """Ordered Remote EMS transactions. Discharge/export remain capability-blocked."""
+    """Ordered Remote EMS transactions for charge, discharge, and export.
+
+    Each direction is gated by its own setting and verified against physical telemetry;
+    an unverified command falls back to local control rather than staying committed.
+    """
 
     def __init__(
         self,
@@ -135,6 +139,14 @@ class SigenergyController:
                     t0,
                     lockout=False,
                 )
+            if intent.export and not self._settings.battery_export_enabled:
+                return self._fail(
+                    command_id,
+                    ControllerState.ARMED_IDLE,
+                    "export_not_enabled",
+                    t0,
+                    lockout=False,
+                )
 
         if intent.direction == ControlDirection.CHARGE and intent.grid_charge:
             if intent.grid_charge and not self._settings.battery_control_grid_charge_enabled:
@@ -144,6 +156,16 @@ class SigenergyController:
                     "grid_charge_not_enabled",
                     t0,
                 )
+
+        if (
+            intent.direction in {ControlDirection.CHARGE, ControlDirection.DISCHARGE}
+            and intent.requested_power_kw < self._settings.battery_control_deadband_kw
+        ):
+            # Writing a 0.0 power limit physically disables local charge/discharge
+            # (see docs/sigenergy-control-contract.md), so never command one.
+            return self._fail(
+                command_id, ControllerState.ARMED_IDLE, "commanded_power_below_deadband", t0
+            )
 
         physical = await self._read_physical()
         if physical.battery_power_kw is None:
@@ -206,21 +228,41 @@ class SigenergyController:
                     command_id, "standby_after_enable_failed", t0, cancel_event
                 )
 
-        if not await self._wait_neutral(cancel_event=cancel_event):
-            return await self._failure_fallback(
-                command_id, "standby_physical_timeout", t0, cancel_event
-            )
+        # First enable and charge↔discharge reversals must pass through Standby
+        # idle. A same-direction ramp while Remote EMS is already on must not:
+        # waiting for |P|≤0.12 kW aborts a live 0.8–2 kW charge every 30 s
+        # (observed 2026-08-18 1c).
+        continuing_same_direction = (
+            remote.state == "on"
+            and prev == intent.direction
+            and intent.direction
+            in {ControlDirection.CHARGE, ControlDirection.DISCHARGE}
+        )
+        if not continuing_same_direction:
+            if not await self._wait_neutral(cancel_event=cancel_event):
+                return await self._failure_fallback(
+                    command_id, "standby_physical_timeout", t0, cancel_event
+                )
 
-        if intent.direction != ControlDirection.CHARGE:
-            return self._fail(
-                command_id,
-                ControllerState.ARMED_IDLE,
-                "command_mode_not_characterized",
-                t0,
+        if intent.direction == ControlDirection.CHARGE:
+            return await self._command_charge(
+                intent, command_id, t0, cancel_event=cancel_event
             )
+        if intent.direction == ControlDirection.DISCHARGE:
+            return await self._command_discharge(
+                intent, command_id, t0, cancel_event=cancel_event
+            )
+        return self._fail(command_id, ControllerState.ARMED_IDLE, "unsupported_direction", t0)
 
+    async def _command_charge(
+        self,
+        intent: BatteryControlIntent,
+        command_id: str,
+        t0: float,
+        *,
+        cancel_event: asyncio.Event | None,
+    ) -> SigenergyControlResult:
         mode = self._settings.battery_control_command_mode
-        # Only the characterized charge path may proceed.
         if mode != self._settings.battery_control_mode_charge_grid_first:
             return self._fail(
                 command_id, ControllerState.ARMED_IDLE, "command_mode_not_characterized", t0
@@ -263,11 +305,83 @@ class SigenergyController:
 
         self._consecutive_failures = 0
         self._last_direction = ControlDirection.CHARGE
+        return self._commanded(command_id, ControllerState.ACTIVE_CHARGE, mode, t0)
+
+    async def _command_discharge(
+        self,
+        intent: BatteryControlIntent,
+        command_id: str,
+        t0: float,
+        *,
+        cancel_event: asyncio.Event | None,
+    ) -> SigenergyControlResult:
+        s = self._settings
+        mode = (
+            s.battery_control_export_command_mode
+            if intent.export
+            else s.battery_control_discharge_command_mode
+        )
+        if mode not in SIGENERGY_DISCHARGE_MODES:
+            return self._fail(command_id, ControllerState.ARMED_IDLE, "discharge_mode_invalid", t0)
+
+        # Give the inverter the operating reserve as a hard floor as well. Cut-off
+        # enforcement is uncharacterized here, so physical verification below still
+        # rejects samples that cross it.
+        soc_floor_pct = max(intent.cutoff_soc_pct, s.battery_control_min_soc_pct)
+        cutoff_ack = await self._tracked_number(
+            s.battery_control_discharge_cutoff_entity,
+            soc_floor_pct,
+            cancel_event=cancel_event,
+        )
+        if cutoff_ack.status not in _NUMBER_WRITE_SENT:
+            return await self._failure_fallback(
+                command_id, "discharge_cutoff_unacknowledged", t0, cancel_event
+            )
+
+        discharge_limit = min(intent.requested_power_kw, s.battery_control_max_discharge_kw)
+        limit_ack = await self._tracked_number(
+            s.battery_control_discharge_limit_entity,
+            discharge_limit,
+            cancel_event=cancel_event,
+        )
+        if limit_ack.status not in _NUMBER_WRITE_SENT:
+            return await self._failure_fallback(
+                command_id, "discharge_limit_unacknowledged", t0, cancel_event
+            )
+
+        selected = await self._tracked_select(self.mode_select, mode, cancel_event=cancel_event)
+        if selected.status not in {AckStatus.ACKNOWLEDGED, AckStatus.IDEMPOTENT_NOOP}:
+            return await self._failure_fallback(
+                command_id, "command_mode_unacknowledged", t0, cancel_event
+            )
+
+        command_started = dt.datetime.now(tz=dt.UTC)
+        verified, verify_reason = await self._verify_discharge_command(
+            intent,
+            min_kw=max(0.1, discharge_limit * 0.5),
+            commanded_mode=mode,
+            commanded_discharge_limit_kw=discharge_limit,
+            soc_floor_pct=soc_floor_pct,
+            command_started_at=command_started,
+            cancel_event=cancel_event,
+        )
+        if not verified:
+            return await self._failure_fallback(
+                command_id, verify_reason or "no_physical_discharge_response", t0, cancel_event
+            )
+
+        self._consecutive_failures = 0
+        self._last_direction = ControlDirection.DISCHARGE
+        return self._commanded(command_id, ControllerState.ACTIVE_DISCHARGE, mode, t0)
+
+    def _commanded(
+        self, command_id: str, state: ControllerState, mode: str, t0: float
+    ) -> SigenergyControlResult:
         return SigenergyControlResult(
             control=ControlResult(
                 command_id=command_id,
-                requested_state=ControllerState.ACTIVE_CHARGE,
-                observed_state=ControllerState.ACTIVE_CHARGE,
+                requested_state=state,
+                observed_state=state,
                 entity_readback={self.mode_select: mode},
                 physical_verified=True,
                 retries=0,
@@ -502,7 +616,17 @@ class SigenergyController:
                 await self._sleep(0.2)
                 continue
             physical = await self._read_physical()
-            if physical.battery_power_kw is not None and abs(physical.battery_power_kw) <= band:
+            # Local Maximum Self Consumption is not idle: overnight the battery covers
+            # house load (~0.3-0.5 kW here), which is above the Standby deadband. That is
+            # restored local behaviour. Continued grid-import charging is not.
+            charging = (
+                physical.battery_power_kw is not None
+                and physical.battery_power_kw > band
+            )
+            importing = (
+                physical.grid_import_kw is not None and physical.grid_import_kw > band
+            )
+            if physical.battery_power_kw is not None and not (charging and importing):
                 good += 1
                 if good >= _STABLE_GOOD_SAMPLES:
                     return True
@@ -569,16 +693,9 @@ class SigenergyController:
         if physical.ems_mode is None:
             return "ems_mode_missing"
 
-        for label, updated in (
-            ("battery_power", physical.battery_power_updated_at),
-            ("grid_import", physical.grid_import_updated_at),
-            ("grid_export", physical.grid_export_updated_at),
-            ("soc", physical.soc_updated_at),
-        ):
-            if updated is None:
-                return f"stale_timestamp_missing:{label}"
-            if updated < command_started_at:
-                return f"stale_pre_command:{label}"
+        stale = self._reject_stale_sample(physical, command_started_at)
+        if stale is not None:
+            return stale
 
         if physical.ems_mode != commanded_mode:
             return "wrong_ems_mode"
@@ -616,6 +733,159 @@ class SigenergyController:
             and abs(physical.charge_limit_kw - commanded_charge_limit_kw) > 0.05
         ):
             return "charge_limit_mismatch"
+        return None
+
+    async def _verify_discharge_command(
+        self,
+        intent: BatteryControlIntent,
+        *,
+        min_kw: float,
+        commanded_mode: str,
+        commanded_discharge_limit_kw: float,
+        soc_floor_pct: float,
+        command_started_at: dt.datetime,
+        cancel_event: asyncio.Event | None,
+    ) -> tuple[bool, str | None]:
+        timeout = self._settings.battery_control_physical_verify_timeout_seconds
+        deadline = self._monotonic() + timeout
+        good = 0
+        last_reason: str | None = "no_physical_discharge_response"
+        while self._monotonic() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                return False, "cancelled"
+            physical = await self._read_physical()
+            reason = self._reject_discharge_sample(
+                physical,
+                intent,
+                min_kw=min_kw,
+                commanded_mode=commanded_mode,
+                commanded_discharge_limit_kw=commanded_discharge_limit_kw,
+                soc_floor_pct=soc_floor_pct,
+                command_started_at=command_started_at,
+            )
+            if reason is None:
+                good += 1
+                if good >= _STABLE_GOOD_SAMPLES:
+                    return True, None
+            else:
+                good = 0
+                last_reason = reason
+            await self._sleep(0.2)
+        return False, last_reason
+
+    def _reject_discharge_sample(
+        self,
+        physical: PhysicalSnapshot,
+        intent: BatteryControlIntent,
+        *,
+        min_kw: float,
+        commanded_mode: str,
+        commanded_discharge_limit_kw: float,
+        soc_floor_pct: float,
+        command_started_at: dt.datetime,
+    ) -> str | None:
+        s = self._settings
+        deadband = s.battery_control_deadband_kw
+
+        if physical.battery_power_kw is None:
+            return "battery_power_missing"
+        if physical.grid_import_kw is None or physical.grid_export_kw is None:
+            return "grid_power_missing"
+        if physical.soc_pct is None:
+            return "soc_missing"
+        if physical.ems_mode is None:
+            return "ems_mode_missing"
+
+        stale = self._reject_stale_sample(physical, command_started_at)
+        if stale is not None:
+            return stale
+
+        if physical.ems_mode != commanded_mode:
+            return "wrong_ems_mode"
+        # Sigenergy reports battery power negative while discharging.
+        if -physical.battery_power_kw < min_kw:
+            return "battery_discharge_below_min"
+        if physical.soc_pct <= soc_floor_pct + s.battery_control_discharge_cutoff_margin_pct:
+            return "soc_floor_breached"
+
+        if intent.export:
+            if physical.grid_export_kw < deadband:
+                return "expected_export_missing"
+            if (
+                intent.expected_grid_kw_min is not None
+                and physical.grid_export_kw + 1e-9 < intent.expected_grid_kw_min
+            ):
+                return "grid_export_below_expected"
+            if (
+                intent.expected_grid_kw_max is not None
+                and physical.grid_export_kw - 1e-9 > intent.expected_grid_kw_max
+            ):
+                return "grid_export_above_expected"
+            if physical.grid_import_kw > deadband:
+                return "export_with_import_contradiction"
+        elif physical.grid_export_kw > deadband:
+            return "unplanned_export"
+
+        if physical.grid_export_kw > s.battery_control_max_grid_export_kw + 1e-9:
+            return "site_export_exceeded"
+        if physical.grid_import_kw > s.battery_control_max_grid_import_kw + 1e-9:
+            return "site_import_exceeded"
+        # Ignore HA displayed 0.0 (known number-register defect); a real non-zero
+        # mismatch still fails closed.
+        if (
+            physical.discharge_limit_kw is not None
+            and abs(physical.discharge_limit_kw) > 0.05
+            and abs(physical.discharge_limit_kw - commanded_discharge_limit_kw) > 0.05
+        ):
+            return "discharge_limit_mismatch"
+        return None
+
+    def _reject_stale_sample(
+        self, physical: PhysicalSnapshot, command_started_at: dt.datetime
+    ) -> str | None:
+        deadband = self._settings.battery_control_deadband_kw
+        # HA last_updated can precede command_started by a few hundred ms (observed
+        # 2026-08-17 1b: charge held at 0.813 kW with last_updated 2 ms earlier). A
+        # true pre-command sample is older than this skew.
+        skew = dt.timedelta(seconds=2.0)
+        for label, updated in (
+            ("battery_power", physical.battery_power_updated_at),
+            ("grid_import", physical.grid_import_updated_at),
+            ("grid_export", physical.grid_export_updated_at),
+        ):
+            if updated is None:
+                return f"stale_timestamp_missing:{label}"
+            if updated < command_started_at - skew:
+                # Grid export (and import) sit at 0.000 for long stretches and HA does
+                # not emit. Requiring a post-command tick then rejects a passing charge
+                # whose export stayed 0 — observed 2026-08-17 1b. A pinned *zero* on the
+                # unused grid direction is evidence, not staleness. Battery power and the
+                # expected grid direction still have to move.
+                if (
+                    label == "grid_export"
+                    and physical.grid_export_kw is not None
+                    and physical.grid_export_kw <= deadband
+                ):
+                    continue
+                if (
+                    label == "grid_import"
+                    and physical.grid_import_kw is not None
+                    and physical.grid_import_kw <= deadband
+                ):
+                    continue
+                return f"stale_pre_command:{label}"
+
+        # SoC only emits on a 0.1% change, which is far slower than the verification
+        # deadline, so requiring it to tick post-command would reject sound commands. It
+        # guards the discharge floor rather than proving the command took effect, and over
+        # this bound it drifts well inside the cut-off margin.
+        if physical.soc_updated_at is None:
+            return "stale_timestamp_missing:soc"
+        reference = physical.sampled_at or command_started_at
+        if (
+            reference - physical.soc_updated_at
+        ).total_seconds() > self._settings.battery_control_max_soc_age_seconds:
+            return "stale_soc"
         return None
 
     async def _read_physical(self) -> PhysicalSnapshot:

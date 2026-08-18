@@ -11,6 +11,7 @@ from energy_optimizer.battery_control import (
     ControllerState,
     PlanFlowSnapshot,
     clamp_intent_power,
+    direction_from_controller_state,
     intent_from_plan_flows,
     is_allowed_transition,
     require_neutral_before_reversal,
@@ -169,6 +170,20 @@ def test_power_clamped_to_configured_limits_and_ramp() -> None:
     )
     clamped = clamp_intent_power(intent, settings=settings, previous_power_kw=0.0)
     assert clamped.requested_power_kw == pytest.approx(0.5)
+
+
+def test_direction_from_controller_state_treats_only_active_states_as_directional() -> None:
+    assert direction_from_controller_state("ACTIVE_CHARGE") is ControlDirection.CHARGE
+    assert direction_from_controller_state("ACTIVE_DISCHARGE") is ControlDirection.DISCHARGE
+    for neutral in ("ARMED_IDLE", "DISARMED", "FALLBACK", "LOCKOUT", "PREFLIGHT", "", None):
+        assert direction_from_controller_state(neutral) is ControlDirection.IDLE
+
+
+def test_persisted_active_state_round_trips_into_reversal_detection() -> None:
+    """The persisted state string is the only cross-cycle memory of direction."""
+    previous = direction_from_controller_state(ControllerState.ACTIVE_CHARGE.value)
+    assert require_neutral_before_reversal(previous, ControlDirection.DISCHARGE) is True
+    assert require_neutral_before_reversal(previous, ControlDirection.CHARGE) is False
 
 
 def test_expired_or_non_current_interval_rejected() -> None:

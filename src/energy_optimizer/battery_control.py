@@ -157,6 +157,23 @@ def require_neutral_before_reversal(
     return current in active and target in active and current != target
 
 
+_ACTIVE_STATE_DIRECTIONS: dict[str, ControlDirection] = {
+    ControllerState.ACTIVE_CHARGE.value: ControlDirection.CHARGE,
+    ControllerState.ACTIVE_DISCHARGE.value: ControlDirection.DISCHARGE,
+}
+
+
+def direction_from_controller_state(state: str | None) -> ControlDirection:
+    """Recover the last commanded direction from persisted controller state.
+
+    Reversal protection only needs to know whether the battery was last actively
+    charging or discharging, so every other state (including unknown) is neutral.
+    """
+    if state is None:
+        return ControlDirection.IDLE
+    return _ACTIVE_STATE_DIRECTIONS.get(state, ControlDirection.IDLE)
+
+
 def clamp_intent_power(
     intent: BatteryControlIntent,
     *,
