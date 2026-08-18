@@ -150,16 +150,113 @@ go-live if you would rather commission first.
 
 Requires access to the live Home Assistant / Sigen instance (offered by the
 operator). For each direction, issue an app-driven command and confirm read-back
-plus physical response, then record a short note in `commissioning/`:
+plus physical response, then record a short note in
+[`commissioning/`](./commissioning/).
 
-- Full-rate grid-import charge.
-- Discharge to house loads.
-- Grid export.
-- Fallback: kill the app / drop HA and confirm the inverter returns to local
-  self-consumption (watchdog path).
+Discharge and export are new territory (never physically tested), so treat those
+as the real checkpoints. Step-by-step procedure, preconditions, pass criteria, and
+the abort path are in [`commissioning/README.md`](./commissioning/README.md).
 
-Discharge and export are new territory (never physically tested), so treat these
-as the real checkpoints.
+The code prerequisite is done: `sigenergy_control.py` no longer rejects non-charge
+commands with `command_mode_not_characterized`. It commands discharge and export
+through configurable Sigenergy discharge modes, writes the operating reserve to the
+inverter discharge cut-off register, and verifies each direction against physical
+telemetry (sign-flipped battery power, export bounds, SoC floor) before treating the
+command as applied. Live actuation still needs `EO_MODE=control`,
+`EO_BATTERY_CONTROL_ENABLED`, and the per-direction gate, all of which ship off.
+
+### Prerequisites cleared on 2026-08-17
+
+Three defects made Stage 1 unrunnable. All three are fixed; none of them was a
+missing feature, and each would have silently blocked or failed commissioning.
+
+**`plan_not_ok` blocked every economic command, permanently.** `safety.py` warned
+whenever `known_price_hours < horizon_hours`, any warning forces `LOW_CONFIDENCE`,
+and `_control_blockers` then adds `plan_not_ok` to every economic action. The
+database held zero `ok` runs in its entire history.
+
+The comparison itself was the bug. Pstryk is the only price source, and
+`_build_intervals` creates intervals only where a price row exists, so the effective
+planning horizon has always been Pstryk's published coverage. `optimise_horizon_hours`
+is merely an upper bound on the fetch window. The warning therefore compared real
+coverage against a bound it could only equal in the rare case of a full window —
+firing permanently, for a condition that is just the normal day-ahead cycle: roughly
+10 h of forward coverage before the afternoon publication, up to ~34 h after it.
+
+`safety.py` now warns only when coverage drops below `optimise_min_price_hours`
+(8 h), which the publication cycle never does on its own and which therefore
+indicates a genuine publication or fetch failure. This is safe because the acting
+interval is gated separately and far more sharply, by `current_price_not_real`,
+`current_price_unavailable`, and `current_price_stale`; a distant estimate can never
+authorize a command in the present. The bound is back at 48 h so that no published
+price is discarded, and `Run.horizon_hours` now records the horizon actually planned
+rather than the configured bound.
+
+Note `pad_prices` in `forecast/price.py` is dead code: it is exported and unit-tested
+but never called, so nothing is padded today and the old warning text was misleading
+on that point too. The optimiser already honours `price_is_real` if padding is ever
+wired in — it refuses to let an estimated future justify grid charging now.
+
+**A full battery blinded the optimiser.** HA stops emitting SoC updates when the
+value is pinned, so a battery sitting at 100% tripped the 10-minute SoC staleness
+threshold, and one stale entity flagged the whole snapshot — a hard `blockers`
+entry, status `BLOCKED`, no plan at all. Measured across stored telemetry, 86% of
+samples at exactly 100% SoC were flagged stale versus 7% below it. `_is_stale` now
+accepts a pinned SoC when another Sigen entity reported inside the power-staleness
+window, which proves integration liveness without trusting a genuinely dead feed.
+
+**Command verification demanded a SoC tick it could never get.** Verification
+required every signal, SoC included, to have updated after the command was issued,
+within a 15-second deadline. The Sigen SoC sensor emits only on a 0.1% change —
+roughly every 65 seconds at 1 kW — so the first discharge command would almost
+certainly have been rejected as `stale_pre_command:soc` and fallen back, while the
+inverter was in fact obeying. Fast signals (battery power, grid flows) still must be
+post-command; SoC is now bounded by age instead
+(`battery_control_max_soc_age_seconds`, 300 s), which suits its actual role as a
+discharge-floor guard rather than a response signal.
+
+Checkpoint 1 no longer waits for the planner. `POST /api/control/manual-charge`
+(`{"target_kw": 2.0, "duration_seconds": 600}`) arms one attended grid-charge request
+that the control loop prefers over the plan interval until it expires. It is charge-only,
+capped by `battery_control_max_charge_kw`, limited to 30 minutes, dropped on restart, and
+refused unless `EO_BATTERY_CONTROL_GRID_CHARGE_ENABLED` is on. It changes *what* the loop
+commands, not *whether* it may: gates, authorization blockers, the 0.5 kW/cycle ramp, and
+physical verification all still apply.
+
+### Sub-tests
+
+Status: **done** = evidence note exists; **partial** = narrower scope passed;
+**open** = never physically attempted.
+
+| # | Sub-test | Status |
+|---|---|---|
+| **1** | **Full-rate grid-import charge** | partial |
+| 1a | 0.5 kW `Command Charging (Grid First)`, A/B/A | done — [2026-08-14](./commissioning/2026-08-14-attended-charge-aba.md) |
+| 1b | Step to ~2 kW, verify limit tracking and import coverage | done — [2026-08-17/18](./commissioning/2026-08-17-attended-charge-2-4-8p8.md) |
+| 1c | Step to ~4 kW | failed — same note (sawtooth: Standby-neutral on every ramp cycle) |
+| 1d | Step to site cap, verify against `max_grid_import_kw` | open |
+| **2** | **Discharge to house loads** | open |
+| 2a | Discharge below *net* load (load minus PV), zero export | open |
+| 2b | Discharge at net load | open |
+| 2c | Discharge cut-off register holds the 15% reserve (raw read) | open |
+| 2d | Compare `Command Discharging (PV First)` vs `(ESS First)` | open |
+| **3** | **Grid export** | open |
+| 3a | ~0.5 kW deliberate export | open |
+| 3b | Step toward `max_grid_export_kw`, respect site export limit | open |
+| 3c | Reconcile exported energy against Pstryk settled sell data | open |
+| **4** | **Fallback** | partial |
+| 4a | Heartbeat expiry | done — 2026-08-12 (charge only) |
+| 4b | Sigen integration reload | done — [2026-08-14](./commissioning/2026-08-14-sigen-integration-reload-fallback.md) (charge only) |
+| 4c | Process stop (`docker stop`) | open |
+| 4d | Process hang (`docker pause`) | open |
+| 4e | Home Assistant restart | open |
+| 4f | Modbus / network path loss | open |
+| 4g | Repeat 4a-4f while **discharging**, not just charging | open |
+
+Sub-test 2a's ceiling is net load, not gross load: with PV producing, commanding
+more than `load - pv` exports and correctly trips `unplanned_export`. Prefer a
+window with little or no PV, or add a known resistive load, so cloud movement
+cannot turn a passing test into a spurious fallback.
 
 ## Stage 2 — supervised live operation
 
@@ -178,3 +275,17 @@ spread / grid-charge margin thresholds for real-world results.
 ## Known-missing functionality (tracked across stages)
 
 - Physically verified discharge and export (Stage 1).
+- A manual command path for discharge and export. Grid charge now has one
+  (`POST /api/control/manual-charge`, charge-only and self-expiring), so checkpoint 1
+  can be scheduled instead of waited for. Checkpoints 2 and 3 still depend on the
+  planner independently choosing the direction under test.
+- Terminal value for stored energy. `terminal_soc_salvage_pln_kwh` is `0.0` and
+  `preserve_terminal_soc` is never set, so energy left at the end of the horizon is
+  worth nothing to the solver. Because the horizon ends at Pstryk's publication edge
+  — as little as ~10 h out before the afternoon publication — the plan carries a
+  standing incentive to empty the battery toward that edge. Rolling re-optimisation
+  every 15 minutes limits the damage to a bias rather than an actual dump, but this
+  should be resolved before unattended operation in Stage 3.
+- Padding is built but not wired in (`forecast/price.py`). Wiring it would stabilise
+  the horizon across the publication boundary and push the terminal edge past the
+  next real cycle.

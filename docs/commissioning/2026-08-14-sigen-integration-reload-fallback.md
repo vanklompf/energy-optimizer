@@ -37,4 +37,4 @@ No watchdog path enables Remote EMS. The emergency-off helper prevents a fresh h
 - Modbus/network-path loss.
 - Complete HA-host-loss containment through an inverter-native timeout or independent actor.
 
-Related: [control runbook](../control-runbook.md), [watchdog interface](../battery-control-watchdog-interface.md), and [charge A/B/A evidence](./2026-08-14-attended-charge-aba.md).
+Related: [Stage 1 runbook](./README.md), [charge A/B/A evidence](./2026-08-14-attended-charge-aba.md), and the historical [watchdog interface](../archive/battery-control-watchdog-interface.md).

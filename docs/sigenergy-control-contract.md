@@ -118,6 +118,26 @@ A read-only search of all installed Sigen entity-registry entries found no entit
 
 This proves only that no such capability is exposed through the installed HA entity surface. It does **not** prove that the inverter lacks an internal timeout. Until active failure characterization proves a bounded autonomous expiry or an independent watchdog restores local control, a persistent forced command after controller/HA failure remains a release blocker.
 
+## Telemetry emission behavior
+
+Observed 2026-08-17 from stored PvOpti telemetry, not from a dedicated test.
+
+`sensor.sigen_plant_battery_state_of_charge` reports at 0.1% resolution and its
+`last_updated` advances only when that value changes. Two consequences follow, both of
+which produced real defects before they were understood:
+
+- A pinned SoC (a full battery, or an idle one) stops emitting entirely. Across stored
+  samples, 86% of readings at exactly 100% SoC exceeded the 10-minute SoC staleness
+  threshold, against 7% below 100%. Entity age alone is therefore not evidence that the
+  SoC feed is dead; liveness must be judged from another entity in the same integration.
+- At 1 kW the pack moves 0.1% roughly every 65 seconds, so SoC cannot be expected to tick
+  inside a 15-second command-verification window. Command verification must bound SoC by
+  age and rely on battery power and grid flows to prove that a command took effect.
+
+The fast power sensors (battery, PV, consumed, grid import, grid export) do update
+within the 5-minute window while their values are changing, and likewise pin when their
+value settles — zero being the common case overnight.
+
 ## Supervised active characterization
 
 ### Exact installed-source behavior and safety patch
@@ -241,6 +261,8 @@ The following remain explicitly unverified:
 - deliberate battery export and site/export-limit enforcement;
 - cut-off SoC enforcement boundaries and BMS-buffer interaction;
 - reliable register read-back for power limits and cut-offs.
+
+PvOpti can now *command* discharge and export, and verifies both against physical telemetry, but no discharge or export command has ever been issued to this inverter. Both directions stay behind their own default-off gates until the attended checkpoints in [`commissioning/README.md`](./commissioning/README.md) produce evidence notes. Code capability is not characterization.
 
 No unattended live-control adapter may be armed while the failure-path and watchdog blockers remain unresolved.
 

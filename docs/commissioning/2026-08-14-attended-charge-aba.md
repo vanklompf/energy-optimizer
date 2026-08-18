@@ -33,4 +33,4 @@ The installed Sigen integration package version was not exposed by the read-only
 - Promotion of the live acknowledgement gate before the remaining fallback and host-loss gates are accepted.
 - Assuming that the HA-hosted watchdog can recover from complete HA-host loss.
 
-Related: [control runbook](../control-runbook.md), [watchdog evidence](../battery-control-watchdog-interface.md), and [Sigen control contract](../sigenergy-control-contract.md).
+Related: [Stage 1 runbook](./README.md), [Sigen control contract](../sigenergy-control-contract.md), and the historical [watchdog evidence](../archive/battery-control-watchdog-interface.md).
