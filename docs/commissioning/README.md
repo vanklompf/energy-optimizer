@@ -38,9 +38,12 @@ Sigenergy discharge mode has ever been physically exercised at this site, which 
 whole point of checkpoints 2 and 3.
 
 During a discharge command PvOpti also writes the operating reserve
-(`EO_BATTERY_CONTROL_MIN_SOC_PCT`, 15%) into the inverter's discharge cut-off register.
-Cut-off enforcement is itself uncharacterized, so software verification still rejects
-any sample within `EO_BATTERY_CONTROL_DISCHARGE_CUTOFF_MARGIN_PCT` of the floor.
+(`EO_BATTERY_CONTROL_MIN_SOC_PCT`) into the inverter's discharge cut-off register. This
+defaults to 15% in the image but is **relaxed to 2% on HpeNas for the commissioning
+windows** (`energy_optimizer_battery_control_min_soc_pct`), matching the 2% site operating
+reserve so attended discharge/export tests have room; it is raised back before unattended
+operation. Cut-off enforcement is itself uncharacterized, so software verification still
+rejects any sample within `EO_BATTERY_CONTROL_DISCHARGE_CUTOFF_MARGIN_PCT` of the floor.
 
 ## Deployment
 
@@ -73,17 +76,22 @@ Confirm all of these before each window, not once per day.
 3. **Watchdog live.** Both PvOpti watchdog entities resolve, the HA watchdog automations
    are on, and `input_boolean.pvopti_battery_control_emergency_off` and the fallback
    latch are both off. `/api/status` must report `watchdog_healthy`.
-4. **Headroom.** SoC gives the checkpoint room to run without crossing 15% or 98%.
-5. **Plan status is `ok`.** `plan_not_ok` blocks every economic command, and the plan
-   only reaches `ok` once Pstryk has published enough contiguous real prices to cover
-   the 24-hour horizon — in practice from about 14:00. Check `/api/status`; a morning
-   window cannot command anything.
-6. **The planner independently wants the direction under test** — for checkpoints 2, 3,
-   and 4 only. Checkpoint 2 needs the planner to choose discharge-to-load, which in
-   turn needs no PV, a real house load, and prices that favour discharging over
-   importing. A full battery on a good sell price makes it choose export instead.
-   Checkpoint 1 uses the manual grid-charge request below and does not wait for prices.
-5. **Abort path rehearsed.** You can turn
+4. **Headroom.** SoC gives the checkpoint room to run without crossing the control reserve
+   (`EO_BATTERY_CONTROL_MIN_SOC_PCT`, relaxed to 2% for commissioning) or 98%.
+5. **Plan status is `ok`.** `plan_not_ok` blocks every economic command. Since the
+   `optimise_min_price_hours` fix (see [`../ROADMAP.md`](../ROADMAP.md) "Prerequisites cleared
+   on 2026-08-17"), the plan reaches `ok` whenever Pstryk's published coverage clears the 8 h
+   floor — which the normal day-ahead cycle almost always does, so the old "not before 14:00"
+   guidance no longer holds. Confirm from `/api/status` (`last_run.status == "ok"`) rather than
+   assuming a time of day; the acting interval is still gated separately and sharply by
+   `current_price_*`, so a distant estimate can never authorize a command in the present.
+6. **The direction under test is drivable.** Every checkpoint can be scheduled with the manual
+   command path below, so you no longer have to wait for the planner to independently choose the
+   direction. The *physics* must still suit the checkpoint: checkpoint 2 (discharge-to-load)
+   needs no PV and a real house load so nothing is pushed to the grid; checkpoint 3 (export)
+   needs confirmed DSO export permission and headroom. A manual request only selects the
+   direction — it authorizes nothing, and every gate and blocker still applies.
+7. **Abort path rehearsed.** You can turn
    `switch.sigen_plant_remote_ems_controlled_by_home_assistant` off by hand, and you know
    that doing so returns the inverter to local self-consumption.
 
@@ -101,21 +109,27 @@ Only 0.5 kW has been characterized. Step up, do not jump to 8.8 kW.
 Drive each step with one manual request rather than waiting for the planner:
 
 ```bash
-curl -X POST http://<host>:8320/api/control/manual-charge \
+curl -X POST http://<host>:8320/api/control/manual-command \
   -H 'content-type: application/json' \
-  -d '{"target_kw": 2.0, "duration_seconds": 600}'
-curl -X DELETE http://<host>:8320/api/control/manual-charge   # release early
+  -d '{"direction": "CHARGE", "target_kw": 2.0, "duration_seconds": 600}'
+curl -X DELETE http://<host>:8320/api/control/manual-command   # release early
 ```
 
-The request is charge-only, expires by itself (30 minutes maximum), is dropped on restart,
-and is refused unless the grid-charge gate is on. It selects the direction; it authorizes
-nothing. Because `clamp_intent_power` allows only `battery_control_max_power_step_kw`
-(0.5 kW) more than measured battery power per 30-second cycle, the commanded power ramps:
-allow roughly 2 minutes to reach 2 kW and 9 minutes to reach 8.8 kW, and size
-`duration_seconds` to cover the ramp plus the hold. The armed request and its ramp estimate
-appear under `battery_control.manual_charge` in `/api/status`, and the resulting actions
-carry reason code `manual_grid_charge_test` in the audit log — quote it in the note so the
-evidence is not mistaken for planner-driven behaviour.
+`POST /api/control/manual-charge` remains as a charge-only alias. The request expires by
+itself (30 minutes maximum), is dropped on restart, and is refused at arm time unless the
+grid-charge gate is on. It selects the direction; it authorizes nothing. Because
+`clamp_intent_power` allows only `battery_control_max_power_step_kw` (0.5 kW) more than
+measured battery power per 30-second cycle, the commanded power ramps: allow roughly
+2 minutes to reach 2 kW and 9 minutes to reach 8.8 kW, and size `duration_seconds` to cover
+the ramp plus the hold. The armed request and its ramp estimate appear under
+`battery_control.manual_command` in `/api/status`, and the resulting actions carry reason
+code `manual_grid_charge_test` in the audit log — quote it in the note so the evidence is not
+mistaken for planner-driven behaviour.
+
+Note the same-direction ramp fix (a live charge no longer aborts every cycle waiting for
+Standby-neutral) is committed but not yet live-proven, so sub-test 1c is the checkpoint that
+confirms it: it passes only when a ramp holds above 3.5 kW with `last=ok` and
+`standby_physical_timeout` never appears.
 
 1. Enable charge gates only; leave discharge and export off. Redeploy.
 2. Run intervals at roughly 2 kW, then 4 kW, then the site cap, each held long enough for
@@ -139,7 +153,16 @@ This is new territory. Start below house load so nothing is pushed to the grid.
 1. Turn on `authorize_discharge` and add `DISCHARGE` to the supported directions. Leave
    `battery_export_enabled` **off** — with export off, any measured export fails the
    command closed with `unplanned_export` and triggers fallback. That is the safety net
-   for this checkpoint.
+   for this checkpoint. Redeploy, then arm the direction (it is refused unless the gates
+   above are set):
+
+```bash
+curl -X POST http://<host>:8320/api/control/manual-command \
+  -H 'content-type: application/json' \
+  -d '{"direction": "DISCHARGE", "target_kw": 1.0, "duration_seconds": 600}'
+```
+
+   Resulting actions carry reason code `manual_discharge_test` — quote it in the note.
 2. Command roughly half of current house load. With PV producing, the ceiling is *net*
    load (`load - pv`), not gross: exceeding it exports and correctly trips
    `unplanned_export`. Cloud movement shifts that ceiling minute to minute, so prefer a
@@ -147,7 +170,8 @@ This is new territory. Start below house load so nothing is pushed to the grid.
 3. Confirm: EMS mode reads `Command Discharging (PV First)`, battery power is negative and
    at least half the commanded limit, grid export stays under the 0.12 kW deadband, grid
    import falls by roughly the discharged power.
-4. Read the discharge cut-off register raw and confirm it holds 15%, not 0%.
+4. Read the discharge cut-off register raw and confirm it holds the configured control
+   reserve (`EO_BATTERY_CONTROL_MIN_SOC_PCT`, 2% for the commissioning windows), not 0%.
 5. Step up to roughly house load. Do not exceed it in this checkpoint.
 6. Release to state A.
 
@@ -164,9 +188,22 @@ comparison is the most valuable thing this checkpoint can produce.
 Do this only after checkpoint 2 passes, and only after confirming the DSO connection and
 metering actually permit prosumer export.
 
-1. Turn on `battery_export_enabled`. Redeploy.
+1. Turn on `battery_export_enabled` (on top of the checkpoint 2 discharge gates). Redeploy,
+   then arm the export direction:
+
+```bash
+curl -X POST http://<host>:8320/api/control/manual-command \
+  -H 'content-type: application/json' \
+  -d '{"direction": "EXPORT", "target_kw": 0.5, "duration_seconds": 600}'
+```
+
+   Resulting actions carry reason code `manual_export_test`. The 2026-08-17 attempt was
+   HA-direct and never exercised PvOpti's control path; this is the first app-driven export.
 2. Command a discharge that exceeds house load by a small margin, so export is roughly
-   0.5 kW.
+   0.5 kW. Note the earlier failure: at a 0.5 kW `ESS First` discharge limit the inverter
+   curtailed PV to 0 rather than exporting. Test the hypothesis that the discharge limit caps
+   plant output — command a limit *above* house load plus the desired export, and compare
+   `PV First` against `ESS First` via `energy_optimizer_battery_control_discharge_command_mode`.
 3. Confirm: EMS mode reads `Command Discharging (ESS First)`, export is measured and
    within the intent bounds, grid import is under the deadband, and export never exceeds
    `EO_BATTERY_CONTROL_MAX_GRID_EXPORT_KW` (6.0 kW, itself capped by the 6.0 kW inverter

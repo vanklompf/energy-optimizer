@@ -34,9 +34,13 @@ These drive the whole plan. Correct any that are wrong before Stage 0.
 4. **Grid-import charging for arbitrage is desired** — charge cheap, discharge or
    self-consume when expensive. Import is billed via Pstryk settled buy prices.
 5. **Single site, single operator.** No multi-tenant, no concurrent operators.
-6. **Battery operating reserve is 15%** (`battery_soc_min_pct`), distinct from the
-   BMS hard floor (`battery_hard_soc_min_pct`, default 0%). Confirm this value.
-   (The old roadmap said 2%; code uses 15%. This resolves that contradiction.)
+6. **Battery operating reserve** (`battery_soc_min_pct`), distinct from the
+   BMS hard floor (`battery_hard_soc_min_pct`, default 0%). The code default is 15%, but
+   the HpeNas site deploys a **2%** operating reserve as normal policy (relying on the BMS
+   for equipment safety per assumption 1). The control-side reserve written to the inverter
+   discharge cut-off (`battery_control_min_soc_pct`, image default 15%) is likewise relaxed
+   to 2% for the attended commissioning windows so discharge/export checkpoints have room;
+   raise it back toward 15% before unattended Stage 3 if a larger reserve is wanted.
 7. **EV and battery control should share one simple gating scheme:** an enable
    flag per actuator plus `EO_MODE`. No arm tokens, no evidence IDs.
 8. **OIDC stays optional**; production runs behind the operator's reverse proxy.
@@ -215,13 +219,19 @@ post-command; SoC is now bounded by age instead
 (`battery_control_max_soc_age_seconds`, 300 s), which suits its actual role as a
 discharge-floor guard rather than a response signal.
 
-Checkpoint 1 no longer waits for the planner. `POST /api/control/manual-charge`
-(`{"target_kw": 2.0, "duration_seconds": 600}`) arms one attended grid-charge request
-that the control loop prefers over the plan interval until it expires. It is charge-only,
-capped by `battery_control_max_charge_kw`, limited to 30 minutes, dropped on restart, and
-refused unless `EO_BATTERY_CONTROL_GRID_CHARGE_ENABLED` is on. It changes *what* the loop
-commands, not *whether* it may: gates, authorization blockers, the 0.5 kW/cycle ramp, and
-physical verification all still apply.
+No checkpoint waits for the planner. `POST /api/control/manual-command`
+(`{"direction": "DISCHARGE", "target_kw": 2.0, "duration_seconds": 600}`) arms one attended
+request that the control loop prefers over the plan interval until it expires. `direction`
+is `CHARGE`, `DISCHARGE` (to house load), or `EXPORT` (to grid); `POST /api/control/manual-charge`
+remains as a charge-only alias. Each request is capped by `battery_control_max_charge_kw`
+(charge) or `battery_control_max_discharge_kw` (discharge/export), limited to 30 minutes,
+dropped on restart, and refused at arm time unless its per-direction gate is on — grid charge
+needs `EO_BATTERY_CONTROL_GRID_CHARGE_ENABLED`, discharge needs
+`EO_BATTERY_CONTROL_AUTHORIZE_DISCHARGE` plus `DISCHARGE` in the supported directions, and
+export needs `EO_BATTERY_EXPORT_ENABLED` on top. It changes *what* the loop commands, not
+*whether* it may: gates, authorization blockers, the 0.5 kW/cycle ramp, and physical
+verification all still apply. `DISCHARGE` declares no grid flow, so any measured export trips
+`unplanned_export`; `EXPORT` declares the export flow so the export bounds are verified.
 
 ### Sub-tests
 
@@ -238,10 +248,10 @@ Status: **done** = evidence note exists; **partial** = narrower scope passed;
 | **2** | **Discharge to house loads** | open |
 | 2a | Discharge below *net* load (load minus PV), zero export | open |
 | 2b | Discharge at net load | open |
-| 2c | Discharge cut-off register holds the 15% reserve (raw read) | open |
-| 2d | Compare `Command Discharging (PV First)` vs `(ESS First)` | open |
-| **3** | **Grid export** | open |
-| 3a | ~0.5 kW deliberate export | open |
+| 2c | Discharge cut-off register holds the configured control reserve (`EO_BATTERY_CONTROL_MIN_SOC_PCT`, relaxed to 2% for commissioning), raw read | open |
+| 2d | Compare `Command Discharging (PV First)` vs `(ESS First)` — now pivotal: 3a showed `ESS First` curtails PV rather than exporting, so this comparison must settle whether either mode exports at all | open |
+| **3** | **Grid export** | failed |
+| 3a | ~0.5 kW deliberate export | failed — [2026-08-17](./commissioning/2026-08-17-attended-export-ess-first-0p5.md) (`ESS First` at a 0.5 kW discharge limit curtailed PV to 0 instead of exporting; HA-direct, so PvOpti's control path was untested) |
 | 3b | Step toward `max_grid_export_kw`, respect site export limit | open |
 | 3c | Reconcile exported energy against Pstryk settled sell data | open |
 | **4** | **Fallback** | partial |
@@ -275,10 +285,11 @@ spread / grid-charge margin thresholds for real-world results.
 ## Known-missing functionality (tracked across stages)
 
 - Physically verified discharge and export (Stage 1).
-- A manual command path for discharge and export. Grid charge now has one
-  (`POST /api/control/manual-charge`, charge-only and self-expiring), so checkpoint 1
-  can be scheduled instead of waited for. Checkpoints 2 and 3 still depend on the
-  planner independently choosing the direction under test.
+- ~~A manual command path for discharge and export.~~ Done:
+  `POST /api/control/manual-command` arms a self-expiring `CHARGE`, `DISCHARGE`, or `EXPORT`
+  request, so checkpoints 1, 2, and 3 can each be scheduled instead of waiting for the planner
+  to independently choose the direction under test. It authorizes nothing; every gate and
+  blocker still applies.
 - Terminal value for stored energy. `terminal_soc_salvage_pln_kwh` is `0.0` and
   `preserve_terminal_soc` is never set, so energy left at the end of the horizon is
   worth nothing to the solver. Because the horizon ends at Pstryk's publication edge

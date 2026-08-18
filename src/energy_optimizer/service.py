@@ -83,7 +83,7 @@ class Service(BatteryMixin, PlanningMixin):
         self.ev_charge_to_100_active = False
         self.controller_owner_id = str(uuid.uuid4())
         self._battery_control_lock = asyncio.Lock()
-        self._manual_charge = None
+        self._manual_command = None
 
     # --- lifecycle ---------------------------------------------------------
     def start_mqtt(self) -> None:

@@ -172,6 +172,37 @@ def test_manual_charge_rejects_target_above_configured_cap(client: TestClient) -
     assert client.get("/api/status").json()["battery_control"]["manual_charge"] is None
 
 
+def test_manual_command_endpoint_arms_export_direction(client: TestClient) -> None:
+    settings = client.app.state.settings
+
+    # Refused while the export gate is closed, even with discharge authorized.
+    settings.battery_control_authorize_discharge = True
+    settings.battery_control_supported_directions = ["FALLBACK", "IDLE", "CHARGE", "DISCHARGE"]
+    refused = client.post(
+        "/api/control/manual-command", json={"direction": "EXPORT", "target_kw": 0.5}
+    )
+    assert refused.status_code == 400
+    assert "battery_export_enabled" in refused.json()["detail"]
+
+    settings.battery_export_enabled = True
+    armed = client.post(
+        "/api/control/manual-command",
+        json={"direction": "EXPORT", "target_kw": 0.5, "duration_seconds": 600},
+    )
+    assert armed.status_code == 200
+    manual = armed.json()["manual_command"]
+    assert manual["direction"] == "EXPORT"
+    assert manual["target_kw"] == 0.5
+
+    battery = client.get("/api/status").json()["battery_control"]
+    assert battery["manual_command"]["request_id"] == manual["request_id"]
+    # The charge-only compatibility view stays empty for a non-charge command.
+    assert battery["manual_charge"] is None
+
+    assert client.request("DELETE", "/api/control/manual-command").status_code == 200
+    assert client.get("/api/status").json()["battery_control"]["manual_command"] is None
+
+
 def test_status_exposes_latest_pstryk_billing_interval(client: TestClient) -> None:
     store = client.app.state.store
     start = dt.datetime.now(tz=dt.UTC).replace(minute=0, second=0, microsecond=0) - dt.timedelta(

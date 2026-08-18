@@ -135,10 +135,14 @@ async def _battery_control_status(request: Request, now: dt.datetime) -> dict:
 
     watchdog_healthy, watchdog_reason = await service._watchdog_health(now)
 
-    manual_charge = None
-    manual_charge_status = getattr(service, "manual_charge_status", None)
-    if callable(manual_charge_status):
-        manual_charge = manual_charge_status(now)
+    manual_command = None
+    manual_command_status = getattr(service, "manual_command_status", None)
+    if callable(manual_command_status):
+        manual_command = manual_command_status(now)
+    # Charge-only view kept for backward compatibility with existing clients.
+    manual_charge = (
+        manual_command if manual_command and manual_command.get("direction") == "CHARGE" else None
+    )
 
     return {
         "mode": settings.mode,
@@ -160,6 +164,7 @@ async def _battery_control_status(request: Request, now: dt.datetime) -> dict:
         "heartbeat_age_seconds": heartbeat_age,
         "heartbeat_expiry_seconds": settings.battery_control_heartbeat_expiry_seconds,
         "current_intent": intent,
+        "manual_command": manual_command,
         "manual_charge": manual_charge,
         "last_action": _control_action_dict(last_action),
         "last_verified_action": _control_action_dict(last_verified),
@@ -290,18 +295,50 @@ async def set_actuation(request: Request, body: ActuationRequest) -> dict:
     }
 
 
+class ManualCommandBody(BaseModel):
+    direction: str
+    target_kw: float
+    duration_seconds: float | None = None
+
+
 class ManualChargeBody(BaseModel):
     target_kw: float
     duration_seconds: float | None = None
 
 
+@router.post("/control/manual-command")
+def arm_manual_command(request: Request, body: ManualCommandBody) -> dict:
+    """Arm one attended battery command (ROADMAP Stage 1 checkpoints 1-3).
+
+    ``direction`` is ``CHARGE``, ``DISCHARGE`` (to house load), or ``EXPORT`` (to grid).
+    The request expires on its own and is dropped on restart. Every gate, blocker, ramp
+    limit, and physical verification still applies to the resulting command.
+    """
+    service = request.app.state.service
+    now = dt.datetime.now(tz=dt.UTC)
+    try:
+        service.request_manual_command(
+            direction=body.direction,
+            target_kw=body.target_kw,
+            duration_seconds=body.duration_seconds,
+            now=now,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"armed": True, "manual_command": service.manual_command_status(now)}
+
+
+@router.delete("/control/manual-command")
+def clear_manual_command(request: Request) -> dict:
+    """Drop an armed request; the next control cycle returns to the plan."""
+    service = request.app.state.service
+    service.clear_manual_command()
+    return {"armed": False, "manual_command": None}
+
+
 @router.post("/control/manual-charge")
 def arm_manual_charge(request: Request, body: ManualChargeBody) -> dict:
-    """Arm one attended grid-charge command (ROADMAP Stage 1 sub-tests 1b-1d).
-
-    The request expires on its own and is dropped on restart. Every gate, blocker,
-    ramp limit, and physical verification still applies to the resulting command.
-    """
+    """Charge-only alias for ``/control/manual-command`` (ROADMAP checkpoint 1)."""
     service = request.app.state.service
     now = dt.datetime.now(tz=dt.UTC)
     try:
@@ -312,14 +349,14 @@ def arm_manual_charge(request: Request, body: ManualChargeBody) -> dict:
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"armed": True, "manual_charge": service.manual_charge_status(now)}
+    return {"armed": True, "manual_charge": service.manual_command_status(now)}
 
 
 @router.delete("/control/manual-charge")
 def clear_manual_charge(request: Request) -> dict:
     """Drop an armed request; the next control cycle returns to the plan."""
     service = request.app.state.service
-    service.clear_manual_charge()
+    service.clear_manual_command()
     return {"armed": False, "manual_charge": None}
 
 

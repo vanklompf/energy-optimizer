@@ -453,6 +453,105 @@ async def test_manual_charge_ramp_estimate_matches_step_and_cadence() -> None:
     assert service.manual_charge_ramp_seconds(0.5) == 0.0
 
 
+def _discharge_settings(**overrides) -> Settings:
+    """Settings that authorize discharge so manual discharge/export can be armed."""
+    base = dict(
+        step_minutes=15,
+        battery_control_authorize_discharge=True,
+        battery_control_supported_directions=["FALLBACK", "IDLE", "CHARGE", "DISCHARGE"],
+    )
+    base.update(overrides)
+    return _settings(**base)
+
+
+async def test_manual_discharge_command_overrides_plan_to_house_load() -> None:
+    settings = _discharge_settings()
+    now = dt.datetime(2026, 8, 17, 18, 50, tzinfo=dt.UTC)
+    interval_start = dt.datetime(2026, 8, 17, 18, 45, tzinfo=dt.UTC)
+    service = _export_plan_service(settings, now, interval_start)
+
+    service.request_manual_command(
+        direction="DISCHARGE", target_kw=1.5, duration_seconds=600, now=now
+    )
+    intent, _run_id, selected_start, _ = service.build_battery_control_intent(now)
+
+    assert intent.direction is ControlDirection.DISCHARGE
+    assert intent.export is False
+    assert intent.requested_power_kw == 1.5
+    assert intent.reason_codes == ("manual_discharge_test",)
+    # Discharge to load declares no grid flow, so any measured export trips
+    # unplanned_export — the safety net checkpoint 2 relies on.
+    assert intent.expected_grid_direction is None
+    # The operating reserve, not the charge ceiling, guards the discharge floor.
+    assert intent.cutoff_soc_pct == settings.battery_control_min_soc_pct
+    assert selected_start == interval_start
+
+
+async def test_manual_export_command_declares_export_bounds() -> None:
+    settings = _discharge_settings(battery_export_enabled=True)
+    now = dt.datetime(2026, 8, 17, 18, 50, tzinfo=dt.UTC)
+    interval_start = dt.datetime(2026, 8, 17, 18, 45, tzinfo=dt.UTC)
+    service = _export_plan_service(settings, now, interval_start)
+
+    service.request_manual_command(
+        direction="EXPORT", target_kw=0.5, duration_seconds=600, now=now
+    )
+    intent, _run_id, _start, _ = service.build_battery_control_intent(now)
+
+    assert intent.direction is ControlDirection.DISCHARGE
+    assert intent.export is True
+    assert intent.requested_power_kw == 0.5
+    assert intent.reason_codes == ("manual_export_test",)
+    assert intent.expected_grid_direction == "export"
+    assert intent.expected_grid_kw_max == settings.battery_control_max_grid_export_kw
+
+
+async def test_manual_command_rejects_closed_direction_gates() -> None:
+    now = utcnow()
+
+    # Discharge without authorization is refused before it can fail every cycle.
+    service = Service(_settings(), Store(":memory:"))
+    with pytest.raises(ValueError, match="authorize_discharge"):
+        service.request_manual_command(direction="DISCHARGE", target_kw=1.0, now=now)
+
+    # Export needs the export gate on top of discharge authorization.
+    service = Service(_discharge_settings(), Store(":memory:"))
+    with pytest.raises(ValueError, match="battery_export_enabled"):
+        service.request_manual_command(direction="EXPORT", target_kw=0.5, now=now)
+
+    # An unknown direction is refused outright.
+    service = Service(_discharge_settings(battery_export_enabled=True), Store(":memory:"))
+    with pytest.raises(ValueError, match="direction must be one of"):
+        service.request_manual_command(direction="SIDEWAYS", target_kw=1.0, now=now)
+
+
+async def test_manual_command_clamps_discharge_target_to_configured_cap() -> None:
+    service = Service(_discharge_settings(), Store(":memory:"))
+    now = utcnow()
+
+    with pytest.raises(ValueError, match="deadband"):
+        service.request_manual_command(direction="DISCHARGE", target_kw=0.05, now=now)
+    with pytest.raises(ValueError, match="max_discharge_kw"):
+        service.request_manual_command(direction="DISCHARGE", target_kw=12.0, now=now)
+    assert service.manual_command_status(now) is None
+
+
+async def test_manual_command_status_reports_direction_and_expiry() -> None:
+    service = Service(_discharge_settings(battery_export_enabled=True), Store(":memory:"))
+    now = dt.datetime(2026, 8, 17, 18, 46, tzinfo=dt.UTC)
+
+    service.request_manual_command(
+        direction="EXPORT", target_kw=0.5, duration_seconds=60, now=now
+    )
+    status = service.manual_command_status(now)
+    assert status["direction"] == "EXPORT"
+    assert status["target_kw"] == 0.5
+
+    later = now + dt.timedelta(seconds=120)
+    assert service.active_manual_command(later) is None
+    assert service.manual_command_status(later) is None
+
+
 async def test_control_battery_lease_conflict_locks_out() -> None:
     settings = _settings()
     store = Store(":memory:")

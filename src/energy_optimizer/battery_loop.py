@@ -23,21 +23,41 @@ from .watchdog import watchdog_health_from_ha
 
 logger = logging.getLogger(__name__)
 
-# Attended commissioning only (ROADMAP Stage 1 sub-tests 1b-1d). The request lives in
+# Attended commissioning only (ROADMAP Stage 1 checkpoints 1-3). The request lives in
 # process memory and expires on its own so a forgotten arm cannot outlive the window or
 # a restart.
-_MANUAL_CHARGE_DEFAULT_DURATION_SECONDS = 300.0
-_MANUAL_CHARGE_MAX_DURATION_SECONDS = 1800.0
+_MANUAL_COMMAND_DEFAULT_DURATION_SECONDS = 300.0
+_MANUAL_COMMAND_MAX_DURATION_SECONDS = 1800.0
+_MANUAL_COMMAND_DIRECTIONS = ("CHARGE", "DISCHARGE", "EXPORT")
+_MANUAL_COMMAND_REASON_CODES = {
+    "CHARGE": ("manual_grid_charge_test",),
+    "DISCHARGE": ("manual_discharge_test",),
+    "EXPORT": ("manual_export_test",),
+}
+
+# Back-compat aliases for callers still using the charge-only names.
+_MANUAL_CHARGE_DEFAULT_DURATION_SECONDS = _MANUAL_COMMAND_DEFAULT_DURATION_SECONDS
+_MANUAL_CHARGE_MAX_DURATION_SECONDS = _MANUAL_COMMAND_MAX_DURATION_SECONDS
 
 
 @dataclass(frozen=True, slots=True)
-class ManualChargeRequest:
-    """One attended grid-charge request the control loop prefers over the plan."""
+class ManualCommandRequest:
+    """One attended battery command the control loop prefers over the plan.
+
+    ``direction`` is one of ``CHARGE``, ``DISCHARGE`` (to house load), or ``EXPORT``
+    (discharge to grid). It only selects *what* the loop commands; every gate, blocker,
+    ramp limit, and physical verification still applies.
+    """
 
     request_id: str
+    direction: str
     target_kw: float
     requested_at: dt.datetime
     expires_at: dt.datetime
+
+
+# Back-compat alias; older references may still import the charge-only name.
+ManualChargeRequest = ManualCommandRequest
 
 
 class BatteryMixin:
@@ -48,7 +68,7 @@ class BatteryMixin:
     controller_owner_id: str
     _battery_control_lock: asyncio.Lock
     _mqtt: MqttPublisher | None
-    _manual_charge: ManualChargeRequest | None
+    _manual_command: ManualCommandRequest | None
 
     def _latest_soc_with_age(self, now: dt.datetime) -> tuple[float | None, float | None]:
         raise NotImplementedError
@@ -68,78 +88,121 @@ class BatteryMixin:
     def _known_price_hours(self, prices: list[Price], now: dt.datetime) -> float:
         raise NotImplementedError
 
-    # --- attended manual grid charge ---------------------------------------
-    def request_manual_charge(
+    # --- attended manual command (charge / discharge / export) -------------
+    def request_manual_command(
         self,
         *,
+        direction: str,
         target_kw: float,
         duration_seconds: float | None = None,
         now: dt.datetime | None = None,
-    ) -> ManualChargeRequest:
-        """Arm one bounded grid-charge command for an attended commissioning window.
+    ) -> ManualCommandRequest:
+        """Arm one bounded battery command for an attended commissioning window.
 
-        The planner only chooses grid charging when the price spread justifies it, so
-        sub-tests 1b-1d otherwise cannot be scheduled. This does not bypass any gate:
-        mode, ``battery_control_enabled``, authorization blockers, the ramp limit, and
-        physical verification all still apply.
+        ``direction`` is ``CHARGE``, ``DISCHARGE`` (to house load), or ``EXPORT`` (to
+        grid). The planner only chooses a direction when the price spread justifies it,
+        so the Stage 1 checkpoints otherwise cannot be scheduled. This does not bypass
+        any gate: mode, ``battery_control_enabled``, the per-direction gate, authorization
+        blockers, the ramp limit, and physical verification all still apply.
         """
         s = self.settings
         now = now or utcnow()
+        direction = direction.strip().upper()
+        if direction not in _MANUAL_COMMAND_DIRECTIONS:
+            raise ValueError(
+                f"direction must be one of {_MANUAL_COMMAND_DIRECTIONS}"
+            )
         duration = (
-            _MANUAL_CHARGE_DEFAULT_DURATION_SECONDS
+            _MANUAL_COMMAND_DEFAULT_DURATION_SECONDS
             if duration_seconds is None
             else float(duration_seconds)
         )
-        if not s.battery_control_grid_charge_enabled:
-            # Arming against a closed gate would make every cycle fail the intent and
-            # fall back, so refuse here instead.
-            raise ValueError("battery_control_grid_charge_enabled is false")
+
+        # Refuse arming against a closed gate: otherwise every control cycle would fail
+        # the intent and fall back. Mirror exactly the gates the intent builder enforces.
+        if direction == "CHARGE":
+            if not s.battery_control_grid_charge_enabled:
+                raise ValueError("battery_control_grid_charge_enabled is false")
+            max_kw = s.battery_control_max_charge_kw
+            max_name = "battery_control_max_charge_kw"
+        else:
+            if not s.battery_control_authorize_discharge:
+                raise ValueError("battery_control_authorize_discharge is false")
+            if "DISCHARGE" not in s.battery_control_supported_directions:
+                raise ValueError("DISCHARGE not in battery_control_supported_directions")
+            if direction == "EXPORT" and not s.battery_export_enabled:
+                raise ValueError("battery_export_enabled is false")
+            max_kw = s.battery_control_max_discharge_kw
+            max_name = "battery_control_max_discharge_kw"
+
         if target_kw < s.battery_control_deadband_kw:
             raise ValueError(
                 f"target_kw must be at least the deadband {s.battery_control_deadband_kw} kW"
             )
-        if target_kw > s.battery_control_max_charge_kw + 1e-9:
+        if target_kw > max_kw + 1e-9:
+            raise ValueError(f"target_kw exceeds {max_name} ({max_kw} kW)")
+        if duration <= 0 or duration > _MANUAL_COMMAND_MAX_DURATION_SECONDS:
             raise ValueError(
-                f"target_kw exceeds battery_control_max_charge_kw "
-                f"({s.battery_control_max_charge_kw} kW)"
-            )
-        if duration <= 0 or duration > _MANUAL_CHARGE_MAX_DURATION_SECONDS:
-            raise ValueError(
-                f"duration_seconds must be within 0-{_MANUAL_CHARGE_MAX_DURATION_SECONDS:.0f}"
+                f"duration_seconds must be within 0-{_MANUAL_COMMAND_MAX_DURATION_SECONDS:.0f}"
             )
 
-        request = ManualChargeRequest(
+        request = ManualCommandRequest(
             request_id=str(uuid.uuid4()),
+            direction=direction,
             target_kw=float(target_kw),
             requested_at=now,
             expires_at=now + dt.timedelta(seconds=duration),
         )
-        self._manual_charge = request
+        self._manual_command = request
         logger.warning(
-            "manual grid-charge armed: %.2f kW until %s (request %s)",
+            "manual %s command armed: %.2f kW until %s (request %s)",
+            request.direction,
             request.target_kw,
             request.expires_at.isoformat(),
             request.request_id,
         )
         return request
 
-    def clear_manual_charge(self) -> None:
-        """Drop any armed request; the next control cycle returns to the plan."""
-        if self._manual_charge is not None:
-            logger.warning("manual grid-charge cleared: %s", self._manual_charge.request_id)
-        self._manual_charge = None
+    def request_manual_charge(
+        self,
+        *,
+        target_kw: float,
+        duration_seconds: float | None = None,
+        now: dt.datetime | None = None,
+    ) -> ManualCommandRequest:
+        """Charge-only alias for :meth:`request_manual_command` (checkpoint 1)."""
+        return self.request_manual_command(
+            direction="CHARGE",
+            target_kw=target_kw,
+            duration_seconds=duration_seconds,
+            now=now,
+        )
 
-    def active_manual_charge(self, now: dt.datetime) -> ManualChargeRequest | None:
-        request = self._manual_charge
+    def clear_manual_command(self) -> None:
+        """Drop any armed request; the next control cycle returns to the plan."""
+        if self._manual_command is not None:
+            logger.warning("manual command cleared: %s", self._manual_command.request_id)
+        self._manual_command = None
+
+    def clear_manual_charge(self) -> None:
+        """Back-compat alias for :meth:`clear_manual_command`."""
+        self.clear_manual_command()
+
+    def active_manual_command(self, now: dt.datetime) -> ManualCommandRequest | None:
+        request = self._manual_command
         if request is None:
             return None
         if now >= request.expires_at:
-            logger.info("manual grid-charge expired: %s", request.request_id)
-            self._manual_charge = None
+            logger.info("manual command expired: %s", request.request_id)
+            self._manual_command = None
             return None
         return request
 
-    def manual_charge_ramp_seconds(self, target_kw: float) -> float:
+    def active_manual_charge(self, now: dt.datetime) -> ManualCommandRequest | None:
+        """Back-compat alias for :meth:`active_manual_command`."""
+        return self.active_manual_command(now)
+
+    def manual_command_ramp_seconds(self, target_kw: float) -> float:
         """Cycles the 0.5 kW/step ramp needs to reach the target from a standstill."""
         s = self.settings
         if s.battery_control_max_power_step_kw <= 0:
@@ -147,21 +210,64 @@ class BatteryMixin:
         steps = math.ceil(target_kw / s.battery_control_max_power_step_kw)
         return max(0, steps - 1) * s.battery_control_cadence_seconds
 
-    def manual_charge_status(self, now: dt.datetime | None = None) -> dict[str, object] | None:
+    def manual_charge_ramp_seconds(self, target_kw: float) -> float:
+        """Back-compat alias for :meth:`manual_command_ramp_seconds`."""
+        return self.manual_command_ramp_seconds(target_kw)
+
+    def manual_command_status(self, now: dt.datetime | None = None) -> dict[str, object] | None:
         now = now or utcnow()
-        request = self.active_manual_charge(now)
+        request = self.active_manual_command(now)
         if request is None:
             return None
         return {
             "request_id": request.request_id,
+            "direction": request.direction,
             "target_kw": request.target_kw,
             "requested_at": request.requested_at.isoformat(),
             "expires_at": request.expires_at.isoformat(),
             "seconds_remaining": max(0.0, (request.expires_at - now).total_seconds()),
-            "ramp_estimate_seconds": self.manual_charge_ramp_seconds(request.target_kw),
+            "ramp_estimate_seconds": self.manual_command_ramp_seconds(request.target_kw),
         }
 
+    def manual_charge_status(self, now: dt.datetime | None = None) -> dict[str, object] | None:
+        """Back-compat alias for :meth:`manual_command_status`."""
+        return self.manual_command_status(now)
+
     # --- battery control ---------------------------------------------------
+    def _manual_command_flows(
+        self,
+        manual: ManualCommandRequest,
+        *,
+        interval_start: dt.datetime,
+        dt_hours: float,
+    ):
+        """Translate a manual request into the plan-flow snapshot for its direction.
+
+        Routing energy through the same ``PlanFlowSnapshot`` the planner uses keeps every
+        gate, cut-off, and expected-grid-bound check identical to plan-driven commands.
+        DISCHARGE keeps both grid flows at zero so any measured export trips
+        ``unplanned_export``; EXPORT declares the export flow so ``battery_export_enabled``
+        is required and the export bounds are verified.
+        """
+        from .battery_control import PlanFlowSnapshot
+
+        energy = manual.target_kw * dt_hours
+        grid_to_battery = energy if manual.direction == "CHARGE" else 0.0
+        battery_to_load = energy if manual.direction == "DISCHARGE" else 0.0
+        battery_to_grid = energy if manual.direction == "EXPORT" else 0.0
+        flows = PlanFlowSnapshot(
+            interval_start=interval_start,
+            dt_hours=dt_hours,
+            pv_to_battery_kwh=0.0,
+            grid_to_battery_kwh=grid_to_battery,
+            battery_to_load_kwh=battery_to_load,
+            battery_to_grid_kwh=battery_to_grid,
+            battery_to_ev_kwh=0.0,
+            grid_import_kwh=grid_to_battery,
+            grid_export_kwh=battery_to_grid,
+        )
+        return flows, _MANUAL_COMMAND_REASON_CODES[manual.direction]
+
     def build_battery_control_intent(self, now: dt.datetime | None = None):
         """Select the plan interval containing now and translate it to a typed intent."""
         from .battery_control import PlanFlowSnapshot, intent_from_plan_flows
@@ -191,7 +297,7 @@ class BatteryMixin:
         selected = select_current_interval(
             starts, now=now, step_minutes=s.step_minutes, tz=s.tz
         )
-        manual = self.active_manual_charge(now)
+        manual = self.active_manual_command(now)
         if selected is None:
             if manual is None:
                 raise ValueError("no current plan interval")
@@ -214,20 +320,11 @@ class BatteryMixin:
         reason_codes: tuple[str, ...] = ()
         if manual is not None:
             # Reuse the plan-flow translation so the manual intent carries the same gate
-            # check, cut-off, and expected-import bounds the verifier relies on.
-            flows = PlanFlowSnapshot(
-                interval_start=interval_start,
-                dt_hours=dt_hours,
-                pv_to_battery_kwh=0.0,
-                grid_to_battery_kwh=manual.target_kw * dt_hours,
-                battery_to_load_kwh=0.0,
-                battery_to_grid_kwh=0.0,
-                battery_to_ev_kwh=0.0,
-                grid_import_kwh=manual.target_kw * dt_hours,
-                grid_export_kwh=0.0,
+            # check, cut-off, and expected grid bounds the verifier relies on.
+            flows, reason_codes = self._manual_command_flows(
+                manual, interval_start=interval_start, dt_hours=dt_hours
             )
             expiry = min(interval_end, manual.expires_at)
-            reason_codes = ("manual_grid_charge_test",)
         else:
             flows = PlanFlowSnapshot(
                 interval_start=interval_start,
