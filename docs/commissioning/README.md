@@ -15,7 +15,8 @@ Record one dated note per checkpoint in this directory. Existing notes
 ([charge A/B/A](./2026-08-14-attended-charge-aba.md),
 [integration reload](./2026-08-14-sigen-integration-reload-fallback.md),
 [export ESS First 0.5 kW](./2026-08-17-attended-export-ess-first-0p5.md),
-[charge 2/4/8.8 kW](./2026-08-17-attended-charge-2-4-8p8.md)) are the format
+[charge 2/4/8.8 kW](./2026-08-17-attended-charge-2-4-8p8.md),
+[charge 4 kW / 1d plateau](./2026-08-18-attended-charge-4-8p8.md)) are the format
 to follow; a template is at the end of this file.
 
 ## What changed for Stage 1

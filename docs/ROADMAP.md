@@ -243,8 +243,8 @@ Status: **done** = evidence note exists; **partial** = narrower scope passed;
 | **1** | **Full-rate grid-import charge** | partial |
 | 1a | 0.5 kW `Command Charging (Grid First)`, A/B/A | done — [2026-08-14](./commissioning/2026-08-14-attended-charge-aba.md) |
 | 1b | Step to ~2 kW, verify limit tracking and import coverage | done — [2026-08-17/18](./commissioning/2026-08-17-attended-charge-2-4-8p8.md) |
-| 1c | Step to ~4 kW | failed — same note (sawtooth: Standby-neutral on every ramp cycle) |
-| 1d | Step to site cap, verify against `max_grid_import_kw` | open |
+| 1c | Step to ~4 kW | done — [2026-08-18](./commissioning/2026-08-18-attended-charge-4-8p8.md) |
+| 1d | Step to site cap, verify against `max_grid_import_kw` | partial — same note (last=`ok` through 6.86 kW command; battery plateaued at 6.36 kW / import 6.87 kW, never reached 8.8 kW) |
 | **2** | **Discharge to house loads** | open |
 | 2a | Discharge below *net* load (load minus PV), zero export | open |
 | 2b | Discharge at net load | open |
