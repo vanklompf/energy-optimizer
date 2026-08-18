@@ -7,6 +7,7 @@ import pytest
 from energy_optimizer.control_store import (
     claim_path_loss_recovery,
     clear_lockout,
+    ensure_controller_state,
     finalize_action,
     is_locked_out,
     list_pending_actions,
@@ -118,3 +119,24 @@ def test_lockout_persistence(store: Store) -> None:
         assert is_locked_out(session, now=now + dt.timedelta(seconds=3601)) is False
         clear_lockout(session, now=now)
         assert is_locked_out(session, now=now) is False
+
+
+def test_clear_lockout_from_lockout_state_disarms(store: Store) -> None:
+    now = dt.datetime(2026, 8, 17, 23, 32, tzinfo=dt.UTC)
+    with store.session() as session:
+        set_lockout(session, reason="fallback_unverified", duration_seconds=3600, now=now)
+        row = clear_lockout(session, now=now)
+        assert row.lockout_until is None
+        assert row.state == "DISARMED"
+
+
+def test_clear_lockout_preserves_live_active_charge(store: Store) -> None:
+    now = dt.datetime(2026, 8, 17, 23, 32, tzinfo=dt.UTC)
+    with store.session() as session:
+        set_lockout(session, reason="fallback_unverified", duration_seconds=3600, now=now)
+        row = ensure_controller_state(session)
+        row.state = "ACTIVE_CHARGE"
+        row = clear_lockout(session, now=now)
+        assert row.lockout_until is None
+        assert row.lockout_reason is None
+        assert row.state == "ACTIVE_CHARGE"

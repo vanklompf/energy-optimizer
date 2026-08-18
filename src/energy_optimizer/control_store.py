@@ -163,9 +163,16 @@ def set_lockout(
 
 
 def clear_lockout(session: Session, *, now: dt.datetime | None = None) -> ControllerStateRow:
+    """Drop backoff only. Do not DISARM a live command.
+
+    Forcing ``DISARMED`` while the inverter still holds a Remote-EMS charge makes
+    the next cycle follow the plan (often discharge) instead of the held command.
+    Observed 2026-08-17 1b attempt 2.
+    """
     now = _aware(now or utcnow())
     row = ensure_controller_state(session)
-    row.state = "DISARMED"
+    if row.state == "LOCKOUT":
+        row.state = "DISARMED"
     row.lockout_reason = None
     row.lockout_until = None
     row.consecutive_failures = 0
