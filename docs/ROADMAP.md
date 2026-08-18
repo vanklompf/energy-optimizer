@@ -259,9 +259,9 @@ Status: **done** = evidence note exists; **partial** = narrower scope passed;
 | 4b | Sigen integration reload | done — [2026-08-14](./commissioning/2026-08-14-sigen-integration-reload-fallback.md) (charge only) |
 | 4c | Process stop (`docker stop`) | done — [2026-08-18](./commissioning/2026-08-18-fallback-stop-pause-discharge.md) (discharge only) |
 | 4d | Process hang (`docker pause`) | done — same note (discharge only) |
-| 4e | Home Assistant restart | open |
-| 4f | Modbus / network path loss | open |
-| 4g | Repeat 4a-4f while **discharging**, not just charging | partial — 4c/4d discharge done (same note); 4a/4b/4e/4f on discharge still open |
+| 4e | Home Assistant restart | done — [2026-08-18](./commissioning/2026-08-18-fallback-ha-restart-modbus-discharge.md) (discharge only; `ha_start_guard` restored A, PvOpti did not resume) |
+| 4f | Modbus / network path loss | failed — same note (discharge: HA cached entities, watchdog never fired, inverter kept last Remote EMS command for 90 s; PvOpti lockouted; attended restore to A) |
+| 4g | Repeat 4a-4f while **discharging**, not just charging | partial — 4c/4d/4e discharge done; 4f discharge failed; 4a/4b discharge and all charge-side 4c–4f still open |
 
 Sub-test 2a's ceiling is net load, not gross load: with PV producing, commanding
 more than `load - pv` exports and correctly trips `unplanned_export`. Prefer a

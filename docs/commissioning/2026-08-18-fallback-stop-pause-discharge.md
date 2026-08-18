@@ -54,7 +54,7 @@ discharge command.
 ## What remains blocked
 
 - 4c/4d while **charging**.
-- 4e Home Assistant restart.
-- 4f Modbus / network path loss.
+- 4e Home Assistant restart — later: [2026-08-18 HA restart / Modbus](./2026-08-18-fallback-ha-restart-modbus-discharge.md) (passed on discharge).
+- 4f Modbus / network path loss — later: same note (failed on discharge).
 - 4a/4b while discharging (heartbeat expiry / Sigen reload on discharge).
 - Unattended control, export, 2d ESS First.
