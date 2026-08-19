@@ -18,8 +18,8 @@ scripts (now in [`archive/`](./archive/)). Read [`DESIGN.md`](./DESIGN.md) first
 - Attended 0.5–4 kW grid-charge, PV First discharge-to-load, ESS First
   battery export at night, and several fallback faults are physically
   characterized (see `commissioning/`). Remaining Stage 1 gaps: 1d full-rate
-  import, 2d PV First vs ESS First with PV present, 3c Pstryk settlement of
-  the 22:00Z export hour, and charge-side / Modbus-loss fallback.
+  import, 2d PV First vs ESS First with PV present, and charge-side /
+  Modbus-loss fallback.
 
 ## Assumptions (please review)
 
@@ -252,10 +252,10 @@ Status: **done** = evidence note exists; **partial** = narrower scope passed;
 | 2b | Discharge at net load | done — same note (1.8 kW vs 1.98 kW load; left 0.18 kW import rather than sitting on the export deadband) |
 | 2c | Discharge cut-off register holds the configured control reserve (`EO_BATTERY_CONTROL_MIN_SOC_PCT`, relaxed to 2% for commissioning), raw read | done — same note (raw 2.0%) |
 | 2d | Compare `Command Discharging (PV First)` vs `(ESS First)` with PV present — 3a night export passed on `ESS First` from battery; the 17 Aug daylight result still shows `ESS First` at a 0.5 kW limit curtailing PV, so this comparison must settle whether a higher limit exports PV surplus | open |
-| **3** | **Grid export** | partial |
+| **3** | **Grid export** | done (night battery export; daylight PV-surplus still 2d) |
 | 3a | ~0.5 kW deliberate export | done — [2026-08-18](./commissioning/2026-08-18-attended-export-ess-first-0p8.md) (PvOpti `EXPORT` 0.8 kW `ESS First` at night, PV 0: battery 0.8 kW, export 0.36–0.39 kW, import 0). Prior [2026-08-17](./commissioning/2026-08-17-attended-export-ess-first-0p5.md) HA-direct 0.5 kW in daylight curtailed PV and does not contradict this. |
 | 3b | Step toward `max_grid_export_kw`, respect site export limit | done — [2026-08-18](./commissioning/2026-08-18-attended-export-step-6kw.md) (2 / 4 / 6 kW `ESS First`, last=`ok`, export 1.48 / 3.58 / 5.45 kW, never above 6.0) |
-| 3c | Reconcile exported energy against Pstryk settled sell data | partial — same note (21:00Z hour settled 0.099 kWh sell, not a tight 3a match; 22:00Z 3b hour not settled yet, Sigen ≈ 0.74 kWh) |
+| 3c | Reconcile exported energy against Pstryk settled sell data | done — same note (22:00Z hour: Pstryk 0.733 kWh sell vs Sigen 0.732 kWh; 23:00Z back to 0.006 kWh noise) |
 | **4** | **Fallback** | partial |
 | 4a | Heartbeat expiry | done — 2026-08-12 (charge only) |
 | 4b | Sigen integration reload | done — [2026-08-14](./commissioning/2026-08-14-sigen-integration-reload-fallback.md) (charge only) |
@@ -288,7 +288,7 @@ spread / grid-charge margin thresholds for real-world results.
 
 - ~~Physically verified discharge and export (Stage 1).~~ Discharge-to-load
   (PV First) and night battery export (ESS First 0.8 kW) are characterized.
-  Daylight PV-surplus export and 3c settlement of the 22:00Z hour remain.
+  Daylight PV-surplus export remains.
 - ~~A manual command path for discharge and export.~~ Done:
   `POST /api/control/manual-command` arms a self-expiring `CHARGE`, `DISCHARGE`, or `EXPORT`
   request, so checkpoints 1, 2, and 3 can each be scheduled instead of waiting for the planner

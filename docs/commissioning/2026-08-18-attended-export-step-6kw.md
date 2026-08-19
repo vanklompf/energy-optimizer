@@ -2,10 +2,11 @@
 
 Status: **passed for 3b (PvOpti `EXPORT` stepped 2 → 4 → 6 kW
 `Command Discharging (ESS First)`, last=`ok`, measured export 1.48 / 3.58 /
-5.45–5.47 kW, never above the 6.0 kW cap); 3c partial — the 21:00Z hour
-that contains 3a is settled but is not a tight match, and the 22:00Z hour
-that contains 3b is not settled yet.** Not authorization for unattended
-control. State A was restored; PvOpti is `dry_run`.
+5.45–5.47 kW, never above the 6.0 kW cap) and for 3c on the 22:00Z hour
+(Pstryk settled sell **0.733 kWh** vs Sigen 1-min integral **0.732 kWh**).**
+The 21:00Z hour that contains the short 3a pulse is settled but is not a
+tight unique match. Not authorization for unattended control. State A was
+restored; PvOpti is `dry_run`.
 
 ## Scope
 
@@ -44,32 +45,33 @@ the evidence, and it never crossed 6.0 kW.
 
 ## 3c — Pstryk settled sell
 
-Pstryk billing frames are hourly. Latest refresh 22:14:38Z.
+Pstryk billing frames are hourly. Rechecked 2026-08-19 08:02Z (fetched_at).
 
-| UTC hour | Pstryk import kWh | Pstryk export kWh | Notes |
-|---|---|---|---|
-| 20:00–21:00 | 1.801 | 0.011 | before 3a (night noise / MSC) |
-| 21:00–22:00 | 0.601 | **0.099** | contains 3a (~1.5 min at 0.36 kW ≈ 0.01 kWh on 1-min Sigen samples) |
-| 22:00–23:00 | — | **not settled** | contains 3b; Sigen trapezoid 21:50–22:16Z ≈ **0.74 kWh** export |
+| UTC hour | Pstryk import kWh | Pstryk export kWh | Sigen 1-min integral export kWh | Notes |
+|---|---|---|---|---|
+| 20:00–21:00 | 1.801 | 0.011 | — | night noise / MSC before 3a |
+| 21:00–22:00 | 0.601 | 0.099 | 0.070 | contains 3a (~1.5 min at 0.36 kW); not a unique match |
+| **22:00–23:00** | **0.011** | **0.733** | **0.732** | **3b step-up; billed sell matches Sigen to 0.001 kWh** |
+| 23:00–00:00 | 0.000 | 0.006 | — | back to night noise after restore |
 
-The 21:00Z hour *did* settle a sell (0.099 vs 0.011 the hour before), so
-Pstryk is registering export, but 0.099 kWh is larger than the ~0.01 kWh
-3a pulse and Sigen 1-min telemetry in that hour also has unrelated spikes
-(21:20Z, 21:49Z). That is not a unique 3a reconciliation.
+The 22:00Z hour is the 3c evidence: commanded battery export appears as
+Pstryk settled sell, and the billed kWh matches the Sigen trapezoid over
+the same hour (60 one-minute samples, 0.7319 kWh vs 0.733 kWh). Adjacent
+hours return to ~0.006 kWh sell, so this is not a stuck meter offset.
 
-The hour that should close 3c is **22:00–23:00Z** (~0.74 kWh Sigen-side).
-Re-check `billing_meter` / `pstryk_meter_intervals` after that frame
-appears (meter refresh every 15 min).
+The 21:00Z hour (3a) settled 0.099 kWh sell vs 0.011 the hour before, so
+Pstryk registered *some* export, but Sigen only integrates 0.070 kWh and
+that hour also has unrelated spikes. 3c is closed on the 3b hour, not on
+the 3a pulse.
 
 ## What this releases
 
 - 3b: ESS First battery export tracks 2 / 4 / 6 kW commands with last=`ok`
   and stays inside `EO_BATTERY_CONTROL_MAX_GRID_EXPORT_KW`.
-- 3c: not closed. Pstryk is selling *something* in the 3a hour; wait for
-  the 3b hour to settle before treating billed kWh as matched.
+- 3c: the 22:00Z commanded-export hour is billed. Pstryk sell 0.733 kWh
+  matches Sigen 0.732 kWh. Checkpoint 3 is closed for night battery export.
 
 ## What remains blocked
 
-- Tight 3c match for the 22:00Z hour (pending settlement).
 - 2d PV First vs ESS First with PV present.
 - Unattended control; fallback-while-exporting.
