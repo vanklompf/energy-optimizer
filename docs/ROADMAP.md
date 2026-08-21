@@ -19,6 +19,9 @@ scripts (now in [`archive/`](./archive/)). Read [`DESIGN.md`](./DESIGN.md) first
   continuously with grid charge, discharge, and export enabled; the operator
   reviews daily rather than attending each command. The operating document is
   [`OPERATIONS.md`](./OPERATIONS.md).
+- HpeNas entered Stage 2 on 2026-08-22. The first autonomous interval selected
+  discharge/export, completed with physical verification, and retained a healthy
+  watchdog, active lease, and clear lockout state.
 - Live battery actuation is gated on `mode == "control"` and
   `battery_control_enabled` only. Lockouts auto-expire after cooldown and can be
   cleared from the API. Compose reads `EO_MODE` from `.env` (default `dry_run`)
@@ -119,7 +122,8 @@ Simplify runtime safety in
   (fallback to local control, retry after a cooldown), plus an explicit
   manual-clear control endpoint.
 - Keep the independent `control_authorized` blockers for stale/missing inputs,
-  lease ownership, watchdog health, and manual override.
+  lease ownership, and watchdog health. The operator override is stopping the
+  container, not application state.
 
 Tests: **delete** tests that only assert the removed ceremony (arm token,
 evidence ID, dead settings) rather than repairing them. Keep and adapt tests that
@@ -152,8 +156,9 @@ go-live if you would rather commission first.
 - The SPA badge in
   [`frontend/src/App.tsx`](../frontend/src/App.tsx) is hardcoded to `dry_run`;
   drive it from `/api/status`.
-- Add authenticated control-mutation endpoints (enable/disable actuation, clear
-  lockout) if live operation should be controllable from the UI.
+- Add the authenticated lockout-clear endpoint. Actuation remains deployment
+  configuration; the operator override is `docker stop energy-optimizer`, not an
+  in-process UI toggle.
 
 ## Stage 1 — attended commissioning at the site (done)
 

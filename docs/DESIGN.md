@@ -175,8 +175,12 @@ good state — not to act as a certified safety system.
 - **Single-owner lease.** Only one controller instance may actuate at a time.
 - **Fail-closed on stale inputs.** Missing/stale telemetry, SoC, prices, or plan
   → no economic actuation (fallback only).
-- **Manual intervention wins.** Operator/manual changes at the inverter take
-  precedence over the app.
+- **Operator stop is the manual override.** The operator runs
+  `docker stop energy-optimizer`; `restart: unless-stopped` keeps it stopped until
+  an explicit start. Graceful shutdown performs fallback, and the independent
+  watchdog covers a hung or killed process. The app never receives Docker-socket
+  access and never stops its own container. Ad hoc inverter or HA changes while
+  PvOpti is running are not an override and may be replaced by the next command.
 - **FSM discipline.** No direct charge↔discharge flip; transitions pass through
   idle/fallback.
 
@@ -201,7 +205,7 @@ FastAPI serves the SPA and a read-oriented REST API:
 GET  /api/status /api/prices /api/plan /api/runs /api/reports/daily
 GET  /api/savings /api/comparison/hourly
 GET  /api/control/actions /api/control/shadow-observations
-POST /api/control/actuation /api/control/lockout/clear
+POST /api/control/lockout/clear
 POST /api/backtest
 GET  /healthz
 ```

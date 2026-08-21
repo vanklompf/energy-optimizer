@@ -32,7 +32,7 @@ refuses export without discharge, so a half-configured inventory fails at deploy
 time rather than at the inverter.
 
 ```bash
-/mnt/nas/media/code/AnsibleNasConfigs/.cursor/skills/deploy-ansible-nas/deploy-ansible-nas.sh HpeNas energy_optimizer
+/mnt/nas/media/code/HomeLab/AnsibleNasConfigs/.cursor/skills/deploy-ansible-nas/deploy-ansible-nas.sh HpeNas energy_optimizer
 ```
 
 Before the first live deploy, confirm the Sigen integration has `read_only:
@@ -106,15 +106,22 @@ than it asked for.
 
 ## Aborting
 
-Turn `switch.sigen_plant_remote_ems_controlled_by_home_assistant` off in HA. That
-returns the inverter to local self-consumption immediately and is always
-available.
+The operator override is:
 
-To stop PvOpti from re-arming, `POST /api/control/actuation {"enabled": false}`,
-which takes effect without a redeploy. Set
-`input_boolean.pvopti_battery_control_emergency_off` if a fresh heartbeat must not
-clear the fault. Reverting the inventory gates and redeploying is the durable
-version of the same thing, but it is slower and is not the first move.
+```bash
+docker stop energy-optimizer
+```
+
+An intentional stop remains stopped because the container uses
+`restart: unless-stopped`. Graceful shutdown performs a verified fallback before
+exit; if the process is hung or must be killed, heartbeat expiry makes the
+independent HA watchdog restore local control. The app does not stop its own
+container and has no Docker-socket access.
+
+Do not use an HA Remote EMS change or an in-process API toggle as the override:
+either can be replaced by a later control cycle or restart. Start the container
+again only after review; startup reconciliation leaves unexpected Remote EMS
+ownership before normal authorization can resume.
 
 Aborting is for a control fault, not for an expensive hour. Economic mistakes are
 expected and are not a reason to intervene.

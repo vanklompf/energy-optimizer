@@ -72,7 +72,7 @@ this source tree into `energy-optimizer:local`. Never start a separate Compose s
 against the live site.
 
 ```bash
-/mnt/nas/media/code/AnsibleNasConfigs/.cursor/skills/deploy-ansible-nas/deploy-ansible-nas.sh HpeNas energy_optimizer
+/mnt/nas/media/code/HomeLab/AnsibleNasConfigs/.cursor/skills/deploy-ansible-nas/deploy-ansible-nas.sh HpeNas energy_optimizer
 ```
 
 Gate values live in `HpeNas/group_vars/nas/main.yml` as
