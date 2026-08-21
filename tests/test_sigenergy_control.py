@@ -115,6 +115,7 @@ class FakePhysical:
             grid_export_kw=snap.grid_export_kw,
             soc_pct=snap.soc_pct,
             ems_mode=snap.ems_mode,
+            pv_power_kw=snap.pv_power_kw,
             sampled_at=now,
             battery_power_updated_at=now,
             grid_import_updated_at=now,
@@ -146,6 +147,7 @@ def _phys(
     updated_at: dt.datetime | None = None,
     charge_limit_kw: float | None = None,
     discharge_limit_kw: float | None = None,
+    pv_kw: float | None = None,
 ) -> PhysicalSnapshot:
     ts = updated_at or dt.datetime.now(tz=dt.UTC)
     return PhysicalSnapshot(
@@ -154,6 +156,7 @@ def _phys(
         grid_export_kw=grid_out,
         soc_pct=soc,
         ems_mode=ems_mode,
+        pv_power_kw=pv_kw,
         sampled_at=ts,
         battery_power_updated_at=ts,
         grid_import_updated_at=ts,
@@ -398,6 +401,34 @@ async def test_export_uses_ess_first_mode_and_requires_physical_export() -> None
         data["option"] for domain, _, data in result.service_calls if domain == "select"
     ]
     assert options[-1] == "Command Discharging (ESS First)"
+
+
+@pytest.mark.asyncio
+async def test_export_uses_pv_first_when_pv_is_producing() -> None:
+    settings = _discharge_settings(battery_export_enabled=True)
+    ha = _armed_ha(settings)
+    physical = FakePhysical(
+        [
+            _phys(-0.36, ems_mode="Standby", pv_kw=1.4),
+            _phys(-0.05, ems_mode="Standby", pv_kw=1.4),
+            _phys(
+                -2.0,
+                grid_out=1.5,
+                soc=60.0,
+                ems_mode="Command Discharging (PV First)",
+                discharge_limit_kw=2.0,
+                pv_kw=1.4,
+            ),
+        ]
+    )
+    controller = _stepping_controller(ha, physical, settings)
+    result = await controller.apply_intent(_discharge_intent(power=2.0, export=True))
+
+    assert result.control.failure_reason is None
+    options = [
+        data["option"] for domain, _, data in result.service_calls if domain == "select"
+    ]
+    assert options[-1] == "Command Discharging (PV First)"
 
 
 @pytest.mark.asyncio
@@ -913,6 +944,18 @@ def _stale_probe(
     )
 
 
+def _stale(
+    controller: SigenergyController,
+    sample: PhysicalSnapshot,
+    started: dt.datetime,
+    *,
+    soc_headroom_pct: float = 80.0,
+) -> str | None:
+    return controller._reject_stale_sample(
+        sample, started, soc_headroom_pct=soc_headroom_pct
+    )
+
+
 def test_soc_lagging_the_command_is_accepted_within_its_age_bound() -> None:
     # SoC emits only on a 0.1% change (~65s at 1 kW), far slower than the verification
     # deadline, so a pre-command SoC timestamp must not reject an otherwise sound sample.
@@ -922,15 +965,26 @@ def test_soc_lagging_the_command_is_accepted_within_its_age_bound() -> None:
 
     assert sample.soc_updated_at is not None
     assert sample.soc_updated_at < started  # genuinely pre-command
-    assert controller._reject_stale_sample(sample, started) is None
+    assert _stale(controller, sample, started) is None
 
 
-def test_soc_beyond_its_age_bound_is_rejected() -> None:
+def test_pinned_soc_far_from_cutoff_is_accepted() -> None:
+    # 2026-08-19: SoC pinned at 100% for hours failed every cycle of a daylight export.
+    # Age cannot tell "full and steady" from "feed dead"; battery power already proved
+    # the integration is live, so accept the reading while it has headroom.
     started = dt.datetime(2026, 8, 17, 18, 0, tzinfo=dt.UTC)
     controller = SigenergyController(FakeHa(), _settings())  # type: ignore[arg-type]
     sample = _stale_probe(command_started_at=started, soc_age_s=3600.0)
 
-    assert controller._reject_stale_sample(sample, started) == "stale_soc"
+    assert _stale(controller, sample, started, soc_headroom_pct=80.0) is None
+
+
+def test_pinned_soc_near_cutoff_is_rejected() -> None:
+    started = dt.datetime(2026, 8, 17, 18, 0, tzinfo=dt.UTC)
+    controller = SigenergyController(FakeHa(), _settings())  # type: ignore[arg-type]
+    sample = _stale_probe(command_started_at=started, soc_age_s=3600.0)
+
+    assert _stale(controller, sample, started, soc_headroom_pct=2.0) == "stale_soc"
 
 
 def test_fast_signals_still_must_be_post_command() -> None:
@@ -942,7 +996,7 @@ def test_fast_signals_still_must_be_post_command() -> None:
         battery_power_updated_at=started - dt.timedelta(seconds=5),
     )
 
-    assert controller._reject_stale_sample(sample, started) == "stale_pre_command:battery_power"
+    assert _stale(controller, sample, started) == "stale_pre_command:battery_power"
 
 
 def test_battery_power_timestamp_just_before_command_started_is_not_stale() -> None:
@@ -958,7 +1012,7 @@ def test_battery_power_timestamp_just_before_command_started_is_not_stale() -> N
     sample.grid_import_kw = 1.17
     sample.grid_import_updated_at = started - dt.timedelta(milliseconds=2)
 
-    assert controller._reject_stale_sample(sample, started) is None
+    assert _stale(controller, sample, started) is None
 
 
 def test_pinned_zero_grid_export_may_predate_a_charge_command() -> None:
@@ -968,7 +1022,7 @@ def test_pinned_zero_grid_export_may_predate_a_charge_command() -> None:
     sample.grid_export_kw = 0.0
     sample.grid_export_updated_at = started - dt.timedelta(seconds=8)
 
-    assert controller._reject_stale_sample(sample, started) is None
+    assert _stale(controller, sample, started) is None
 
 
 def test_nonzero_stale_grid_export_is_still_rejected() -> None:
@@ -978,7 +1032,7 @@ def test_nonzero_stale_grid_export_is_still_rejected() -> None:
     sample.grid_export_kw = 0.4
     sample.grid_export_updated_at = started - dt.timedelta(seconds=8)
 
-    assert controller._reject_stale_sample(sample, started) == "stale_pre_command:grid_export"
+    assert _stale(controller, sample, started) == "stale_pre_command:grid_export"
 
 
 def test_missing_soc_timestamp_is_still_rejected() -> None:
@@ -987,7 +1041,7 @@ def test_missing_soc_timestamp_is_still_rejected() -> None:
     sample = _stale_probe(command_started_at=started, soc_age_s=10.0)
     sample.soc_updated_at = None
 
-    assert controller._reject_stale_sample(sample, started) == "stale_timestamp_missing:soc"
+    assert _stale(controller, sample, started) == "stale_timestamp_missing:soc"
 
 
 @pytest.mark.asyncio

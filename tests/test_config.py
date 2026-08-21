@@ -99,6 +99,8 @@ def test_battery_control_defaults_are_non_actuating() -> None:
     assert s.battery_control_mode_charge_grid_first == "Command Charging (Grid First)"
     assert s.battery_control_discharge_command_mode == "Command Discharging (PV First)"
     assert s.battery_control_export_command_mode == "Command Discharging (ESS First)"
+    assert s.battery_control_export_pv_command_mode == "Command Discharging (PV First)"
+    assert s.terminal_soc_salvage_auto is True
     assert s.battery_control_fallback_mode == "Standby"
     assert s.battery_control_local_charge_limit_kw == 8.8
     assert s.battery_control_local_discharge_limit_kw == 9.6
@@ -150,6 +152,11 @@ def test_control_mode_requires_enabled_gate() -> None:
             "discharging mode",
         ),
         ("battery_control_export_command_mode", "Maximum Self Consumption", "discharging mode"),
+        (
+            "battery_control_export_pv_command_mode",
+            "Maximum Self Consumption",
+            "discharging mode",
+        ),
         ("battery_control_discharge_command_mode", "Unknown", "mode|Unknown|option"),
         ("battery_control_max_charge_kw", 0.0, "charge.*kw|positive|non.?positive"),
         ("battery_control_max_discharge_kw", -1.0, "discharge.*kw|positive|non.?positive"),

@@ -139,7 +139,13 @@ class Settings(BaseSettings):
     allow_grid_charging: bool = True
     minimum_export_spread_pln_kwh: float = 0.30
     grid_charge_margin_pln_kwh: float = 0.30
+    # Energy still stored when the horizon ends. Leaving this at zero makes the solver
+    # value it at nothing, and because the horizon ends at Pstryk's publication edge —
+    # as little as ~10 h out — that is a standing incentive to empty the battery toward
+    # that edge. Zero now means "derive it from the horizon's own prices" (see
+    # `terminal_salvage_price`); set a positive value to pin it explicitly.
     terminal_soc_salvage_pln_kwh: float = 0.0
+    terminal_soc_salvage_auto: bool = True
     # Upper bound on the price window fetched for a plan, not the planning horizon
     # itself. Pstryk is the sole price source and intervals exist only where it has
     # published, so the effective horizon is its coverage: roughly 10 h just before
@@ -225,10 +231,15 @@ class Settings(BaseSettings):
     # Active command mode used when charging under Remote EMS.
     battery_control_command_mode: str = SIGENERGY_MODE_COMMAND_CHARGING_GRID_FIRST
     # Discharging to house load lets PV serve the load first; deliberate export asks the
-    # ESS to back the exported energy. Both remain settings because neither Sigenergy
-    # discharge mode is physically characterized at this site.
+    # ESS to back the exported energy.
     battery_control_discharge_command_mode: str = SIGENERGY_MODE_COMMAND_DISCHARGING_PV_FIRST
     battery_control_export_command_mode: str = SIGENERGY_MODE_COMMAND_DISCHARGING_ESS_FIRST
+    # ESS First curtails PV to zero whenever PV is producing, at any discharge limit
+    # (measured 2026-08-19 at both 0.5 kW and 4.0 kW). Exporting under it in daylight
+    # therefore throws away generation to sell stored energy. PV First keeps PV on and
+    # exports PV plus battery, so export switches modes on measured PV.
+    battery_control_export_pv_command_mode: str = SIGENERGY_MODE_COMMAND_DISCHARGING_PV_FIRST
+    battery_control_export_pv_threshold_kw: float = Field(default=0.2, ge=0)
     battery_control_fallback_mode: str = SIGENERGY_MODE_STANDBY
 
     # Explicit local-restore values; never populate from HA number-entity fallback states.
@@ -253,6 +264,11 @@ class Settings(BaseSettings):
     # SoC emits only on a 0.1% change, so it is bounded by age rather than required to
     # update within a command's verification window.
     battery_control_max_soc_age_seconds: float = Field(default=300.0, ge=0)
+    # A pinned SoC stops emitting entirely, so age alone cannot distinguish "full and
+    # steady" from "feed dead". Verification already proves the integration is live via
+    # post-command battery power, so an over-age SoC is accepted when it sits this far
+    # from the cut-off it guards — far enough that drift cannot have crossed it.
+    battery_control_stale_soc_headroom_pct: float = Field(default=10.0, ge=0, le=100)
     battery_control_command_poll_seconds: float = Field(default=1.0, ge=0)
     battery_control_command_timeout_seconds: float = Field(default=30.0, ge=0)
     # Contract: physical Standby/command verification deadline is at least 15 seconds.
@@ -340,6 +356,9 @@ class Settings(BaseSettings):
             "battery_control_command_mode": self.battery_control_command_mode,
             "battery_control_discharge_command_mode": self.battery_control_discharge_command_mode,
             "battery_control_export_command_mode": self.battery_control_export_command_mode,
+            "battery_control_export_pv_command_mode": (
+                self.battery_control_export_pv_command_mode
+            ),
         }
         mode_fields = {
             "battery_control_mode_standby": self.battery_control_mode_standby,
@@ -360,6 +379,7 @@ class Settings(BaseSettings):
         for name in (
             "battery_control_discharge_command_mode",
             "battery_control_export_command_mode",
+            "battery_control_export_pv_command_mode",
         ):
             value = mode_fields[name]
             if value not in SIGENERGY_DISCHARGE_MODES:

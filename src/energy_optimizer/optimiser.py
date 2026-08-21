@@ -60,6 +60,7 @@ class OptimiserParams:
     grid_charge_margin_pln_kwh: float = 0.0
     minimum_export_spread_pln_kwh: float = 0.0
     terminal_soc_salvage_pln_kwh: float = 0.0
+    terminal_soc_salvage_auto: bool = False
     preserve_terminal_soc: bool = False
     ev_charge_power_kw: float = 0.0
     ev_target_slots: int = 0
@@ -101,6 +102,35 @@ class OptimiseResult:
     steps: list[PlanStepResult] = field(default_factory=list)
     solve_ms: float = 0.0
     solver: str = "unknown"
+
+
+def terminal_salvage_price(
+    params: OptimiserParams, intervals: list[IntervalInput]
+) -> float:
+    """Value of a kWh still stored when the horizon ends, in PLN/kWh.
+
+    Zero makes the solver treat leftover energy as worthless, and since the horizon
+    ends at Pstryk's publication edge — sometimes only ~10 h out — that biases every
+    plan toward emptying the battery into that edge. Derive it instead from the
+    cheapest import the horizon can actually see: stored energy is worth at least what
+    buying it back would cost, after discharge losses and the cycle's degradation. The
+    cheapest visible price keeps this a floor rather than speculation, so it removes
+    the dump bias without inventing arbitrage the prices do not support.
+    """
+    if params.terminal_soc_salvage_pln_kwh:
+        return params.terminal_soc_salvage_pln_kwh
+    if not params.terminal_soc_salvage_auto:
+        return 0.0
+    buys = [
+        itv.buy_price + params.import_price_adjustment_pln_kwh
+        for itv in intervals
+        if itv.price_is_real
+    ]
+    if not buys:
+        return 0.0
+    return max(
+        0.0, min(buys) * params.eta_discharge - params.degradation_cost_pln_per_kwh
+    )
 
 
 def optimise(
@@ -209,8 +239,9 @@ def optimise(
         obj_terms.append(
             is_ev_opportunistic[i] * i * itv.dt_hours * params.ev_early_start_value_pln_per_hour
         )
-    if params.terminal_soc_salvage_pln_kwh and not params.preserve_terminal_soc:
-        obj_terms.append(-soc[n - 1] * params.terminal_soc_salvage_pln_kwh)
+    salvage = terminal_salvage_price(params, intervals)
+    if salvage and not params.preserve_terminal_soc:
+        obj_terms.append(-soc[n - 1] * salvage)
     prob += pulp.lpSum(obj_terms)
 
     for i, itv in enumerate(intervals):

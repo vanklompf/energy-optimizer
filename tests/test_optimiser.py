@@ -4,7 +4,12 @@ import math
 
 import pytest
 
-from energy_optimizer.optimiser import IntervalInput, OptimiserParams, optimise
+from energy_optimizer.optimiser import (
+    IntervalInput,
+    OptimiserParams,
+    optimise,
+    terminal_salvage_price,
+)
 
 
 def make_params(**overrides) -> OptimiserParams:
@@ -558,3 +563,93 @@ def test_reason_codes_distinguish_self_consumption_and_ev() -> None:
     assert result.status == "optimal"
     assert "ev_guaranteed" in result.steps[0].reason_codes
     assert any("self_consumption" in s.reason_codes for s in result.steps)
+
+
+def test_terminal_salvage_uses_cheapest_real_import() -> None:
+    intervals = [
+        IntervalInput(
+            interval_start="2026-08-21T00:00:00+00:00",
+            dt_hours=1.0,
+            pv_energy_kwh=0.0,
+            load_energy_kwh=0.0,
+            buy_price=0.40,
+            sell_price=0.10,
+            price_is_real=True,
+        ),
+        IntervalInput(
+            interval_start="2026-08-21T01:00:00+00:00",
+            dt_hours=1.0,
+            pv_energy_kwh=0.0,
+            load_energy_kwh=0.0,
+            buy_price=1.20,
+            sell_price=0.10,
+            price_is_real=True,
+        ),
+        IntervalInput(
+            interval_start="2026-08-21T02:00:00+00:00",
+            dt_hours=1.0,
+            pv_energy_kwh=0.0,
+            load_energy_kwh=0.0,
+            buy_price=0.05,
+            sell_price=0.10,
+            price_is_real=False,
+        ),
+    ]
+    params = make_params(terminal_soc_salvage_auto=True)
+    expected = max(0.0, 0.40 * math.sqrt(0.9) - 0.05)
+    assert terminal_salvage_price(params, intervals) == pytest.approx(expected)
+
+
+def test_explicit_terminal_salvage_overrides_auto() -> None:
+    intervals = [
+        IntervalInput(
+            interval_start="2026-08-21T00:00:00+00:00",
+            dt_hours=1.0,
+            pv_energy_kwh=0.0,
+            load_energy_kwh=0.0,
+            buy_price=0.40,
+            sell_price=0.10,
+        )
+    ]
+    params = make_params(terminal_soc_salvage_pln_kwh=0.8, terminal_soc_salvage_auto=True)
+    assert terminal_salvage_price(params, intervals) == pytest.approx(0.8)
+
+
+def test_terminal_salvage_off_is_zero() -> None:
+    intervals = [
+        IntervalInput(
+            interval_start="2026-08-21T00:00:00+00:00",
+            dt_hours=1.0,
+            pv_energy_kwh=0.0,
+            load_energy_kwh=0.0,
+            buy_price=0.40,
+            sell_price=0.10,
+        )
+    ]
+    params = make_params(terminal_soc_salvage_auto=False)
+    assert terminal_salvage_price(params, intervals) == 0.0
+
+
+def test_terminal_salvage_keeps_energy_that_would_otherwise_export() -> None:
+    intervals = [
+        IntervalInput(
+            interval_start=f"2026-08-21T{h:02d}:00:00+00:00",
+            dt_hours=1.0,
+            pv_energy_kwh=0.0,
+            load_energy_kwh=0.0,
+            buy_price=0.50,
+            sell_price=0.40,
+        )
+        for h in range(3)
+    ]
+    dumped = optimise(intervals, 8.0, make_params(terminal_soc_salvage_auto=False))
+    kept = optimise(
+        intervals, 8.0, make_params(terminal_soc_salvage_pln_kwh=10.0)
+    )
+    assert dumped.status == "optimal"
+    assert kept.status == "optimal"
+    dumped_export = sum(s.battery_to_grid_kwh for s in dumped.steps)
+    kept_export = sum(s.battery_to_grid_kwh for s in kept.steps)
+    assert dumped_export > 1.0
+    assert kept_export < 0.1
+    assert kept.steps[-1].soc_kwh_end >= 8.0 - 0.05

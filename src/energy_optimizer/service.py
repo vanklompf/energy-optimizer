@@ -678,6 +678,7 @@ class Service(BatteryMixin, PlanningMixin):
             grid_charge_margin_pln_kwh=s.grid_charge_margin_pln_kwh,
             minimum_export_spread_pln_kwh=s.minimum_export_spread_pln_kwh,
             terminal_soc_salvage_pln_kwh=s.terminal_soc_salvage_pln_kwh,
+            terminal_soc_salvage_auto=s.terminal_soc_salvage_auto,
             ev_charge_power_kw=s.ev_charge_power_kw if ev else 0.0,
             ev_target_slots=ev.target_slots if ev else 0,
             ev_minimum_slots=ev.minimum_slots if ev else 0,

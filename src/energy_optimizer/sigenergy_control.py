@@ -28,6 +28,7 @@ from .ha_client import (
     ENTITY_BATTERY_POWER,
     ENTITY_GRID_EXPORT_POWER,
     ENTITY_GRID_IMPORT_POWER,
+    ENTITY_PV_POWER,
     ENTITY_SOC,
     AckResult,
     AckStatus,
@@ -54,6 +55,7 @@ class PhysicalSnapshot:
     grid_export_kw: float | None
     soc_pct: float | None
     ems_mode: str | None = None
+    pv_power_kw: float | None = None
     sampled_at: dt.datetime | None = None
     battery_power_updated_at: dt.datetime | None = None
     grid_import_updated_at: dt.datetime | None = None
@@ -307,6 +309,20 @@ class SigenergyController:
         self._last_direction = ControlDirection.CHARGE
         return self._commanded(command_id, ControllerState.ACTIVE_CHARGE, mode, t0)
 
+    async def _export_mode(self) -> str:
+        """Choose the export discharge mode from measured PV.
+
+        ESS First zeroes PV whenever it is producing, at any discharge limit, so under
+        it a daylight export sells stored energy while discarding generation. PV First
+        keeps PV on and exports PV plus battery. An unreadable PV sensor keeps ESS
+        First: it exports strictly less, and the export bounds still fail closed.
+        """
+        s = self._settings
+        pv_kw = (await self._read_physical()).pv_power_kw
+        if pv_kw is not None and pv_kw > s.battery_control_export_pv_threshold_kw:
+            return s.battery_control_export_pv_command_mode
+        return s.battery_control_export_command_mode
+
     async def _command_discharge(
         self,
         intent: BatteryControlIntent,
@@ -317,7 +333,7 @@ class SigenergyController:
     ) -> SigenergyControlResult:
         s = self._settings
         mode = (
-            s.battery_control_export_command_mode
+            await self._export_mode()
             if intent.export
             else s.battery_control_discharge_command_mode
         )
@@ -693,7 +709,12 @@ class SigenergyController:
         if physical.ems_mode is None:
             return "ems_mode_missing"
 
-        stale = self._reject_stale_sample(physical, command_started_at)
+        charge_cutoff = intent.cutoff_soc_pct - s.battery_control_charge_cutoff_margin_pct
+        stale = self._reject_stale_sample(
+            physical,
+            command_started_at,
+            soc_headroom_pct=charge_cutoff - physical.soc_pct,
+        )
         if stale is not None:
             return stale
 
@@ -722,8 +743,7 @@ class SigenergyController:
             return "unexpected_export"
         if not intent.export and physical.grid_export_kw > deadband:
             return "unplanned_export"
-        cutoff = intent.cutoff_soc_pct - s.battery_control_charge_cutoff_margin_pct
-        if physical.soc_pct >= cutoff:
+        if physical.soc_pct >= charge_cutoff:
             return "soc_cutoff_breached"
         # Ignore HA displayed 0.0 (known number-register defect); a real non-zero
         # mismatch still fails closed.
@@ -796,7 +816,12 @@ class SigenergyController:
         if physical.ems_mode is None:
             return "ems_mode_missing"
 
-        stale = self._reject_stale_sample(physical, command_started_at)
+        discharge_floor = soc_floor_pct + s.battery_control_discharge_cutoff_margin_pct
+        stale = self._reject_stale_sample(
+            physical,
+            command_started_at,
+            soc_headroom_pct=physical.soc_pct - discharge_floor,
+        )
         if stale is not None:
             return stale
 
@@ -805,7 +830,7 @@ class SigenergyController:
         # Sigenergy reports battery power negative while discharging.
         if -physical.battery_power_kw < min_kw:
             return "battery_discharge_below_min"
-        if physical.soc_pct <= soc_floor_pct + s.battery_control_discharge_cutoff_margin_pct:
+        if physical.soc_pct <= discharge_floor:
             return "soc_floor_breached"
 
         if intent.export:
@@ -841,7 +866,11 @@ class SigenergyController:
         return None
 
     def _reject_stale_sample(
-        self, physical: PhysicalSnapshot, command_started_at: dt.datetime
+        self,
+        physical: PhysicalSnapshot,
+        command_started_at: dt.datetime,
+        *,
+        soc_headroom_pct: float,
     ) -> str | None:
         deadband = self._settings.battery_control_deadband_kw
         # HA last_updated can precede command_started by a few hundred ms (observed
@@ -885,7 +914,14 @@ class SigenergyController:
         if (
             reference - physical.soc_updated_at
         ).total_seconds() > self._settings.battery_control_max_soc_age_seconds:
-            return "stale_soc"
+            # A pinned SoC stops emitting altogether, so age cannot tell "full and
+            # steady" from "feed dead" — a battery at 100% goes over this bound within
+            # the hour and then failed every cycle of the 2026-08-19 export. Reaching
+            # here already proves battery power ticked post-command, so the integration
+            # is live and the reading is pinned. What age costs is confidence in the
+            # cut-off this signal guards, so accept it only well clear of that limit.
+            if soc_headroom_pct < self._settings.battery_control_stale_soc_headroom_pct:
+                return "stale_soc"
         return None
 
     async def _read_physical(self) -> PhysicalSnapshot:
@@ -896,6 +932,7 @@ class SigenergyController:
             ENTITY_GRID_IMPORT_POWER,
             ENTITY_GRID_EXPORT_POWER,
             ENTITY_SOC,
+            ENTITY_PV_POWER,
             self.mode_select,
             self._settings.battery_control_charge_limit_entity,
             self._settings.battery_control_discharge_limit_entity,
@@ -907,6 +944,7 @@ class SigenergyController:
         grid_in = states.get(ENTITY_GRID_IMPORT_POWER)
         grid_out = states.get(ENTITY_GRID_EXPORT_POWER)
         soc = states.get(ENTITY_SOC)
+        pv = states.get(ENTITY_PV_POWER)
         mode = states.get(self.mode_select)
         charge_lim = states.get(self._settings.battery_control_charge_limit_entity)
         discharge_lim = states.get(self._settings.battery_control_discharge_limit_entity)
@@ -919,6 +957,7 @@ class SigenergyController:
             grid_export_kw=grid_out.as_float() if grid_out else None,
             soc_pct=soc.as_float() if soc else None,
             ems_mode=mode.state if mode else None,
+            pv_power_kw=pv.as_float() if pv else None,
             sampled_at=now,
             battery_power_updated_at=batt.last_updated if batt else None,
             grid_import_updated_at=grid_in.last_updated if grid_in else None,
