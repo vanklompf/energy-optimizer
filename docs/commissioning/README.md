@@ -1,11 +1,21 @@
 # Stage 1 attended commissioning runbook
 
-Status: **procedure only. Nothing below is authorization to run unattended.**
+Status: **complete and historical.** Stage 1 finished on 2026-08-20. PvOpti now runs
+continuous supervised control; the current operating document is
+[`../OPERATIONS.md`](../OPERATIONS.md). Nothing in this file is current policy — in
+particular, the per-window restrictions below (one checkpoint at a time, restore
+`read_only: true` and the non-actuating gates afterwards, record a dated note) applied
+to characterizing unknown behavior and no longer apply to running the system.
 
-This runbook covers the four Stage 1 checkpoints in [`../ROADMAP.md`](../ROADMAP.md):
-full-rate grid-import charge, discharge to house loads, grid export, and fallback.
-Every step is attended: an operator is at the site, watching physical telemetry, able
-to pull Remote EMS authority by hand at any moment.
+Keep this runbook for its procedure. It is the right shape for characterizing anything
+still uncharacterized — full-rate import above ~6.9 kW, Modbus-loss containment, or a
+new command mode — where an attended A/B/A window with a dated note remains the way to
+turn an unknown into evidence.
+
+It covers the four Stage 1 checkpoints in [`../ROADMAP.md`](../ROADMAP.md): full-rate
+grid-import charge, discharge to house loads, grid export, and fallback. Every step is
+attended: an operator is at the site, watching physical telemetry, able to pull Remote
+EMS authority by hand at any moment.
 
 Read [`../DESIGN.md`](../DESIGN.md) and
 [`../sigenergy-control-contract.md`](../sigenergy-control-contract.md) first. The
@@ -21,7 +31,10 @@ Record one dated note per checkpoint in this directory. Existing notes
 [fallback stop/pause while discharging](./2026-08-18-fallback-stop-pause-discharge.md),
 [fallback HA restart / Modbus loss while discharging](./2026-08-18-fallback-ha-restart-modbus-discharge.md),
 [export ESS First 0.8 kW from battery](./2026-08-18-attended-export-ess-first-0p8.md),
-[export step 2/4/6 kW](./2026-08-18-attended-export-step-6kw.md)) are the format
+[export step 2/4/6 kW](./2026-08-18-attended-export-step-6kw.md),
+[2d PV First vs ESS First with PV present](./2026-08-19-attended-2d-pv-first-vs-ess-first.md),
+[fallback stop/pause/HA restart while charging](./2026-08-20-fallback-stop-pause-ha-restart-charge.md),
+[fallback heartbeat/Sigen reload while discharging](./2026-08-20-fallback-heartbeat-sigen-reload-discharge.md)) are the format
 to follow; a template is at the end of this file.
 
 ## What changed for Stage 1
@@ -38,18 +51,19 @@ thing standing between the planner and the inverter is configuration:
 | Export | `EO_BATTERY_EXPORT_ENABLED` (on top of discharge) | false |
 
 Discharge uses `EO_BATTERY_CONTROL_DISCHARGE_COMMAND_MODE`
-(`Command Discharging (PV First)`); export uses
-`EO_BATTERY_CONTROL_EXPORT_COMMAND_MODE` (`Command Discharging (ESS First)`). Neither
-Sigenergy discharge mode has ever been physically exercised at this site, which is the
-whole point of checkpoints 2 and 3.
+(`Command Discharging (PV First)`). Night export uses
+`EO_BATTERY_CONTROL_EXPORT_COMMAND_MODE` (`Command Discharging (ESS First)`);
+daylight export switches to `EO_BATTERY_CONTROL_EXPORT_PV_COMMAND_MODE`
+(`Command Discharging (PV First)`) when measured PV exceeds the threshold,
+because ESS First curtails PV to zero at any discharge limit (2d, 2026-08-19).
+Both discharge modes are characterized.
 
 During a discharge command PvOpti also writes the operating reserve
-(`EO_BATTERY_CONTROL_MIN_SOC_PCT`) into the inverter's discharge cut-off register. This
-defaults to 15% in the image but is **relaxed to 2% on HpeNas for the commissioning
-windows** (`energy_optimizer_battery_control_min_soc_pct`), matching the 2% site operating
-reserve so attended discharge/export tests have room; it is raised back before unattended
-operation. Cut-off enforcement is itself uncharacterized, so software verification still
-rejects any sample within `EO_BATTERY_CONTROL_DISCHARGE_CUTOFF_MARGIN_PCT` of the floor.
+(`EO_BATTERY_CONTROL_MIN_SOC_PCT`) into the inverter's discharge cut-off register.
+HpeNas runs this at **2%**, matching the site operating reserve. That is policy,
+not a temporary commissioning relaxation. Cut-off enforcement is itself
+uncharacterized, so software verification still rejects any sample within
+`EO_BATTERY_CONTROL_DISCHARGE_CUTOFF_MARGIN_PCT` of the floor.
 
 ## Deployment
 
@@ -177,7 +191,7 @@ curl -X POST http://<host>:8320/api/control/manual-command \
    at least half the commanded limit, grid export stays under the 0.12 kW deadband, grid
    import falls by roughly the discharged power.
 4. Read the discharge cut-off register raw and confirm it holds the configured control
-   reserve (`EO_BATTERY_CONTROL_MIN_SOC_PCT`, 2% for the commissioning windows), not 0%.
+   reserve (`EO_BATTERY_CONTROL_MIN_SOC_PCT`, 2% on HpeNas), not 0%.
 5. Step up to roughly house load. Do not exceed it in this checkpoint.
 6. Release to state A.
 
@@ -224,10 +238,12 @@ settled data, and release restores A.
 
 ## Checkpoint 4 — fallback
 
-The heartbeat-expiry and Sigen-reload paths already passed
-([2026-08-14](./2026-08-14-sigen-integration-reload-fallback.md)). The gaps are process
-loss, HA restart, and Modbus/network loss — and none of them has been tested while
-*discharging*.
+The heartbeat-expiry and Sigen-reload paths passed on charge
+([2026-08-14](./2026-08-14-sigen-integration-reload-fallback.md)) and on
+discharge
+([2026-08-20](./2026-08-20-fallback-heartbeat-sigen-reload-discharge.md)).
+Process stop/hang and HA restart passed on both polarities. Modbus/network
+loss failed on discharge — do not re-run.
 
 Run each fault from an active, verified command. Repeat the set once while charging and
 once while discharging, since the recovery direction differs.
@@ -246,18 +262,20 @@ that leaves Remote EMS on, or that restores limits to `0.0`, is a hard failure.
 **Pass:** every fault returns the inverter to local self-consumption with state A
 restored, from both charge and discharge, with no path that turns Remote EMS on.
 
-## After every window
+## After a characterization window
 
-Restore `read_only: true`, disable the six control entities in the registry, set the
-PvOpti gates back to their non-actuating values, redeploy, and confirm state A one last
-time from raw Modbus.
+Applies only when running one of these procedures against otherwise-uncharacterized
+behavior, and only if you took the site out of its normal operating configuration to do
+it. Put the gates back the way [`../OPERATIONS.md`](../OPERATIONS.md) specifies and
+confirm the inverter is where you expect from raw Modbus. During ordinary live
+operation there is nothing to restore — control stays armed.
 
 ## Note template
 
 ```markdown
 # <checkpoint> — YYYY-MM-DD
 
-Status: **passed|failed for <exact scope>; not authorization for unattended control.**
+Status: **passed|failed for <exact scope>.**
 
 ## Scope
 

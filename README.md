@@ -88,9 +88,12 @@ Stationary battery control defaults to non-actuating: `EO_MODE=dry_run` and
 `EO_BATTERY_EXPORT_ENABLED`), and valid entity/limit/timing config. The planner flags
 `EO_ALLOW_GRID_CHARGING` / `EO_ALLOW_BATTERY_EXPORT` only affect what the plan may
 recommend; they do not by themselves actuate the inverter. Compose reads `EO_MODE`
-from `.env` and defaults to `dry_run`. See the [roadmap](./docs/ROADMAP.md) for the
-go-live path and the [Sigenergy control contract](./docs/sigenergy-control-contract.md)
-before enabling control.
+from `.env` and defaults to `dry_run`, so a fresh checkout is inert; the deployed
+HpeNas inventory is what sets the live mode. The site is moving to unattended
+live control — see [operations](./docs/OPERATIONS.md) for the gate values and
+review cadence, the [roadmap](./docs/ROADMAP.md) for where that sits, and the
+[Sigenergy control contract](./docs/sigenergy-control-contract.md) for what is
+and is not physically characterized.
 
 ## Deployment
 

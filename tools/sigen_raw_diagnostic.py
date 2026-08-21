@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only Sigen Modbus/TCP diagnostic for the PvOpti commissioning gates.
+"""Read-only Sigen Modbus/TCP diagnostic.
 
 This tool sends Modbus function 0x03 requests only.  It intentionally has no
 write implementation and it never enables Remote EMS.  The narrow register list

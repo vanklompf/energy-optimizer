@@ -2,35 +2,48 @@
 
 ## Safety Boundary
 
-PvOpti is in **Stage 1 commissioning**. Finite-duration live actuation tests
-against the site inverter are allowed without additional approvals. Follow
-[`docs/commissioning/README.md`](docs/commissioning/README.md): one checkpoint
-per window, restore non-actuating gates and `read_only: true` when the window
-ends, and record a dated note. Do not leave `EO_MODE=control` armed after the
-test.
+PvOpti is moving to **unattended live operation**. Write code and docs for a
+system that stays in `EO_MODE=control` with grid charge, discharge, and export
+enabled. That is the normal state of this repo, not an exception that needs
+justifying, restoring, or recording.
+
+There is no per-window checkpoint limit, no requirement to restore
+`read_only: true` or the non-actuating gates at the end of a session, and no
+need to record a dated note for ordinary operation. Notes are for
+characterizing new behavior, not for running. Follow
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md) for going live, aborting, and the
+path from daily review into weekly (unattended) review.
+
+Changes should reduce supervision, not add it. Do not add gates, ceremony, arm
+tokens, or attended-only restrictions. If a failure mode needs containing,
+contain it in code that recovers on its own.
 
 - Ordinary development, tests, and CI remain non-actuating. Use the HA
   emulator/fakes and dummy credentials. Do not contact the live inverter from
   pytest, `make test`, or a local Compose stack.
-- Live actuation tests may use live Home Assistant credentials, enable writable
-  entities, deploy the `energy_optimizer` role, arm control for the window, and
-  run `tools/sigen_raw_diagnostic.py` (reads only). Deploy only via ansible-nas
-  to HpeNas; never start a second Compose stack against the live site.
+- Deploy only via ansible-nas to HpeNas; never start a second Compose stack
+  against the live site. `tools/sigen_raw_diagnostic.py` reads only and is the
+  independent baseline whenever HA telemetry is in doubt.
 - Planner options such as `EO_ALLOW_GRID_CHARGING` and `EO_ALLOW_BATTERY_EXPORT`
   do not authorize physical control. Actuation still requires `EO_MODE=control`,
   `EO_BATTERY_CONTROL_ENABLED`, and the per-direction gate.
-- Compose defaults `EO_MODE` to `dry_run` via `${EO_MODE:-dry_run}` so going
-  live is a config change, not a code edit.
+- Compose defaults `EO_MODE` to `dry_run` via `${EO_MODE:-dry_run}` so a fresh
+  checkout is inert; the deployed HpeNas inventory is what sets the live mode.
+- The OFF-only watchdog stays. It is the one mechanism that must keep working:
+  if the app dies, the inverter returns to local self-consumption.
 - Before changing battery-control behavior or configuration gates, read
   `docs/DESIGN.md`, `docs/ROADMAP.md`, and `docs/sigenergy-control-contract.md`.
   Older handoff docs (`battery-control-context.md`, `control-runbook.md`, etc.)
   now live in `docs/archive/` and are historical only.
+- Dated notes under `docs/commissioning/` are evidence from the attended Stage 1
+  windows. They record what was true on their date and are not current
+  operating policy.
 
 ## Workflow
 
 - Use Docker/Compose v2 and the root `Makefile`; the supported workflow does not require host Python or Node. Python is 3.12 and frontend builds use Node 20.
 - Run the local gate in this order: tests, `make lint`, `make typecheck`, `make fe-build`. The Make targets rebuild the `dev` image; CI currently treats mypy as non-blocking, but local changes should still pass it.
-- `make test` currently leaves two `tests/test_sigen_raw_diagnostic.py` failures because the dev image omits `tools/`. Run the complete non-actuating suite with `make build-dev`, then `docker compose -f compose.dev.yml run --rm --no-deps -v "$PWD/tools:/app/tools:ro" app pytest -q`; this only makes the script importable by its tests. Do not execute the diagnostic from pytest. During a commissioning window it is the approved independent baseline read.
+- `make test` currently leaves two `tests/test_sigen_raw_diagnostic.py` failures because the dev image omits `tools/`. Run the complete non-actuating suite with `make build-dev`, then `docker compose -f compose.dev.yml run --rm --no-deps -v "$PWD/tools:/app/tools:ro" app pytest -q`; this only makes the script importable by its tests. Do not execute the diagnostic from pytest. It is the independent baseline whenever HA telemetry is in doubt.
 - Run one test without starting dependencies:
   `docker compose -f compose.dev.yml run --rm --no-deps app pytest tests/test_config.py::test_battery_control_defaults_are_non_actuating -v`
 - Run the API at `http://localhost:8320` with `make dev`. Run the optional Vite server at `http://localhost:5173` with `docker compose -f compose.dev.yml --profile frontend up frontend`.

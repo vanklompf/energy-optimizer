@@ -9,21 +9,25 @@ scripts (now in [`archive/`](./archive/)). Read [`DESIGN.md`](./DESIGN.md) first
 
 ## Current state
 
-- Deployed in `EO_MODE=dry_run`. The optimiser runs and publishes
-  recommendations; no inverter writes happen.
-- Stage 0 is implemented: live battery actuation is gated on `mode == "control"`
-  and `battery_control_enabled` only. Lockouts auto-expire after cooldown and can
-  be cleared from the API. Compose reads `EO_MODE` from `.env` (default `dry_run`).
+- Stage 0 and Stage 1 are complete. Grid-import charge to 4 kW, PV First
+  discharge to load, ESS First battery export at night, daylight PV First vs
+  ESS First, and the fallback set on both polarities are physically
+  characterized (see `commissioning/`). Two Stage 1 items are carried rather
+  than closed: 1d full-rate import (plateaued at ~6.4 kW; waived) and 4f
+  Modbus-loss containment (failed; do not re-run).
+- **Stage 2 supervised live operation is the current stage.** Control runs
+  continuously with grid charge, discharge, and export enabled; the operator
+  reviews daily rather than attending each command. The operating document is
+  [`OPERATIONS.md`](./OPERATIONS.md).
+- Live battery actuation is gated on `mode == "control"` and
+  `battery_control_enabled` only. Lockouts auto-expire after cooldown and can be
+  cleared from the API. Compose reads `EO_MODE` from `.env` (default `dry_run`)
+  so a fresh checkout is inert; the HpeNas inventory sets the live mode.
 - EV relay control is implemented and opt-in.
-- Attended 0.5–4 kW grid-charge, PV First discharge-to-load, ESS First
-  battery export at night, and several fallback faults are physically
-  characterized (see `commissioning/`). Remaining Stage 1 gaps: 1d full-rate
-  import, 2d PV First vs ESS First with PV present, and charge-side /
-  Modbus-loss fallback.
 
-## Assumptions (please review)
+## Assumptions
 
-These drive the whole plan. Correct any that are wrong before Stage 0.
+These drive the plan. Correct any that are wrong.
 
 1. **Equipment safety is the inverter/BMS's job.** The Sigen inverter and battery
    BMS have independent protection (voltage/current/temperature/SoC). PvOpti
@@ -40,9 +44,8 @@ These drive the whole plan. Correct any that are wrong before Stage 0.
    BMS hard floor (`battery_hard_soc_min_pct`, default 0%). The code default is 15%, but
    the HpeNas site deploys a **2%** operating reserve as normal policy (relying on the BMS
    for equipment safety per assumption 1). The control-side reserve written to the inverter
-   discharge cut-off (`battery_control_min_soc_pct`, image default 15%) is likewise relaxed
-   to 2% for the attended commissioning windows so discharge/export checkpoints have room;
-   raise it back toward 15% before unattended Stage 3 if a larger reserve is wanted.
+   discharge cut-off (`battery_control_min_soc_pct`) matches that 2%. Do not raise it
+   as a precondition for unattended operation.
 7. **EV and battery control should share one simple gating scheme:** an enable
    flag per actuator plus `EO_MODE`. No arm tokens, no evidence IDs.
 8. **OIDC stays optional**; production runs behind the operator's reverse proxy.
@@ -56,7 +59,7 @@ These drive the whole plan. Correct any that are wrong before Stage 0.
 Numbers that justify the Stage 0 passes below:
 
 - 134 settings in [`config.py`](../src/energy_optimizer/config.py), of which
-  **55 are `battery_control_*`**. Ten are dead in application code (see 0a).
+  **55 are `battery_control_*`**. Nine are dead in application code (see 0a).
 - [`service.py`](../src/energy_optimizer/service.py) is ~1,965 lines — 21% of the
   9.4k-line package — and owns telemetry, prices, optimisation, EV control,
   battery control, fallback, reconnect, and MQTT.
@@ -67,8 +70,7 @@ Numbers that justify the Stage 0 passes below:
   `test_sigenergy_control.py` (615) encoding the current gate semantics.
 
 Success criteria for Stage 0 overall: **no module over ~800 lines**, and **every
-`EO_*` setting is read by application code**. Stage 0 is done; remaining work is
-attended commissioning (Stage 1).
+`EO_*` setting is read by application code**. Stage 0 is done.
 
 ## Stage 0a — de-gate and delete dead config (done)
 
@@ -91,9 +93,11 @@ Simplify the arming model in [`config.py`](../src/energy_optimizer/config.py):
 - Keep the SoC ordering, limit, and timing validators (they protect against
   nonsense config, not ceremony).
 
-Delete these ten settings that no application code reads (they appear only in
+Delete these nine settings that no application code reads (they appear only in
 `config.py`, tests, and `.env.example`), along with their validators and
-`.env.example` entries:
+`.env.example` entries. `battery_control_discharge_cutoff_margin_pct` was on this
+list too, but Stage 1 wired it into discharge verification as the margin above the
+SoC floor, so it stays:
 
 | Setting | Note |
 |---|---|
@@ -106,7 +110,6 @@ Delete these ten settings that no application code reads (they appear only in
 | `battery_control_min_dwell_seconds` | Validated, never wired |
 | `battery_control_max_ramp_kw_per_s` | Validated, never wired |
 | `battery_control_command_settle_seconds` | Validated, never wired |
-| `battery_control_discharge_cutoff_margin_pct` | Validated, never wired |
 
 Simplify runtime safety in
 [`control_store.py`](../src/energy_optimizer/control_store.py) /
@@ -152,24 +155,18 @@ go-live if you would rather commission first.
 - Add authenticated control-mutation endpoints (enable/disable actuation, clear
   lockout) if live operation should be controllable from the UI.
 
-## Stage 1 — attended commissioning at the site
+## Stage 1 — attended commissioning at the site (done)
 
-Requires access to the live Home Assistant / Sigen instance (offered by the
-operator). For each direction, issue an app-driven command and confirm read-back
-plus physical response, then record a short note in
-[`commissioning/`](./commissioning/).
+Finished 2026-08-20. Charge, discharge, export, and fallback on both polarities
+are physically characterized; the evidence notes are in
+[`commissioning/`](./commissioning/). The runbook is historical — current
+operating policy is [`OPERATIONS.md`](./OPERATIONS.md).
 
-Discharge and export are new territory (never physically tested), so treat those
-as the real checkpoints. Step-by-step procedure, preconditions, pass criteria, and
-the abort path are in [`commissioning/README.md`](./commissioning/README.md).
-
-The code prerequisite is done: `sigenergy_control.py` no longer rejects non-charge
-commands with `command_mode_not_characterized`. It commands discharge and export
-through configurable Sigenergy discharge modes, writes the operating reserve to the
-inverter discharge cut-off register, and verifies each direction against physical
-telemetry (sign-flipped battery power, export bounds, SoC floor) before treating the
-command as applied. Live actuation still needs `EO_MODE=control`,
-`EO_BATTERY_CONTROL_ENABLED`, and the per-direction gate, all of which ship off.
+Discharge and export were the new territory at the time. The code no longer
+rejects non-charge commands with `command_mode_not_characterized`. It commands
+discharge and export through configurable Sigenergy discharge modes, writes the
+operating reserve to the inverter discharge cut-off register, and verifies each
+direction against physical telemetry before treating the command as applied.
 
 ### Prerequisites cleared on 2026-08-17
 
@@ -247,60 +244,92 @@ Status: **done** = evidence note exists; **partial** = narrower scope passed;
 | 1b | Step to ~2 kW, verify limit tracking and import coverage | done — [2026-08-17/18](./commissioning/2026-08-17-attended-charge-2-4-8p8.md) |
 | 1c | Step to ~4 kW | done — [2026-08-18](./commissioning/2026-08-18-attended-charge-4-8p8.md) |
 | 1d | Step to site cap, verify against `max_grid_import_kw` | partial — same note (last=`ok` through 6.86 kW command; battery plateaued at 6.36 kW / import 6.87 kW, never reached 8.8 kW) |
-| **2** | **Discharge to house loads** | partial |
+| **2** | **Discharge to house loads** | done |
 | 2a | Discharge below *net* load (load minus PV), zero export | done — [2026-08-18](./commissioning/2026-08-18-attended-discharge-pv-first.md) (1.0 kW vs ~2 kW load, PV First) |
 | 2b | Discharge at net load | done — same note (1.8 kW vs 1.98 kW load; left 0.18 kW import rather than sitting on the export deadband) |
 | 2c | Discharge cut-off register holds the configured control reserve (`EO_BATTERY_CONTROL_MIN_SOC_PCT`, relaxed to 2% for commissioning), raw read | done — same note (raw 2.0%) |
-| 2d | Compare `Command Discharging (PV First)` vs `(ESS First)` with PV present — 3a night export passed on `ESS First` from battery; the 17 Aug daylight result still shows `ESS First` at a 0.5 kW limit curtailing PV, so this comparison must settle whether a higher limit exports PV surplus | open |
-| **3** | **Grid export** | done (night battery export; daylight PV-surplus still 2d) |
+| 2d | Compare `Command Discharging (PV First)` vs `(ESS First)` with PV present — 3a night export passed on `ESS First` from battery; the 17 Aug daylight result still shows `ESS First` at a 0.5 kW limit curtailing PV, so this comparison must settle whether a higher limit exports PV surplus | done — [2026-08-19](./commissioning/2026-08-19-attended-2d-pv-first-vs-ess-first.md) (ESS First curtails PV at 0.5 kW *and* 4.0 kW; PV First 4.0 kW keeps PV on and exports PV + battery, 5.12–5.22 kW) |
+| **3** | **Grid export** | done (night battery export ESS First; daylight PV-surplus needs PV First per 2d) |
 | 3a | ~0.5 kW deliberate export | done — [2026-08-18](./commissioning/2026-08-18-attended-export-ess-first-0p8.md) (PvOpti `EXPORT` 0.8 kW `ESS First` at night, PV 0: battery 0.8 kW, export 0.36–0.39 kW, import 0). Prior [2026-08-17](./commissioning/2026-08-17-attended-export-ess-first-0p5.md) HA-direct 0.5 kW in daylight curtailed PV and does not contradict this. |
 | 3b | Step toward `max_grid_export_kw`, respect site export limit | done — [2026-08-18](./commissioning/2026-08-18-attended-export-step-6kw.md) (2 / 4 / 6 kW `ESS First`, last=`ok`, export 1.48 / 3.58 / 5.45 kW, never above 6.0) |
 | 3c | Reconcile exported energy against Pstryk settled sell data | done — same note (22:00Z hour: Pstryk 0.733 kWh sell vs Sigen 0.732 kWh; 23:00Z back to 0.006 kWh noise) |
 | **4** | **Fallback** | partial |
-| 4a | Heartbeat expiry | done — 2026-08-12 (charge only) |
-| 4b | Sigen integration reload | done — [2026-08-14](./commissioning/2026-08-14-sigen-integration-reload-fallback.md) (charge only) |
-| 4c | Process stop (`docker stop`) | done — [2026-08-18](./commissioning/2026-08-18-fallback-stop-pause-discharge.md) (discharge only) |
-| 4d | Process hang (`docker pause`) | done — same note (discharge only) |
-| 4e | Home Assistant restart | done — [2026-08-18](./commissioning/2026-08-18-fallback-ha-restart-modbus-discharge.md) (discharge only; `ha_start_guard` restored A, PvOpti did not resume) |
-| 4f | Modbus / network path loss | failed — same note (discharge: HA cached entities, watchdog never fired, inverter kept last Remote EMS command for 90 s; PvOpti lockouted; attended restore to A) |
-| 4g | Repeat 4a-4f while **discharging**, not just charging | partial — 4c/4d/4e discharge done; 4f discharge failed; 4a/4b discharge and all charge-side 4c–4f still open |
+| 4a | Heartbeat expiry | done — charge 2026-08-12; discharge [2026-08-20](./commissioning/2026-08-20-fallback-heartbeat-sigen-reload-discharge.md) |
+| 4b | Sigen integration reload | done — charge [2026-08-14](./commissioning/2026-08-14-sigen-integration-reload-fallback.md); discharge [2026-08-20](./commissioning/2026-08-20-fallback-heartbeat-sigen-reload-discharge.md) |
+| 4c | Process stop (`docker stop`) | done — discharge [2026-08-18](./commissioning/2026-08-18-fallback-stop-pause-discharge.md); charge [2026-08-20](./commissioning/2026-08-20-fallback-stop-pause-ha-restart-charge.md) |
+| 4d | Process hang (`docker pause`) | done — same notes (both polarities) |
+| 4e | Home Assistant restart | done — discharge [2026-08-18](./commissioning/2026-08-18-fallback-ha-restart-modbus-discharge.md); charge [2026-08-20](./commissioning/2026-08-20-fallback-stop-pause-ha-restart-charge.md) (`ha_start_guard` restored A, PvOpti did not resume) |
+| 4f | Modbus / network path loss | failed — [2026-08-18](./commissioning/2026-08-18-fallback-ha-restart-modbus-discharge.md) (discharge: HA cached entities, watchdog never fired, inverter kept last Remote EMS command for 90 s; PvOpti lockouted; attended restore to A). Do not re-run. |
+| 4g | Repeat 4a-4f while **discharging**, not just charging | partial — 4a–4e done on both polarities; 4f failed on discharge |
 
 Sub-test 2a's ceiling is net load, not gross load: with PV producing, commanding
 more than `load - pv` exports and correctly trips `unplanned_export`. Prefer a
 window with little or no PV, or add a known resistive load, so cloud movement
 cannot turn a passing test into a spurious fallback.
 
-## Stage 2 — supervised live operation
+## Stage 2 — supervised live operation (current, short)
 
-Run `EO_MODE=control` with grid-charge, discharge, and export enabled for ~1
-week, attended. Watch:
+Run `EO_MODE=control` continuously with grid charge, discharge, and export
+enabled. Review daily until the data looks boring, then drop to a weekly
+review — that drop *is* Stage 3. Gate values, abort, residual risks, and what
+to look at are in [`OPERATIONS.md`](./OPERATIONS.md). Do not invent extra
+ceremony between here and unattended operation.
 
-- Plan-vs-actual and settled Pstryk reconciliation in the Savings view.
-- Control action audit log for stale-input blocking, restart/reconnect behavior,
-  and fallback correctness.
+Three defects that only bite under continuous autonomous operation were fixed
+before entry, since none of them could have surfaced in a short attended window:
 
-## Stage 3 — steady state
+**Daylight export would have thrown away PV.** The export command mode was a
+static setting pinned to `ESS First`, which 2d proved curtails PV to zero at any
+discharge limit. Under the planner that would have sold stored energy while
+discarding live generation, and corrupted the very savings data Stage 2 exists to
+collect. `sigenergy_control.py` now chooses `PV First` when measured PV exceeds
+`battery_control_export_pv_threshold_kw` and keeps `ESS First` otherwise, which
+is also the safe default when the PV sensor cannot be read.
 
-Unattended live operation. Periodic review of settled-data savings; tune export
-spread / grid-charge margin thresholds for real-world results.
+**A pinned SoC failed command verification.** The 2026-08-17 fix taught the
+planner snapshot to accept a pinned SoC, but verification kept a flat age check
+and rejected it as `stale_soc` — observed on 2026-08-19 failing every cycle of an
+export at 100% SoC, then falling back into lockout. Verification already proves
+the integration is live by requiring post-command battery power, so age only
+costs confidence in the cut-off the SoC guards. An over-age reading is now
+accepted while it sits at least `battery_control_stale_soc_headroom_pct` clear of
+that cut-off.
+
+**Stored energy was worth nothing at the horizon edge.** See the terminal-value
+entry below; it is fixed rather than deferred, because the bias would have
+skewed a week of savings measurement.
+
+## Stage 3 — unattended live operation
+
+Same configuration as Stage 2; the only change is the review cadence (weekly,
+not daily). Move as soon as a few days of armed operation look right — see
+[`OPERATIONS.md`](./OPERATIONS.md). Tuning of export spread and grid-charge
+margin belongs here, once enough settled data describes a single unchanged
+configuration.
 
 ## Known-missing functionality (tracked across stages)
 
 - ~~Physically verified discharge and export (Stage 1).~~ Discharge-to-load
-  (PV First) and night battery export (ESS First 0.8 kW) are characterized.
-  Daylight PV-surplus export remains.
+  (PV First), night battery export (ESS First), and daylight PV-surplus export
+  (PV First only; ESS First curtails PV even at 4 kW) are characterized.
 - ~~A manual command path for discharge and export.~~ Done:
   `POST /api/control/manual-command` arms a self-expiring `CHARGE`, `DISCHARGE`, or `EXPORT`
   request, so checkpoints 1, 2, and 3 can each be scheduled instead of waiting for the planner
   to independently choose the direction under test. It authorizes nothing; every gate and
   blocker still applies.
-- Terminal value for stored energy. `terminal_soc_salvage_pln_kwh` is `0.0` and
-  `preserve_terminal_soc` is never set, so energy left at the end of the horizon is
-  worth nothing to the solver. Because the horizon ends at Pstryk's publication edge
-  — as little as ~10 h out before the afternoon publication — the plan carries a
-  standing incentive to empty the battery toward that edge. Rolling re-optimisation
-  every 15 minutes limits the damage to a bias rather than an actual dump, but this
-  should be resolved before unattended operation in Stage 3.
+- ~~Terminal value for stored energy.~~ Fixed before Stage 2. `optimiser.py`
+  derives the salvage price from the horizon's own prices when
+  `terminal_soc_salvage_pln_kwh` is left at `0.0`: stored energy is worth the
+  cheapest visible import, after discharge efficiency and degradation. Using the
+  cheapest rather than an average keeps it a floor, so the dump bias is removed
+  without inventing arbitrage the published prices do not support. Set the
+  setting explicitly, or `terminal_soc_salvage_auto: false`, to override.
+- Modbus/network-loss containment (4f) is unresolved and is **accepted** for
+  unattended operation: the inverter holds a command PvOpti already verified,
+  within limits the BMS enforces independently, and PvOpti itself fails closed.
+  Closing it later needs either an inverter-side timeout or a watchdog that
+  notices frozen-but-present HA entities. Do not re-run the fault; it is
+  characterized. It is not a gate on going unattended.
 - Padding is built but not wired in (`forecast/price.py`). Wiring it would stabilise
   the horizon across the publication boundary and push the terminal edge past the
   next real cycle.

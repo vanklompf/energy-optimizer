@@ -1,14 +1,23 @@
 # Verified Sigenergy control contract
 
-Status: **supervised Standby and 0.5 kW grid-charge behavior verified; unattended control not approved**
-Characterization date: 2026-08-08
+Status: **charge, discharge, and export characterized; HpeNas runs live control. Modbus-loss containment is open and accepted.**
+Characterization date: 2026-08-08 (charge A/B/A). Discharge, export, and fallback evidence is in [`commissioning/`](./commissioning/), through 2026-08-20.
 Site: Sigen Plant through Home Assistant
 
 This document records only behavior observed on the installed system. Upstream names or assumed Modbus semantics are not treated as verified capabilities.
 
-Implementation consumers should also read [`battery-control-context.md`](./battery-control-context.md) and the [actual-control implementation plan](./plans/2026-08-08_001527-pvopti-actual-energy-control.md). This empirical document is authoritative when a plan, code comment, or upstream integration assumption conflicts with it.
+How to run live is [`OPERATIONS.md`](./OPERATIONS.md). The archived
+[`battery-control-context.md`](./archive/battery-control-context.md) and the
+[actual-control implementation plan](./archive/plans/2026-08-08_001527-pvopti-actual-energy-control.md)
+are historical. This empirical document is authoritative when a plan, code
+comment, or upstream integration assumption conflicts with it.
 
-## Safety state after characterization
+## Safety state after the 2026-08-08 characterization (snapshot, not policy)
+
+The bullets below record cleanup after the first attended charge probe. They are
+**not** the live operating posture. Live control keeps Remote EMS available,
+`read_only: false`, and the six control entities enabled; see
+[`OPERATIONS.md`](./OPERATIONS.md).
 
 - Remote EMS is verified `off` in HA and raw diagnostics (`plant_remote_ems_enable = 0`).
 - The dormant Remote EMS mode is verified `Standby` (`plant_remote_ems_control_mode = 1`).
@@ -74,7 +83,12 @@ Options advertised by the installed entity:
 8. `V2G`
 9. `Unknown`
 
-`Standby` and `Command Charging (Grid First)` were physically tested. All other options remain untested. `Unknown` must never be selected by PvOpti. `PCS Remote Control` and `V2G` are outside the intended first release.
+`Standby`, `Command Charging (Grid First)`, `Command Discharging (PV First)`, and
+`Command Discharging (ESS First)` are physically tested. `Unknown` must never be
+selected by PvOpti. `PCS Remote Control` and `V2G` are outside the intended
+release. `Command Charging (PV First)` and `Maximum Self Consumption` under
+Remote EMS remain untested as command modes (local MSC is the restored idle
+state).
 
 ### ESS power limits
 
@@ -248,33 +262,21 @@ A future PvOpti adapter must follow this order:
 
 ## Untested behavior and rollout blockers
 
+Stage 1 closed most of the original gaps. Characterized since this document was first written, each with a dated note in [`commissioning/`](./commissioning/):
+
+- grid-import charge stepped to 4 kW, with limit tracking and import coverage;
+- forced discharge to household load below and at net load, PV First, zero export;
+- deliberate battery export at night on ESS First, stepped to 6 kW, inside the site export limit and reconciled against Pstryk settled sell data;
+- `Command Discharging (PV First)` versus `(ESS First)` with PV present — ESS First curtails PV to zero at any discharge limit, so daylight export must use PV First;
+- the discharge cut-off register taking the configured operating reserve;
+- heartbeat expiry, Sigen integration reload, container stop, container pause, and HA restart, each from an active command, on both charge and discharge.
+
 The following remain explicitly unverified:
 
-- low-power forced discharge to household load without deliberate export;
-- every mode except `Standby` and `Command Charging (Grid First)`;
+- **Modbus/network path loss (failed, do not re-run).** HA served cached Sigen entities, the watchdog never fired, and the inverter held the last Remote EMS command for the full 90 s outage with no native timeout. This is the open blocker for unattended Stage 3 operation and is carried as accepted residual risk through Stage 2; see [`OPERATIONS.md`](./OPERATIONS.md);
+- import charging above ~6.9 kW: the battery plateaued at 6.36 kW against a 6.86 kW command and never reached the 8.8 kW rating;
 - persistence across inverter/gateway reboot;
-- behavior during HA restart while Remote EMS is active;
-- Sigen integration reload while Remote EMS is active: passed attended on 2026-08-14 for the bounded 0.5 kW charge-only path after correcting the entity-readiness race;
-- Modbus loss, network loss, application/container stop, and service timeout after physical actuation;
-- autonomous command expiry;
-- an independent watchdog capable of restoring local control when HA/PvOpti cannot;
-- deliberate battery export and site/export-limit enforcement;
-- cut-off SoC enforcement boundaries and BMS-buffer interaction;
-- reliable register read-back for power limits and cut-offs.
+- cut-off SoC enforcement boundaries and BMS-buffer interaction — PvOpti writes the reserve to the cut-off register but never relies on the inverter to enforce it, rejecting any sample within the configured margin of the floor;
+- every mode except `Standby`, `Command Charging (Grid First)`, and the two discharging modes above; V2G and PCS Remote Control stay out of scope.
 
-PvOpti can now *command* discharge and export, and verifies both against physical telemetry, but no discharge or export command has ever been issued to this inverter. Both directions stay behind their own default-off gates until the attended checkpoints in [`commissioning/README.md`](./commissioning/README.md) produce evidence notes. Code capability is not characterization.
-
-No unattended live-control adapter may be armed while the failure-path and watchdog blockers remain unresolved.
-
-## Next supervised test stage
-
-The next separately authorized maintenance window should focus on failure containment, not export:
-
-1. number-register acknowledgement is now promoted only for the version-bound 2026-08-14 charge evidence; revalidate and reset the gate on any HA/overlay/command-semantic drift;
-2. establish an independent watchdog/fallback actor;
-3. test low-power discharge below current household load, with zero-export monitoring and immediate Standby fallback;
-4. test HA integration reload and HA restart while in Standby before testing them during a low-power command;
-5. test PvOpti/container stop and Modbus interruption only after the watchdog is independently proven;
-6. restore read-only mode, disable the writable entities, and verify local behavior after every scenario.
-
-Deliberate export, V2G, PCS Remote Control, and unattended operation remain excluded.
+Number-register acknowledgement is promoted only for the version-bound evidence recorded above. Revalidate it on any HA, overlay, or command-semantic drift.

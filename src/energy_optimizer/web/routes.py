@@ -308,7 +308,7 @@ class ManualChargeBody(BaseModel):
 
 @router.post("/control/manual-command")
 def arm_manual_command(request: Request, body: ManualCommandBody) -> dict:
-    """Arm one attended battery command (ROADMAP Stage 1 checkpoints 1-3).
+    """Arm one battery command, overriding the direction the plan chose.
 
     ``direction`` is ``CHARGE``, ``DISCHARGE`` (to house load), or ``EXPORT`` (to grid).
     The request expires on its own and is dropped on restart. Every gate, blocker, ramp

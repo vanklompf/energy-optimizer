@@ -23,9 +23,9 @@ from .watchdog import watchdog_health_from_ha
 
 logger = logging.getLogger(__name__)
 
-# Attended commissioning only (ROADMAP Stage 1 checkpoints 1-3). The request lives in
-# process memory and expires on its own so a forgotten arm cannot outlive the window or
-# a restart.
+# Operator override of the planner's chosen direction, for testing a direction on demand
+# or forcing one by hand. The request lives in process memory and expires on its own so a
+# forgotten arm cannot outlive its intent or survive a restart.
 _MANUAL_COMMAND_DEFAULT_DURATION_SECONDS = 300.0
 _MANUAL_COMMAND_MAX_DURATION_SECONDS = 1800.0
 _MANUAL_COMMAND_DIRECTIONS = ("CHARGE", "DISCHARGE", "EXPORT")
@@ -42,7 +42,7 @@ _MANUAL_CHARGE_MAX_DURATION_SECONDS = _MANUAL_COMMAND_MAX_DURATION_SECONDS
 
 @dataclass(frozen=True, slots=True)
 class ManualCommandRequest:
-    """One attended battery command the control loop prefers over the plan.
+    """One operator-requested battery command the control loop prefers over the plan.
 
     ``direction`` is one of ``CHARGE``, ``DISCHARGE`` (to house load), or ``EXPORT``
     (discharge to grid). It only selects *what* the loop commands; every gate, blocker,
@@ -88,7 +88,7 @@ class BatteryMixin:
     def _known_price_hours(self, prices: list[Price], now: dt.datetime) -> float:
         raise NotImplementedError
 
-    # --- attended manual command (charge / discharge / export) -------------
+    # --- manual command override (charge / discharge / export) -------------
     def request_manual_command(
         self,
         *,
@@ -97,13 +97,13 @@ class BatteryMixin:
         duration_seconds: float | None = None,
         now: dt.datetime | None = None,
     ) -> ManualCommandRequest:
-        """Arm one bounded battery command for an attended commissioning window.
+        """Arm one bounded battery command, overriding the direction the plan chose.
 
         ``direction`` is ``CHARGE``, ``DISCHARGE`` (to house load), or ``EXPORT`` (to
         grid). The planner only chooses a direction when the price spread justifies it,
-        so the Stage 1 checkpoints otherwise cannot be scheduled. This does not bypass
-        any gate: mode, ``battery_control_enabled``, the per-direction gate, authorization
-        blockers, the ramp limit, and physical verification all still apply.
+        so this exists to drive one on demand. It does not bypass any gate: mode,
+        ``battery_control_enabled``, the per-direction gate, authorization blockers, the
+        ramp limit, and physical verification all still apply.
         """
         s = self.settings
         now = now or utcnow()

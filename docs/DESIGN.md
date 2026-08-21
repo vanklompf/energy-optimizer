@@ -1,11 +1,13 @@
 # PvOpti design
 
 Single-site home energy manager for a PV + stationary battery + EV setup on the
-Pstryk dynamic-pricing tariff. It plans and (optionally) controls when to charge
-and discharge the battery, when to import/export from the grid, and when to run
-the EV charger, so that the electricity bill is minimized.
+Pstryk dynamic-pricing tariff. It plans and controls when to charge and
+discharge the battery, when to import/export from the grid, and when to run the
+EV charger, so that the electricity bill is minimized. Live battery actuation
+is the production posture; `dry_run` is the inert default of a fresh checkout.
 
-This is the current design document. Historical/superseded design and plan
+This is the current design document. How to run it live is
+[`OPERATIONS.md`](./OPERATIONS.md). Historical/superseded design and plan
 documents live in [`archive/`](./archive/). The only other authoritative
 reference is the empirically verified
 [`sigenergy-control-contract.md`](./sigenergy-control-contract.md).
@@ -136,15 +138,16 @@ of battery control.
 
 `EO_MODE` selects the battery-actuation posture:
 
-- **`dry_run` (default)**: the optimiser runs, battery intents are computed and
-  recorded as `shadow` actions, and recommendations are published over MQTT — but
-  nothing is written to the inverter.
-- **`control`**: the same intents are actuated through Home Assistant
-  (Remote EMS), subject to the safety gates.
+- **`dry_run` (checkout default)**: the optimiser runs, battery intents are
+  computed and recorded as `shadow` actions, and recommendations are published
+  over MQTT — but nothing is written to the inverter. Compose and image
+  defaults stay here so a fresh checkout is inert.
+- **`control` (production on HpeNas)**: the same intents are actuated through
+  Home Assistant (Remote EMS), subject to the safety gates. Going live is a
+  config change; see [`OPERATIONS.md`](./OPERATIONS.md).
 
 EV relay control is separate: it is governed by `EO_EV_CONTROL_ENABLED` and works
-regardless of `EO_MODE`. (A future simplification will align EV and battery under
-one consistent enable + `EO_MODE` scheme; see the roadmap.)
+regardless of `EO_MODE`.
 
 ## Safety model
 
@@ -184,11 +187,11 @@ good state — not to act as a certified safety system.
 - Multi-document, ceremony-based authorization to progress the roadmap.
 - Gates that require a real incident to occur before a stage may begin.
 - Persistent lockouts that require manual database edits to clear after a
-  recoverable fault (to become auto-recovering backoff with a manual-clear
+  recoverable fault (replaced by auto-recovering backoff with a manual-clear
   action).
 
-The concrete code changes implementing this simplification are specified in
-[`ROADMAP.md`](./ROADMAP.md) (Stage 0).
+The concrete code changes implementing this simplification are in
+[`ROADMAP.md`](./ROADMAP.md) Stage 0 (done).
 
 ## Web / auth
 
@@ -217,4 +220,5 @@ are read without the `EO_` prefix.
 Docker-first, single container, non-root, single Uvicorn worker, `/data` volume
 for SQLite. Deployed via the ansible-nas `energy_optimizer` role (GHCR pull or
 local build). Config comes entirely from `EO_*` env vars; see
-[`.env.example`](../.env.example).
+[`.env.example`](../.env.example). Image and Compose defaults are non-actuating;
+the HpeNas inventory is what sets live control.
