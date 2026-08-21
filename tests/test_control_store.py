@@ -13,6 +13,7 @@ from energy_optimizer.control_store import (
     list_pending_actions,
     persist_pending_action,
     release_lease,
+    renew_lease,
     set_lockout,
     try_acquire_lease,
 )
@@ -83,6 +84,30 @@ def test_lease_compare_and_swap(store: Store) -> None:
         assert try_acquire_lease(session, owner_id="b", ttl_seconds=30, now=later) is True
         assert release_lease(session, owner_id="a") is False
         assert release_lease(session, owner_id="b") is True
+
+
+def test_lease_renewal_requires_current_unexpired_owner(store: Store) -> None:
+    now = dt.datetime(2026, 8, 8, 12, 0, tzinfo=dt.UTC)
+    with store.session() as session:
+        assert try_acquire_lease(session, owner_id="a", ttl_seconds=30, now=now)
+        assert renew_lease(
+            session,
+            owner_id="a",
+            ttl_seconds=60,
+            now=now + dt.timedelta(seconds=20),
+        )
+        assert not renew_lease(
+            session,
+            owner_id="b",
+            ttl_seconds=60,
+            now=now + dt.timedelta(seconds=20),
+        )
+        assert not renew_lease(
+            session,
+            owner_id="a",
+            ttl_seconds=60,
+            now=now + dt.timedelta(seconds=81),
+        )
 
 
 def test_concurrent_lease_acquisition(store: Store) -> None:

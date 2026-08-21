@@ -221,7 +221,6 @@ class ControllerStateRow(Base):
     last_successful_command_id: Mapped[str | None] = mapped_column(String(64))
     last_fallback_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     last_fallback_verified: Mapped[bool] = mapped_column(Boolean, default=False)
-    manual_override: Mapped[bool] = mapped_column(Boolean, default=False)
     last_heartbeat_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

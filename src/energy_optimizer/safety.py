@@ -48,7 +48,6 @@ class SafetyInputs:
     ev_telemetry_fresh: bool = True
     lease_held: bool = False
     watchdog_healthy: bool = False
-    manual_override_active: bool = False
     recent_command_failures: int = 0
     max_recent_command_failures: int = 2
     soc_pct: float | None = None
@@ -134,8 +133,6 @@ def _control_blockers(inputs: SafetyInputs, *, plan_status: Status) -> list[str]
         blockers.append("lease_not_held")
     if not inputs.watchdog_healthy:
         blockers.append("watchdog_unhealthy")
-    if inputs.manual_override_active:
-        blockers.append("manual_override_active")
     if inputs.recent_command_failures > inputs.max_recent_command_failures:
         blockers.append("recent_command_failures")
     if not inputs.inverter_entities_available:

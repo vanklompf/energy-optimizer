@@ -1131,6 +1131,33 @@ async def test_fallback_accepts_local_self_consumption_discharge() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fallback_skips_neutral_wait_when_remote_ems_is_already_off() -> None:
+    settings = _settings()
+    ha = FakeHa(
+        states={
+            settings.battery_control_remote_ems_switch_entity: _state(
+                settings.battery_control_remote_ems_switch_entity, "off"
+            ),
+            settings.battery_control_mode_select_entity: _state(
+                settings.battery_control_mode_select_entity, "Standby"
+            ),
+        },
+        number_register_ack_reliable=True,
+        number_ack=AckStatus.ACKNOWLEDGED,
+    )
+    physical = FakePhysical([_phys(-0.4, grid_in=0.0, ems_mode="Standby")])
+    controller = _controller(ha, physical, settings)
+
+    result = await controller.fallback("already_local")
+
+    assert result.control.physical_verified is True
+    assert result.lockout is False
+    assert ("select", "select_option") not in [
+        (domain, service) for domain, service, _ in result.service_calls
+    ]
+
+
+@pytest.mark.asyncio
 async def test_unknown_physical_state_does_not_command() -> None:
     settings = _settings()
     ha = FakeHa(

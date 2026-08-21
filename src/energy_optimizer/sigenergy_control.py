@@ -431,26 +431,35 @@ class SigenergyController:
         t0 = time.perf_counter()
         evidence: dict[str, object] = {"attempted": True, "reason": reason}
 
-        standby = await self._tracked_select(
-            self.mode_select,
-            self._settings.battery_control_fallback_mode,
-            cancel_event=cancel_event,
-        )
-        evidence["standby_ack"] = standby.status.value
-        if standby.status not in {AckStatus.ACKNOWLEDGED, AckStatus.IDEMPOTENT_NOOP}:
-            return self._fallback_incomplete(
-                command_id, reason, "fallback_standby_unacknowledged", t0, evidence, lockout=True
+        remote = await self._ha.get_state(self.remote_switch)
+        remote_already_off = remote is not None and remote.state == "off"
+        evidence["remote_already_off"] = remote_already_off
+        if not remote_already_off:
+            standby = await self._tracked_select(
+                self.mode_select,
+                self._settings.battery_control_fallback_mode,
+                cancel_event=cancel_event,
             )
+            evidence["standby_ack"] = standby.status.value
+            if standby.status not in {AckStatus.ACKNOWLEDGED, AckStatus.IDEMPOTENT_NOOP}:
+                return self._fallback_incomplete(
+                    command_id,
+                    reason,
+                    "fallback_standby_unacknowledged",
+                    t0,
+                    evidence,
+                    lockout=True,
+                )
 
-        neutral_ok = await self._wait_neutral(cancel_event=cancel_event)
-        evidence["neutral_ok"] = neutral_ok
-        if not neutral_ok:
-            # Still attempt cleanup, but never claim verified.
-            await self._restore_local_limits(cancel_event=cancel_event)
-            await self._tracked_switch(self.remote_switch, False, cancel_event=cancel_event)
-            return self._fallback_incomplete(
-                command_id, reason, "fallback_neutral_timeout", t0, evidence, lockout=True
-            )
+            neutral_ok = await self._wait_neutral(cancel_event=cancel_event)
+            evidence["neutral_ok"] = neutral_ok
+            if not neutral_ok:
+                # Still attempt cleanup, but never claim verified.
+                await self._restore_local_limits(cancel_event=cancel_event)
+                await self._tracked_switch(self.remote_switch, False, cancel_event=cancel_event)
+                return self._fallback_incomplete(
+                    command_id, reason, "fallback_neutral_timeout", t0, evidence, lockout=True
+                )
 
         restore_failure = await self._restore_local_limits_verified(cancel_event=cancel_event)
         evidence["restore_failure"] = restore_failure

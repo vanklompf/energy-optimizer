@@ -275,6 +275,8 @@ class Settings(BaseSettings):
     battery_control_physical_verify_timeout_seconds: float = Field(default=30.0, ge=0)
     battery_control_heartbeat_interval_seconds: float = Field(default=15.0, ge=0)
     battery_control_heartbeat_expiry_seconds: float = Field(default=60.0, ge=0)
+    battery_control_lease_ttl_seconds: float = Field(default=300.0, gt=0)
+    battery_control_lease_renew_interval_seconds: float = Field(default=30.0, gt=0)
     battery_control_standby_neutral_band_kw: float = Field(default=0.12, ge=0)
     battery_control_deadband_kw: float = Field(default=0.12, ge=0)
     battery_control_max_power_step_kw: float = Field(default=0.5, ge=0)
@@ -434,6 +436,14 @@ class Settings(BaseSettings):
             raise ValueError("battery_control_heartbeat_interval_seconds must be positive")
         if self.battery_control_heartbeat_expiry_seconds <= 0:
             raise ValueError("battery_control_heartbeat_expiry_seconds must be positive")
+        if (
+            self.battery_control_lease_renew_interval_seconds * 3
+            > self.battery_control_lease_ttl_seconds
+        ):
+            raise ValueError(
+                "battery_control_lease_renew_interval_seconds must be at most one third "
+                "of battery_control_lease_ttl_seconds"
+            )
         if self.battery_control_lockout_duration_seconds <= 0:
             raise ValueError("battery_control_lockout_duration_seconds must be positive")
         if self.battery_control_standby_neutral_band_kw <= 0:

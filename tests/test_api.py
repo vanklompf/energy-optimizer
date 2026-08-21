@@ -114,27 +114,9 @@ def test_control_actions_history_is_read_only(client: TestClient) -> None:
     assert actions[0]["result"] == "shadow"
     assert actions[0]["requested_state"] == "CHARGE"
     assert actions[0]["observed_state"] == "DISARMED"
-    # Mutation endpoints exist for enable/disable and lockout-clear.
-    assert client.post("/api/control/actuation", json={"enabled": False}).status_code == 200
+    # Actuation is deployment configuration; stopping the container is the override.
+    assert client.post("/api/control/actuation", json={"enabled": False}).status_code == 405
     assert client.post("/api/control/lockout/clear").status_code == 200
-
-
-def test_disabling_actuation_fallbacks_before_disarming(client: TestClient) -> None:
-    settings = client.app.state.settings
-    settings.mode = "control"
-    settings.battery_control_enabled = True
-    seen: list[tuple[str, bool]] = []
-
-    async def fake_fallback(reason: str, *, command_id: str | None = None) -> dict:
-        seen.append((reason, settings.battery_control_enabled))
-        return {"result": "fallback", "verified": True, "command_id": command_id or ""}
-
-    client.app.state.service.fallback_battery = fake_fallback  # type: ignore[method-assign]
-    resp = client.post("/api/control/actuation", json={"enabled": False})
-    assert resp.status_code == 200
-    assert seen == [("actuation_disabled", True)]
-    assert settings.battery_control_enabled is False
-    assert resp.json()["control_enabled"] is False
 
 
 def test_manual_charge_endpoint_arms_bounded_request(client: TestClient) -> None:

@@ -518,8 +518,8 @@ class Service(BatteryMixin, PlanningMixin):
             ev_available=ev_available,
             ev_departure_at=ev_requirements.departure_at,
         )
-        have_pv = bool(pv_map)
-        have_load = bool(load_map)
+        have_pv = bool(pv_map) and pv_conf == "ok"
+        have_load = bool(load_map) and load_conf == "ok"
         # Intervals exist only where Pstryk has published, so this is the horizon the
         # solver actually saw — not the configured fetch bound.
         effective_horizon_hours = sum(i.dt_hours for i in intervals)

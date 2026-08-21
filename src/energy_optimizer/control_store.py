@@ -6,8 +6,11 @@ import datetime as dt
 import json
 import uuid
 from dataclasses import asdict, is_dataclass
+from typing import Any, cast
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 
 from .store import ControlAction, ControllerLease, ControllerStateRow, utcnow
@@ -93,29 +96,53 @@ def try_acquire_lease(
     """Atomic compare-and-swap lease acquisition/renewal for one site key."""
     now = _aware(now or utcnow())
     expires = now + dt.timedelta(seconds=ttl_seconds)
-    lease = session.get(ControllerLease, target_key)
-    if lease is None:
-        session.add(
-            ControllerLease(
-                target_key=target_key,
-                owner_id=owner_id,
-                acquired_at=now,
-                renewed_at=now,
-                expires_at=expires,
-            )
-        )
-        session.flush()
-        return True
-    lease_expires = _aware(lease.expires_at)
-    if lease.owner_id == owner_id or lease_expires <= now:
-        lease.owner_id = owner_id
-        if lease_expires <= now:
-            lease.acquired_at = now
-        lease.renewed_at = now
-        lease.expires_at = expires
-        session.flush()
-        return True
-    return False
+    stmt = sqlite_insert(ControllerLease).values(
+        target_key=target_key,
+        owner_id=owner_id,
+        acquired_at=now,
+        renewed_at=now,
+        expires_at=expires,
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[ControllerLease.target_key],
+        set_={
+            "owner_id": owner_id,
+            "acquired_at": now,
+            "renewed_at": now,
+            "expires_at": expires,
+        },
+        where=or_(
+            ControllerLease.owner_id == owner_id,
+            ControllerLease.expires_at <= now,
+        ),
+    )
+    result = cast(CursorResult[Any], session.execute(stmt))
+    session.flush()
+    return result.rowcount == 1
+
+
+def renew_lease(
+    session: Session,
+    *,
+    owner_id: str,
+    target_key: str = DEFAULT_SITE_KEY,
+    ttl_seconds: float = 300.0,
+    now: dt.datetime | None = None,
+) -> bool:
+    """Extend an unexpired lease only while the caller still owns it."""
+    now = _aware(now or utcnow())
+    result = cast(
+        CursorResult[Any],
+        session.execute(
+            update(ControllerLease)
+            .where(ControllerLease.target_key == target_key)
+            .where(ControllerLease.owner_id == owner_id)
+            .where(ControllerLease.expires_at > now)
+            .values(renewed_at=now, expires_at=now + dt.timedelta(seconds=ttl_seconds))
+        ),
+    )
+    session.flush()
+    return result.rowcount == 1
 
 
 def release_lease(

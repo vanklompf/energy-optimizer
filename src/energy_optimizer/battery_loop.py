@@ -18,7 +18,7 @@ from .config import Settings
 from .ha_client import HaClient
 from .mqtt_publish import MqttPublisher
 from .safety import SafetyInputs, SafetyReport, evaluate
-from .store import EvTelemetry, PlanStep, Price, Run, Store, Telemetry, utcnow
+from .store import EvTelemetry, Forecast, PlanStep, Price, Run, Store, Telemetry, utcnow
 from .watchdog import watchdog_health_from_ha
 
 logger = logging.getLogger(__name__)
@@ -382,10 +382,71 @@ class BatteryMixin:
     ) -> dict[str, object]:
         """Lease, authorize, optionally actuate, audit, and publish battery control status."""
         async with self._battery_control_lock:
-            return await self._control_battery_locked(now=now, force_fallback=force_fallback)
+            lease = self._start_battery_lease()
+            if lease is None:
+                return {"result": "lease_conflict", "command_id": str(uuid.uuid4())}
+            stop_renewal, lease_lost, renewal_task = lease
+            try:
+                return await self._control_battery_locked(
+                    now=now,
+                    force_fallback=force_fallback,
+                    lease_lost=lease_lost,
+                )
+            finally:
+                await self._stop_battery_lease_renewal(stop_renewal, renewal_task)
+
+    def _start_battery_lease(self) -> tuple[asyncio.Event, asyncio.Event, asyncio.Task] | None:
+        from .control_store import try_acquire_lease
+
+        s = self.settings
+        with self.store.session() as session:
+            acquired = try_acquire_lease(
+                session,
+                owner_id=self.controller_owner_id,
+                ttl_seconds=s.battery_control_lease_ttl_seconds,
+            )
+        if not acquired:
+            return None
+        stop = asyncio.Event()
+        lost = asyncio.Event()
+        task = asyncio.create_task(self._renew_battery_lease(stop, lost))
+        return stop, lost, task
+
+    async def _renew_battery_lease(self, stop: asyncio.Event, lost: asyncio.Event) -> None:
+        from .control_store import renew_lease
+
+        s = self.settings
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    stop.wait(), timeout=s.battery_control_lease_renew_interval_seconds
+                )
+                return
+            except TimeoutError:
+                pass
+            with self.store.session() as session:
+                renewed = renew_lease(
+                    session,
+                    owner_id=self.controller_owner_id,
+                    ttl_seconds=s.battery_control_lease_ttl_seconds,
+                )
+            if not renewed:
+                lost.set()
+                logger.error("battery control lease lost during transaction")
+                return
+
+    async def _stop_battery_lease_renewal(
+        self, stop: asyncio.Event, task: asyncio.Task
+    ) -> None:
+        stop.set()
+        await task
 
     async def _control_battery_locked(
-        self, *, now: dt.datetime | None, force_fallback: bool
+        self,
+        *,
+        now: dt.datetime | None,
+        force_fallback: bool,
+        lease_lost: asyncio.Event,
     ) -> dict[str, object]:
         from .battery_control import clamp_intent_power
         from .control_store import (
@@ -395,7 +456,6 @@ class BatteryMixin:
             is_locked_out,
             persist_pending_action,
             set_lockout,
-            try_acquire_lease,
         )
         from .sigenergy_control import SigenergyController
 
@@ -406,7 +466,9 @@ class BatteryMixin:
             expire_lockout_if_due(session, now=now)
 
         if force_fallback:
-            return await self.fallback_battery("force_fallback", command_id=command_id)
+            return await self._fallback_battery_locked(
+                "force_fallback", command_id=command_id, lease_lost=lease_lost
+            )
 
         with self.store.session() as session:
             locked_out = is_locked_out(session, now=now)
@@ -416,22 +478,9 @@ class BatteryMixin:
             )
             if locked_out and not path_loss_recovery_needed:
                 return {"result": "lockout", "command_id": command_id}
-            if not locked_out and not try_acquire_lease(
-                session,
-                owner_id=self.controller_owner_id,
-                ttl_seconds=s.battery_control_heartbeat_expiry_seconds,
-                now=now,
-            ):
-                set_lockout(
-                    session,
-                    reason="lease_conflict",
-                    duration_seconds=s.battery_control_lockout_duration_seconds,
-                    now=now,
-                )
-                return {"result": "lease_conflict", "command_id": command_id}
 
         if path_loss_recovery_needed:
-            return await self.reconcile_path_loss_recovery()
+            return await self._reconcile_path_loss_recovery_locked(lease_lost)
 
         shadow = not s.battery_actuation_live
 
@@ -464,7 +513,9 @@ class BatteryMixin:
                     "blockers": [f"stale_plan:{exc}"],
                 }
             reason = f"stale_plan:{exc}"[:60]
-            return await self.fallback_battery(reason, command_id=command_id)
+            return await self._fallback_battery_locked(
+                reason, command_id=command_id, lease_lost=lease_lost
+            )
 
         # Ramp-limit before persisting so the audit records what is actually commanded,
         # and so dry-run previews the same power the live path would write.
@@ -478,6 +529,7 @@ class BatteryMixin:
             plan_age=plan_age,
             lease_held=True,
             shadow=shadow,
+            source_run_id=run_id,
         )
         intent_payload = {
             "direction": intent.direction.value,
@@ -538,18 +590,21 @@ class BatteryMixin:
             }
 
         if not safety.control_authorized:
+            blocker_code = ",".join(safety.control_blockers) or "not_authorized"
             with self.store.session() as session:
                 finalize_action(
                     session,
                     command_id,
-                    observed_state="DISARMED",
+                    observed_state=None,
                     physical=None,
                     result="blocked",
-                    error_code=(",".join(safety.control_blockers) or "not_authorized")[:64],
+                    error_code=blocker_code[:64],
                 )
+            reason = f"control_blocked:{blocker_code}"[:64]
+            fallback = await self._fallback_battery_locked(reason, lease_lost=lease_lost)
             return {
-                "result": "blocked",
-                "command_id": command_id,
+                **fallback,
+                "blocked_command_id": command_id,
                 "blockers": safety.control_blockers,
             }
 
@@ -560,7 +615,9 @@ class BatteryMixin:
         ) as ha:
             controller = SigenergyController(ha, s)
             outcome = await controller.apply_intent(
-                intent, previous_direction=previous_direction
+                intent,
+                previous_direction=previous_direction,
+                cancel_event=lease_lost,
             )
 
         with self.store.session() as session:
@@ -602,6 +659,26 @@ class BatteryMixin:
 
     async def fallback_battery(
         self, reason: str, *, command_id: str | None = None
+    ) -> dict[str, object]:
+        """Serialize a plan-independent restore with every other battery write."""
+        async with self._battery_control_lock:
+            lease = self._start_battery_lease()
+            if lease is None:
+                return {"result": "lease_conflict", "command_id": command_id or str(uuid.uuid4())}
+            stop_renewal, lease_lost, renewal_task = lease
+            try:
+                return await self._fallback_battery_locked(
+                    reason, command_id=command_id, lease_lost=lease_lost
+                )
+            finally:
+                await self._stop_battery_lease_renewal(stop_renewal, renewal_task)
+
+    async def _fallback_battery_locked(
+        self,
+        reason: str,
+        *,
+        command_id: str | None = None,
+        lease_lost: asyncio.Event,
     ) -> dict[str, object]:
         """Plan-independent fallback to local EMS. Safe when optimizer is down."""
         from .control_store import (
@@ -725,6 +802,19 @@ class BatteryMixin:
         }
 
     async def reconcile_path_loss_recovery(self) -> dict[str, object]:
+        async with self._battery_control_lock:
+            lease = self._start_battery_lease()
+            if lease is None:
+                return {"result": "lease_conflict"}
+            stop_renewal, lease_lost, renewal_task = lease
+            try:
+                return await self._reconcile_path_loss_recovery_locked(lease_lost)
+            finally:
+                await self._stop_battery_lease_renewal(stop_renewal, renewal_task)
+
+    async def _reconcile_path_loss_recovery_locked(
+        self, lease_lost: asyncio.Event
+    ) -> dict[str, object]:
         """Make one OFF-only restore attempt after an HA-path-loss lockout.
 
         Economic control stays paused until the backoff expires (or an operator
@@ -743,7 +833,9 @@ class BatteryMixin:
             if not claim_path_loss_recovery(session):
                 return {"result": "reconnect_recovery_already_claimed"}
 
-        result = await self.fallback_battery("reconnect_after_path_loss")
+        result = await self._fallback_battery_locked(
+            "reconnect_after_path_loss", lease_lost=lease_lost
+        )
         verified = bool(result.get("verified"))
         with self.store.session() as session:
             state = ensure_controller_state(session)
@@ -759,6 +851,19 @@ class BatteryMixin:
         return {"result": "reconnect_restore_unverified", "fallback": result}
 
     async def reconcile_battery_on_startup(self) -> dict[str, object]:
+        async with self._battery_control_lock:
+            lease = self._start_battery_lease()
+            if lease is None:
+                return {"result": "lease_conflict"}
+            stop_renewal, lease_lost, renewal_task = lease
+            try:
+                return await self._reconcile_battery_on_startup_locked(lease_lost)
+            finally:
+                await self._stop_battery_lease_renewal(stop_renewal, renewal_task)
+
+    async def _reconcile_battery_on_startup_locked(
+        self, lease_lost: asyncio.Event
+    ) -> dict[str, object]:
         """Never trust persisted desired state; fall back if Remote EMS is unexpectedly on."""
         from .control_store import ensure_controller_state, list_pending_actions
 
@@ -778,18 +883,30 @@ class BatteryMixin:
                 remote = await ha.get_state(s.battery_control_remote_ems_switch_entity)
         except Exception as exc:  # HA state unknown is an unsafe restart condition.
             logger.error("startup Remote EMS state could not be read: %s", exc)
-            return await self.fallback_battery("startup_remote_ems_unknown")
+            return await self._fallback_battery_locked(
+                "startup_remote_ems_unknown", lease_lost=lease_lost
+            )
         if remote is not None and remote.state == "on":
-            return await self.fallback_battery("startup_remote_ems_on")
+            return await self._fallback_battery_locked(
+                "startup_remote_ems_on", lease_lost=lease_lost
+            )
         return {"result": "startup_ok"}
 
     async def shutdown_battery_control(self) -> dict[str, object]:
         from .control_store import release_lease
 
-        result = await self.fallback_battery("shutdown")
-        with self.store.session() as session:
-            release_lease(session, owner_id=self.controller_owner_id)
-        return result
+        async with self._battery_control_lock:
+            lease = self._start_battery_lease()
+            if lease is None:
+                return {"result": "lease_conflict"}
+            stop_renewal, lease_lost, renewal_task = lease
+            try:
+                result = await self._fallback_battery_locked("shutdown", lease_lost=lease_lost)
+            finally:
+                await self._stop_battery_lease_renewal(stop_renewal, renewal_task)
+                with self.store.session() as session:
+                    release_lease(session, owner_id=self.controller_owner_id)
+            return result
 
     async def publish_battery_heartbeat(self) -> None:
         """Lightweight heartbeat independent of optimisation."""
@@ -801,11 +918,13 @@ class BatteryMixin:
         s = self.settings
         with self.store.session() as session:
             state = ensure_controller_state(session)
-            state.last_heartbeat_at = now
-            state.updated_at = now
             lease_held = lease_held_by(
                 session, owner_id=self.controller_owner_id, now=now
             )
+            if not lease_held:
+                return
+            state.last_heartbeat_at = now
+            state.updated_at = now
             last = session.execute(
                 select(ControlAction).order_by(ControlAction.created_at.desc()).limit(1)
             ).scalar_one_or_none()
@@ -883,6 +1002,7 @@ class BatteryMixin:
         plan_age: float,
         lease_held: bool,
         shadow: bool,
+        source_run_id: str,
     ) -> tuple[SafetyReport, dict[str, object]]:
         """Build live-control SafetyInputs from real store evidence (fail-closed)."""
         from .battery_control import ControlDirection
@@ -905,6 +1025,20 @@ class BatteryMixin:
             state = ensure_controller_state(session)
             heartbeat_at = state.last_heartbeat_at
             consecutive_failures = int(state.consecutive_failures or 0)
+            source_run = session.get(Run, source_run_id)
+            forecast_rows = (
+                session.execute(select(Forecast).where(Forecast.run_id == source_run_id))
+                .scalars()
+                .all()
+            )
+
+        def forecast_ok(kind: str) -> bool:
+            confidences = [row.confidence for row in forecast_rows if row.kind == kind]
+            return bool(confidences) and all(value == "ok" for value in confidences)
+
+        have_pv_forecast = forecast_ok("pv")
+        have_load_forecast = forecast_ok("load")
+        plan_status_ok = source_run is not None and source_run.status == "ok"
 
         telemetry_ages: dict[str, float | None] = {
             "soc": soc_age,
@@ -980,8 +1114,8 @@ class BatteryMixin:
             telemetry_stale=telemetry_stale,
             telemetry_stale_reasons=stale_reasons,
             have_current_price=have_current_price,
-            have_pv_forecast=True,  # live control does not re-fetch forecasts here
-            have_load_forecast=True,
+            have_pv_forecast=have_pv_forecast,
+            have_load_forecast=have_load_forecast,
             known_price_hours=known_hours,
             horizon_hours=known_hours,  # control plans only over published prices
             min_price_hours=s.optimise_min_price_hours,
@@ -990,7 +1124,7 @@ class BatteryMixin:
             lease_held=lease_held,
             watchdog_healthy=watchdog_healthy,
             economic_action=economic,
-            plan_status_ok=True,
+            plan_status_ok=plan_status_ok,
             plan_age_seconds=plan_age,
             max_plan_age_seconds=s.battery_control_max_plan_age_seconds,
             max_telemetry_age_seconds=s.battery_control_max_telemetry_age_seconds,
@@ -1016,6 +1150,11 @@ class BatteryMixin:
         evidence: dict[str, object] = {
             "shadow": shadow,
             "plan_age_seconds": plan_age,
+            "source_run_status": source_run.status if source_run is not None else None,
+            "forecast_confidence": {
+                "pv": "ok" if have_pv_forecast else "low_confidence_or_missing",
+                "load": "ok" if have_load_forecast else "low_confidence_or_missing",
+            },
             "price_is_real": price_is_real,
             "price_age_seconds": price_age,
             "price_fetched_at": price.fetched_at.isoformat() if price is not None else None,

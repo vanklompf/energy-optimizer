@@ -77,7 +77,9 @@ class PvForecaster:
         ratio = (
             _clamp(correction_ratio, CORRECTION_MIN, CORRECTION_MAX) if correction_ratio else 1.0
         )
-        confidence = "ok" if correction_ratio is not None else "low_confidence"
+        # Calibration improves the estimate but is not required to trust a
+        # successfully fetched provider forecast. Fetch failures return no points.
+        confidence = "ok"
 
         # Sum watt-hours across planes at each timestamp.
         totals: dict[dt.datetime, float] = {}

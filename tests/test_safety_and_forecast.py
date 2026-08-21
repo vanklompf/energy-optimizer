@@ -3,10 +3,13 @@ from __future__ import annotations
 import datetime as dt
 import math
 
+import httpx
 import pytest
 
+from energy_optimizer.config import PvPlane
 from energy_optimizer.forecast.load import LoadForecaster, LoadSample
 from energy_optimizer.forecast.price import PriceSample, pad_prices
+from energy_optimizer.forecast.pv import PvForecaster
 from energy_optimizer.safety import (
     SafetyInputs,
     Status,
@@ -128,7 +131,6 @@ def _authorized_control_inputs(now: dt.datetime, **overrides: object) -> SafetyI
         ev_telemetry_fresh=True,
         lease_held=True,
         watchdog_healthy=True,
-        manual_override_active=False,
         recent_command_failures=0,
         soc_pct=55.0,
         soc_update_age_seconds=20.0,
@@ -149,7 +151,6 @@ def _authorized_control_inputs(now: dt.datetime, **overrides: object) -> SafetyI
         ("battery_control_enabled", False, "battery_control_disabled"),
         ("lease_held", False, "lease_not_held"),
         ("watchdog_healthy", False, "watchdog_unhealthy"),
-        ("manual_override_active", True, "manual_override_active"),
         ("recent_command_failures", 5, "recent_command_failures"),
         ("inverter_entities_available", False, "inverter_entities_unavailable"),
         ("plan_age_seconds", 901.0, "plan_stale"),
@@ -281,3 +282,25 @@ def test_load_forecast_confidence_scales_with_history() -> None:
     out = fc.forecast(samples, targets)
     assert out[0].load_kwh == 2.0
     assert out[0].confidence == "ok"
+
+
+async def test_successful_uncorrected_pv_provider_forecast_is_ok() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"result": {"2026-08-22 12:00:00": 1500}},
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        async with PvForecaster(
+            50.0,
+            22.0,
+            [PvPlane(peak_kwp=7.0, tilt=35.0, azimuth=0.0)],
+            client=client,
+        ) as forecaster:
+            points = await forecaster.forecast()
+
+    assert len(points) == 1
+    assert points[0].energy_kwh == pytest.approx(1.5)
+    assert points[0].confidence == "ok"

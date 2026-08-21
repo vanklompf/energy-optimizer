@@ -269,32 +269,6 @@ def get_control_actions(request: Request, limit: int = 20) -> dict:
     return {"actions": [_control_action_dict(row) for row in rows]}
 
 
-class ActuationRequest(BaseModel):
-    enabled: bool
-
-
-@router.post("/control/actuation")
-async def set_actuation(request: Request, body: ActuationRequest) -> dict:
-    """Enable or disable battery actuation for this process (env still wins on restart)."""
-    settings = _settings(request)
-    service = request.app.state.service
-    if not body.enabled:
-        service.clear_manual_charge()
-        # Fallback must run while actuation is still live; otherwise
-        # fallback_battery records DISARMED and never writes the inverter.
-        try:
-            await service.fallback_battery("actuation_disabled")
-        finally:
-            settings.battery_control_enabled = False
-    else:
-        settings.battery_control_enabled = True
-    return {
-        "mode": settings.mode,
-        "battery_control_enabled": settings.battery_control_enabled,
-        "control_enabled": settings.battery_actuation_live,
-    }
-
-
 class ManualCommandBody(BaseModel):
     direction: str
     target_kw: float
@@ -756,5 +730,4 @@ def get_hourly_comparison(request: Request, hours: int = 48) -> dict:
         "optimiser_status": opt.status,
         "points": points,
     }
-
 

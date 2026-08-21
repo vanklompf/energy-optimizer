@@ -219,17 +219,8 @@ export default function NowView() {
           <li><span>Last fallback</span><b>{bc.last_fallback_at ? new Date(bc.last_fallback_at).toLocaleString() : "—"}</b></li>
           <li><span>Lockout</span><b>{bc.lockout.active ? bc.lockout.reason ?? "active" : "none"}</b></li>
         </ul>
-        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 12 }}>
-          <button
-            className="tab"
-            type="button"
-            onClick={() => {
-              void api.setActuation(!bc.battery_control_enabled).then(() => window.location.reload());
-            }}
-          >
-            {bc.battery_control_enabled ? "Disable actuation" : "Enable actuation"}
-          </button>
-          {bc.lockout.active && (
+        {bc.lockout.active && (
+          <div style={{ marginTop: 12 }}>
             <button
               className="tab"
               type="button"
@@ -239,8 +230,8 @@ export default function NowView() {
             >
               Clear lockout
             </button>
-          )}
-        </div>
+          </div>
+        )}
         {bc.last_action?.blockers && bc.last_action.blockers.length > 0 && (
           <p className="reason">Blockers: {bc.last_action.blockers.join(", ")}</p>
         )}

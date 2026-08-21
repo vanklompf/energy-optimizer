@@ -280,11 +280,6 @@ export const api = {
   hourlyComparison: (hours = 48) =>
     getJSON<HourlyComparisonResponse>(`/api/comparison/hourly?hours=${hours}`),
   dailyReports: () => getJSON<{ reports: Record<string, unknown>[] }>("/api/reports/daily"),
-  setActuation: (enabled: boolean) =>
-    postJSON<{ mode: string; battery_control_enabled: boolean; control_enabled: boolean }>(
-      "/api/control/actuation",
-      { enabled },
-    ),
   clearLockout: () =>
     postJSON<{ cleared: boolean; state: string; lockout_active: boolean }>(
       "/api/control/lockout/clear",

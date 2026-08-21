@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import json
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from energy_optimizer.service import Service, watchdog_health_from_ha
 from energy_optimizer.store import (
     ControlAction,
     ControllerStateRow,
+    Forecast,
     PlanStep,
     Run,
     Store,
@@ -297,6 +299,192 @@ async def test_control_battery_stale_plan_falls_back_without_ha(monkeypatch) -> 
     assert "stale_plan" in str(result.get("reason", ""))
 
 
+async def test_public_fallback_waits_for_active_control_transaction(monkeypatch) -> None:
+    service = Service(_settings(), Store(":memory:"))
+    service.store.create_all()
+    control_entered = asyncio.Event()
+    release_control = asyncio.Event()
+    fallback_entered = asyncio.Event()
+
+    async def control(*, now, force_fallback, lease_lost):
+        control_entered.set()
+        await release_control.wait()
+        return {"result": "control_complete"}
+
+    async def fallback(reason, *, command_id=None, lease_lost):
+        fallback_entered.set()
+        return {"result": "fallback", "reason": reason}
+
+    monkeypatch.setattr(service, "_control_battery_locked", control)
+    monkeypatch.setattr(service, "_fallback_battery_locked", fallback)
+
+    control_task = asyncio.create_task(service.control_battery())
+    await control_entered.wait()
+    fallback_task = asyncio.create_task(service.fallback_battery("concurrent_test"))
+    await asyncio.sleep(0)
+    assert not fallback_entered.is_set()
+
+    release_control.set()
+    assert (await control_task)["result"] == "control_complete"
+    assert (await fallback_task)["result"] == "fallback"
+    assert fallback_entered.is_set()
+
+
+async def test_low_confidence_run_is_preserved_in_live_authorization_evidence() -> None:
+    now = dt.datetime(2026, 8, 8, 12, 7, tzinfo=dt.UTC)
+    interval = dt.datetime(2026, 8, 8, 12, 0, tzinfo=dt.UTC)
+    settings = _settings()
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+    with store.session() as session:
+        session.add(
+            Run(
+                run_id="low-confidence-run",
+                ts=now,
+                mode="dry_run",
+                horizon_hours=24,
+                known_price_hours=24,
+                status="low_confidence",
+            )
+        )
+        session.add(
+            PlanStep(
+                run_id="low-confidence-run",
+                interval_start=interval,
+                dt_hours=0.25,
+                pv_to_battery_kwh=0.25,
+            )
+        )
+        for kind in ("pv", "load"):
+            session.add(
+                Forecast(
+                    run_id="low-confidence-run",
+                    interval_start=interval,
+                    kind=kind,
+                    value=1.0,
+                    confidence="ok",
+                )
+            )
+
+    intent, run_id, selected, plan_age = service.build_battery_control_intent(now)
+    safety, evidence = await service._evaluate_battery_authorization(
+        intent,
+        now=now,
+        interval_start=selected,
+        plan_age=plan_age,
+        lease_held=True,
+        shadow=True,
+        source_run_id=run_id,
+    )
+
+    assert "plan_not_ok" in safety.control_blockers
+    assert evidence["source_run_status"] == "low_confidence"
+    assert evidence["forecast_confidence"] == {"pv": "ok", "load": "ok"}
+
+
+async def test_control_battery_authorization_block_falls_back_and_reports_verified_state(
+    monkeypatch,
+) -> None:
+    now = dt.datetime(2026, 8, 8, 12, 7, tzinfo=dt.UTC)
+    interval = dt.datetime(2026, 8, 8, 12, 0, tzinfo=dt.UTC)
+    data = _settings().model_dump()
+    data.update(mode="control", battery_control_enabled=True, ha_token="token")
+    settings = Settings.model_construct(**data)
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+    with store.session() as session:
+        session.add(
+            Run(
+                run_id="blocked-run",
+                ts=now,
+                mode="control",
+                horizon_hours=24,
+                known_price_hours=24,
+                status="ok",
+            )
+        )
+        session.add(
+            PlanStep(
+                run_id="blocked-run",
+                interval_start=interval,
+                dt_hours=0.25,
+                pv_to_battery_kwh=0.25,
+            )
+        )
+
+    class FakeHa:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+    class FallbackOnlyController:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def apply_intent(self, *args, **kwargs):
+            raise AssertionError("blocked authorization must not apply the economic intent")
+
+        async def fallback(self, reason, command_id=None):
+            from energy_optimizer.battery_control import ControllerState, ControlResult
+            from energy_optimizer.sigenergy_control import SigenergyControlResult
+
+            return SigenergyControlResult(
+                control=ControlResult(
+                    command_id=command_id or "fallback",
+                    requested_state=ControllerState.FALLBACK,
+                    observed_state=ControllerState.DISARMED,
+                    entity_readback={},
+                    physical_verified=True,
+                    retries=0,
+                    latency_ms=1.0,
+                    failure_reason=None,
+                    lockout_reason=None,
+                )
+            )
+
+    async def blocked_authorization(intent, **kwargs):
+        return (
+            SafetyReport(
+                status=Status.BLOCKED,
+                control_enabled=True,
+                control_authorized=False,
+                control_blockers=["watchdog_unhealthy"],
+            ),
+            {"would_authorize": False},
+        )
+
+    monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", FakeHa)
+    monkeypatch.setattr(
+        "energy_optimizer.sigenergy_control.SigenergyController", FallbackOnlyController
+    )
+    monkeypatch.setattr(service, "_evaluate_battery_authorization", blocked_authorization)
+
+    result = await service.control_battery(now=now)
+
+    assert result["result"] == "fallback"
+    assert result["verified"] is True
+    assert result["blockers"] == ["watchdog_unhealthy"]
+    assert result["reason"] == "control_blocked:watchdog_unhealthy"
+    with store.session() as session:
+        blocked = session.get(ControlAction, result["blocked_command_id"])
+        fallback = session.get(ControlAction, result["command_id"])
+        assert blocked is not None
+        assert blocked.result == "blocked"
+        assert blocked.observed_state is None
+        assert blocked.physical_json is None
+        assert fallback is not None
+        assert fallback.result == "fallback"
+        assert fallback.observed_state == "DISARMED"
+        assert json.loads(fallback.physical_json or "{}") == {"verified": True}
+
+
 async def test_control_battery_selects_containing_interval() -> None:
     settings = _settings(step_minutes=15)
     store = Store(":memory:")
@@ -552,7 +740,7 @@ async def test_manual_command_status_reports_direction_and_expiry() -> None:
     assert service.manual_command_status(later) is None
 
 
-async def test_control_battery_lease_conflict_locks_out() -> None:
+async def test_control_battery_lease_conflict_does_not_disturb_owner() -> None:
     settings = _settings()
     store = Store(":memory:")
     store.create_all()
@@ -565,9 +753,7 @@ async def test_control_battery_lease_conflict_locks_out() -> None:
     assert result["result"] == "lease_conflict"
     with store.session() as session:
         state = session.get(ControllerStateRow, "current")
-        assert state is not None
-        assert state.state == "LOCKOUT"
-        assert state.lockout_reason == "lease_conflict"
+        assert state is None
 
 
 async def test_fallback_battery_records_when_disarmed() -> None:
@@ -622,10 +808,10 @@ async def test_reconcile_startup_falls_back_when_remote_ems_on(monkeypatch) -> N
 
     monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", FakeHa)
 
-    async def _recorded_fallback(reason, command_id=None):
+    async def _recorded_fallback(reason, command_id=None, lease_lost=None):
         return {"result": "fallback_recorded", "reason": reason, "command_id": "fb"}
 
-    monkeypatch.setattr(service, "fallback_battery", _recorded_fallback)
+    monkeypatch.setattr(service, "_fallback_battery_locked", _recorded_fallback)
 
     result = await service.reconcile_battery_on_startup()
     assert result["result"] == "fallback_recorded"
@@ -660,10 +846,10 @@ async def test_reconcile_startup_falls_back_when_ha_read_fails(monkeypatch) -> N
 
     monkeypatch.setattr("energy_optimizer.battery_loop.HaClient", FailingHa)
 
-    async def fallback(reason: str, command_id=None):
+    async def fallback(reason: str, command_id=None, lease_lost=None):
         return {"result": "fallback_recorded", "reason": reason, "command_id": command_id}
 
-    monkeypatch.setattr(service, "fallback_battery", fallback)
+    monkeypatch.setattr(service, "_fallback_battery_locked", fallback)
 
     result = await service.reconcile_battery_on_startup()
 
@@ -784,7 +970,7 @@ async def test_path_loss_reconciliation_retries_safe_fallback_once_when_ha_retur
 
     calls: list[str] = []
 
-    async def fallback(reason: str, command_id=None):
+    async def fallback(reason: str, command_id=None, lease_lost=None):
         calls.append(reason)
         with store.session() as session:
             state = session.get(ControllerStateRow, "current")
@@ -797,7 +983,7 @@ async def test_path_loss_reconciliation_retries_safe_fallback_once_when_ha_retur
             "verified": True,
         }
 
-    monkeypatch.setattr(service, "fallback_battery", fallback)
+    monkeypatch.setattr(service, "_fallback_battery_locked", fallback)
 
     result = await service.reconcile_path_loss_recovery()
     repeated = await service.reconcile_path_loss_recovery()
@@ -1024,11 +1210,11 @@ async def test_unverified_path_loss_recovery_is_attempted_once_and_stays_locked(
 
     fallback_attempts: list[str] = []
 
-    async def unverified_fallback(reason: str, *, command_id=None):
+    async def unverified_fallback(reason: str, *, command_id=None, lease_lost=None):
         fallback_attempts.append(reason)
         return {"result": "fallback", "reason": reason, "verified": False}
 
-    monkeypatch.setattr(service, "fallback_battery", unverified_fallback)
+    monkeypatch.setattr(service, "_fallback_battery_locked", unverified_fallback)
 
     first = await service.control_battery(now=now)
     repeated = await service.control_battery(now=now + dt.timedelta(minutes=1))
@@ -1100,6 +1286,8 @@ async def test_publish_battery_heartbeat_updates_state() -> None:
     store = Store(":memory:")
     store.create_all()
     service = Service(settings, store)
+    with store.session() as session:
+        assert try_acquire_lease(session, owner_id=service.controller_owner_id)
     await service.publish_battery_heartbeat()
     with store.session() as session:
         state = session.get(ControllerStateRow, "current")

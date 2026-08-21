@@ -319,7 +319,7 @@ def test_heartbeat_expiry_triggers_watchdog_fallback_sequence() -> None:
 
 
 @pytest.mark.asyncio
-async def test_duplicate_instance_lease_lockout() -> None:
+async def test_duplicate_instance_lease_conflict_does_not_overwrite_owner_state() -> None:
     settings = _settings(mode="dry_run", battery_control_enabled=False)
     store = Store(":memory:")
     store.create_all()
@@ -335,4 +335,4 @@ async def test_duplicate_instance_lease_lockout() -> None:
     with store.session() as session:
         state = session.get(ControllerStateRow, "current")
         assert state is not None
-        assert state.state == "LOCKOUT"
+        assert state.state == "DISARMED"
