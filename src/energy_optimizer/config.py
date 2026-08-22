@@ -100,7 +100,9 @@ class Settings(BaseSettings):
     # --- Pstryk ---
     pstryk_api_key: str = ""
     pstryk_base_url: str = "https://api.pstryk.pl"
-    pstryk_history_bootstrap_days: int = 21
+    pstryk_history_bootstrap_days: int = 28
+    pstryk_meter_history_bootstrap_days: int = 28
+    telemetry_history_bootstrap_days: int = 28
 
     # --- MQTT ---
     mqtt_enabled: bool = True

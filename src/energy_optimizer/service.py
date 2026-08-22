@@ -48,6 +48,7 @@ from .ha_client import (
 from .mqtt_publish import MqttConfig, MqttPublisher, RecommendationState
 from .optimiser import OptimiserParams, optimise
 from .planning import (
+    FORECAST_HISTORY_RETENTION_DAYS,
     SOLVER_INPUT_SCHEMA,
     PlanningMixin,
     has_complete_telemetry_coverage,
@@ -368,18 +369,20 @@ class Service(BatteryMixin, PlanningMixin):
     async def bootstrap(self) -> None:
         """One-shot startup backfill so backtests and the price chart have history
         immediately instead of only after hours/days of live collection."""
-        days = self.settings.pstryk_history_bootstrap_days
-        if days > 0:
+        price_days = self.settings.pstryk_history_bootstrap_days
+        if price_days > 0:
             try:
-                await self.refresh_prices(history_days=days)
+                await self.refresh_prices(history_days=price_days)
             except Exception:  # pragma: no cover - network dependent
                 logger.exception("price history bootstrap failed")
+        meter_days = self.settings.pstryk_meter_history_bootstrap_days
+        if meter_days > 0:
             try:
-                await self.refresh_meter_values(days_back=days)
+                await self.refresh_meter_values(days_back=meter_days)
             except Exception:  # pragma: no cover - network dependent
                 logger.exception("Pstryk meter history bootstrap failed")
         try:
-            await self.bootstrap_telemetry_history(days)
+            await self.bootstrap_telemetry_history(self.settings.telemetry_history_bootstrap_days)
         except Exception:  # pragma: no cover - network dependent
             logger.exception("telemetry history bootstrap failed")
 
@@ -449,7 +452,15 @@ class Service(BatteryMixin, PlanningMixin):
         have_current_price = self._have_current_price(prices, now)
         known_hours = self._known_price_hours(prices, now)
 
-        pv_map, load_map, pv_conf, load_conf = await self._forecast_maps_live(now, prices)
+        (
+            pv_map,
+            load_map,
+            pv_conf,
+            load_conf,
+            pv_correction,
+            load_point_confidence,
+            load_diagnostics,
+        ) = await self._forecast_maps_live(now, prices)
         forecast_surplus_kwh = same_day_forecast_surplus_kwh(
             now,
             pv_map,
@@ -576,9 +587,8 @@ class Service(BatteryMixin, PlanningMixin):
         )
 
         with self.store.session() as session:
-            # Only the latest run's forecasts are ever read back; replace them each run so
-            # the audit table stays bounded instead of growing every 15 minutes.
-            session.execute(delete(Forecast))
+            retention_start = now - dt.timedelta(days=FORECAST_HISTORY_RETENTION_DAYS)
+            session.execute(delete(Forecast).where(Forecast.interval_start < retention_start))
             for hour, energy in hourly_from_map(pv_map).items():
                 session.add(
                     Forecast(
@@ -589,14 +599,33 @@ class Service(BatteryMixin, PlanningMixin):
                         confidence=pv_conf or "low_confidence",
                     )
                 )
+                session.add(
+                    Forecast(
+                        run_id=run_id,
+                        interval_start=hour,
+                        kind="pv_raw",
+                        value=energy / pv_correction,
+                        confidence=pv_conf or "low_confidence",
+                    )
+                )
             for hour, energy in hourly_from_map(load_map).items():
+                point_confidences = [
+                    confidence
+                    for start, confidence in load_point_confidence.items()
+                    if start.replace(minute=0, second=0, microsecond=0) == hour
+                ]
                 session.add(
                     Forecast(
                         run_id=run_id,
                         interval_start=hour,
                         kind="load",
                         value=energy,
-                        confidence=load_conf or "low_confidence",
+                        confidence=(
+                            "ok"
+                            if point_confidences
+                            and all(confidence == "ok" for confidence in point_confidences)
+                            else "low_confidence"
+                        ),
                     )
                 )
             session.add(
@@ -613,7 +642,12 @@ class Service(BatteryMixin, PlanningMixin):
                     objective_pln=objective,
                     status=status.value,
                     reason=decision.reason,
-                    safety=json.dumps(safety.as_dict()),
+                    safety=json.dumps(
+                        {
+                            **safety.as_dict(),
+                            "forecast_diagnostics": {"load": load_diagnostics},
+                        }
+                    ),
                     solve_ms=solve_ms,
                 )
             )

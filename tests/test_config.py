@@ -34,6 +34,13 @@ def test_price_window_bound_never_discards_published_prices() -> None:
     assert 0 < s.optimise_min_price_hours <= 10
 
 
+def test_load_history_bootstrap_defaults_cover_forecast_lookback() -> None:
+    s = Settings(db=":memory:")
+    assert s.pstryk_history_bootstrap_days == 28
+    assert s.pstryk_meter_history_bootstrap_days == 28
+    assert s.telemetry_history_bootstrap_days == 28
+
+
 def test_battery_soc_thresholds_must_be_ordered() -> None:
     with pytest.raises(ValueError, match="hard.*reserve.*maximum"):
         Settings(

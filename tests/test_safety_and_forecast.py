@@ -282,6 +282,28 @@ def test_load_forecast_confidence_scales_with_history() -> None:
     out = fc.forecast(samples, targets)
     assert out[0].load_kwh == 2.0
     assert out[0].confidence == "ok"
+    assert out[0].sample_count == 3
+    assert out[0].required_sample_count == 3
+
+
+def test_load_forecast_requires_three_distinct_local_dates() -> None:
+    fc = LoadForecaster(tz="Europe/Warsaw")
+    target = dt.datetime(2026, 7, 13, 10, 0, tzinfo=dt.UTC)
+    samples = [
+        LoadSample(target - dt.timedelta(days=7), load_kw=1.0),
+        LoadSample(target - dt.timedelta(days=7, minutes=-15), load_kw=2.0),
+        LoadSample(target - dt.timedelta(days=14), load_kw=3.0),
+    ]
+
+    point = fc.forecast(samples, [(target, 1.0)])[0]
+
+    assert point.confidence == "low_confidence"
+    assert point.sample_count == 2
+
+    samples.append(LoadSample(target - dt.timedelta(days=21), load_kw=4.0))
+    point = fc.forecast(samples, [(target, 1.0)])[0]
+    assert point.confidence == "ok"
+    assert point.sample_count == 3
 
 
 async def test_successful_uncorrected_pv_provider_forecast_is_ok() -> None:
@@ -304,3 +326,24 @@ async def test_successful_uncorrected_pv_provider_forecast_is_ok() -> None:
     assert len(points) == 1
     assert points[0].energy_kwh == pytest.approx(1.5)
     assert points[0].confidence == "ok"
+
+
+@pytest.mark.parametrize(("ratio", "expected_kwh"), [(0.25, 0.75), (2.0, 2.25)])
+async def test_pv_provider_clamps_correction_ratio(ratio: float, expected_kwh: float) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"result": {"2026-08-22 12:00:00": 1500}},
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        async with PvForecaster(
+            50.0,
+            22.0,
+            [PvPlane(peak_kwp=7.0, tilt=35.0, azimuth=0.0)],
+            client=client,
+        ) as forecaster:
+            points = await forecaster.forecast(correction_ratio=ratio)
+
+    assert points[0].energy_kwh == pytest.approx(expected_kwh)

@@ -28,6 +28,8 @@ class LoadForecastPoint:
     interval_start: dt.datetime  # UTC
     load_kwh: float
     confidence: str
+    sample_count: int
+    required_sample_count: int = MIN_SAMPLES
 
 
 class LoadForecaster:
@@ -77,6 +79,7 @@ class LoadForecaster:
                     interval_start=start,
                     load_kwh=load_kw * dt_hours,
                     confidence=confidence,
+                    sample_count=counts.get(bucket, 0),
                 )
             )
         return out

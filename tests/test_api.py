@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 import pytest
 from fastapi.testclient import TestClient
@@ -65,6 +66,47 @@ def test_status_empty(client: TestClient) -> None:
     assert bc["watchdog_reason"] == "watchdog_mapping_missing"
     assert "arm_token_configured" not in bc
     assert "number_register_ack_reliable" not in bc
+
+
+def test_status_exposes_run_safety_and_forecast_diagnostics(client: TestClient) -> None:
+    store = client.app.state.store
+    now = dt.datetime.now(tz=dt.UTC)
+    safety = {
+        "status": "low_confidence",
+        "blockers": [],
+        "warnings": ["missing load forecast; recommendation is low-confidence"],
+        "forecast_diagnostics": {
+            "load": {
+                "status": "low_confidence",
+                "matched_hours": 42,
+                "deficient_buckets": [
+                    {
+                        "local_hour": 23,
+                        "weekend": True,
+                        "distinct_dates": 2,
+                        "required_distinct_dates": 3,
+                        "affected_intervals": [now.isoformat()],
+                    }
+                ],
+            }
+        },
+    }
+    with store.session() as session:
+        session.add(
+            Run(
+                run_id="diagnostic-run",
+                ts=now,
+                mode="dry_run",
+                horizon_hours=24,
+                known_price_hours=24,
+                status="low_confidence",
+                safety=json.dumps(safety),
+            )
+        )
+
+    run = client.get("/api/status").json()["last_run"]
+
+    assert run["safety"] == safety
 
 
 def test_status_reports_expired_lockout_as_cleared(client: TestClient) -> None:

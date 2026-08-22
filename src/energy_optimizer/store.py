@@ -103,7 +103,9 @@ class Forecast(Base):
 
     run_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     interval_start: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), primary_key=True)
-    kind: Mapped[str] = mapped_column(String(16), primary_key=True)  # pv|load|price_buy|price_sell
+    kind: Mapped[str] = mapped_column(
+        String(16), primary_key=True
+    )  # pv|pv_raw|load|price_buy|price_sell
     value: Mapped[float] = mapped_column(Float)
     confidence: Mapped[str] = mapped_column(String(16), default="ok")
 

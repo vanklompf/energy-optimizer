@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 import pytest
 from sqlalchemy import select
 
-from energy_optimizer.config import Settings
+from energy_optimizer.config import PvPlane, Settings
 from energy_optimizer.ev import EvRequirements, apply_ev_shortfall_warning
 from energy_optimizer.ev_control import (
     EvControlDecision,
@@ -28,6 +29,7 @@ from energy_optimizer.store import (
     EvControlStatus,
     EvPlanStep,
     EvTelemetry,
+    Forecast,
     PlanStep,
     Price,
     PstrykMeterInterval,
@@ -77,6 +79,196 @@ def test_telemetry_coverage_requires_every_hour_in_the_bootstrap_window() -> Non
             session.query(Telemetry).filter_by(ts=start + dt.timedelta(minutes=minute)).delete()
     with store.session() as session:
         assert has_complete_telemetry_coverage(session, start, end) is False
+
+
+def _run(run_id: str, timestamp: dt.datetime) -> Run:
+    return Run(
+        run_id=run_id,
+        ts=timestamp,
+        mode="dry_run",
+        horizon_hours=24,
+        known_price_hours=24,
+        status="ok",
+    )
+
+
+def _add_complete_pv_hour(session, hour: dt.datetime, pv_kw: float = 1.0) -> None:
+    for minute in range(0, 60, 5):
+        session.add(
+            Telemetry(
+                ts=hour + dt.timedelta(minutes=minute),
+                soc_pct=50.0,
+                pv_kw=pv_kw,
+                load_kw=1.0,
+                grid_import_kw=0.0,
+                grid_export_kw=0.0,
+                batt_charge_kw=0.0,
+                batt_discharge_kw=0.0,
+                stale=False,
+            )
+        )
+
+
+@pytest.mark.parametrize(("pv_kw", "expected_ratio"), [(1.0, 1.25), (0.1, 0.5), (2.0, 1.5)])
+def test_pv_calibration_uses_latest_pre_delivery_forecasts_only(
+    pv_kw: float, expected_ratio: float
+) -> None:
+    settings = _settings()
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+    now = dt.datetime(2026, 8, 22, 12, tzinfo=dt.UTC)
+    first_hour = now - dt.timedelta(hours=3)
+
+    with store.session() as session:
+        session.add_all(
+            [
+                _run("old", first_hour - dt.timedelta(hours=2)),
+                _run("latest-valid", first_hour - dt.timedelta(minutes=30)),
+                _run("lookahead", now + dt.timedelta(minutes=30)),
+            ]
+        )
+        for offset in range(3):
+            hour = first_hour + dt.timedelta(hours=offset)
+            _add_complete_pv_hour(session, hour, pv_kw=pv_kw)
+            session.add_all(
+                [
+                    Forecast(
+                        run_id="old",
+                        interval_start=hour,
+                        kind="pv_raw",
+                        value=0.4,
+                        confidence="ok",
+                    ),
+                    Forecast(
+                        run_id="latest-valid",
+                        interval_start=hour,
+                        kind="pv_raw",
+                        value=0.8,
+                        confidence="ok",
+                    ),
+                    Forecast(
+                        run_id="lookahead",
+                        interval_start=hour,
+                        kind="pv_raw",
+                        value=10.0,
+                        confidence="ok",
+                    ),
+                ]
+            )
+
+    assert service._pv_correction_ratio(now) == pytest.approx(expected_ratio)
+
+
+def test_pv_calibration_falls_back_with_insufficient_daylight_hours() -> None:
+    settings = _settings()
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+    now = dt.datetime(2026, 8, 22, 12, tzinfo=dt.UTC)
+    assert service._pv_correction_ratio(now) == 1.0
+
+    with store.session() as session:
+        session.add(_run("forecast", now - dt.timedelta(hours=4)))
+        for offset in range(3):
+            hour = now - dt.timedelta(hours=offset + 1)
+            if offset < 2:
+                _add_complete_pv_hour(session, hour)
+            else:
+                session.add(
+                    Telemetry(
+                        ts=hour + dt.timedelta(minutes=30),
+                        soc_pct=50.0,
+                        pv_kw=1.0,
+                        load_kw=1.0,
+                        grid_import_kw=0.0,
+                        grid_export_kw=0.0,
+                        batt_charge_kw=0.0,
+                        batt_discharge_kw=0.0,
+                        stale=False,
+                    )
+                )
+            session.add(
+                Forecast(
+                    run_id="forecast",
+                    interval_start=hour,
+                    kind="pv_raw",
+                    value=0.8,
+                    confidence="ok",
+                )
+            )
+
+    assert service._pv_correction_ratio(now) == 1.0
+
+
+def test_pv_calibration_ignores_near_zero_nighttime_forecasts() -> None:
+    settings = _settings()
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+    now = dt.datetime(2026, 8, 22, 6, tzinfo=dt.UTC)
+
+    with store.session() as session:
+        session.add(_run("forecast", now - dt.timedelta(hours=5)))
+        for offset in range(3):
+            hour = now - dt.timedelta(hours=offset + 1)
+            _add_complete_pv_hour(session, hour, pv_kw=0.1)
+            session.add(
+                Forecast(
+                    run_id="forecast",
+                    interval_start=hour,
+                    kind="pv_raw",
+                    value=0.01,
+                    confidence="ok",
+                )
+            )
+
+    assert service._pv_correction_ratio(now) == 1.0
+
+
+async def test_pv_forecast_applies_historical_correction(monkeypatch) -> None:
+    settings = _settings().model_copy(
+        update={
+            "pv_forecast_provider": "forecast_solar",
+            "pv_planes": [PvPlane(peak_kwp=7.0, tilt=35.0, azimuth=0.0)],
+        }
+    )
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+    now = dt.datetime(2026, 8, 22, 12, tzinfo=dt.UTC)
+    seen_ratio = None
+
+    class FakePvForecaster:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            pass
+
+        async def forecast(self, correction_ratio=1.0):
+            nonlocal seen_ratio
+            seen_ratio = correction_ratio
+
+            class Point:
+                interval_start = now
+                energy_kwh = 2.0 * correction_ratio
+                confidence = "ok"
+
+            return [Point()]
+
+    monkeypatch.setattr(service, "_pv_correction_ratio", lambda _now: 1.25)
+    monkeypatch.setattr("energy_optimizer.planning.PvForecaster", FakePvForecaster)
+
+    pv_map, confidence, correction = await service._pv_forecast_map(now, [(now, 1.0)])
+
+    assert seen_ratio == 1.25
+    assert pv_map[now] == pytest.approx(2.5)
+    assert confidence == "ok"
+    assert correction == 1.25
 
 
 def _settings() -> Settings:
@@ -195,6 +387,164 @@ async def test_run_optimise_produces_plan_from_load_forecast() -> None:
     assert run is not None
     assert run.status != "blocked"
     assert len(steps) > 0
+
+
+async def test_run_optimise_retains_history_and_persists_raw_pv(monkeypatch) -> None:
+    settings = _settings()
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+
+    async def corrected_forecast(forecast_now, forecast_prices):
+        starts = [start for start, _ in service._interval_grid(forecast_prices, forecast_now)]
+        first_hour = starts[0].replace(minute=0, second=0, microsecond=0)
+        load_confidence = {
+            start: (
+                "low_confidence"
+                if start.replace(minute=0, second=0, microsecond=0) == first_hour
+                else "ok"
+            )
+            for start in starts
+        }
+        return (
+            {start: 0.25 for start in starts},
+            {start: 0.25 for start in starts},
+            "ok",
+            "ok",
+            0.5,
+            load_confidence,
+            {
+                "status": "low_confidence",
+                "matched_hours": 20,
+                "deficient_buckets": [
+                    {
+                        "local_hour": first_hour.hour,
+                        "weekend": False,
+                        "distinct_dates": 2,
+                        "required_distinct_dates": 3,
+                        "affected_intervals": [starts[0].isoformat()],
+                    }
+                ],
+            },
+        )
+
+    monkeypatch.setattr(service, "_forecast_maps_live", corrected_forecast)
+    now = utcnow()
+    floor = now.replace(minute=0, second=0, microsecond=0)
+    with store.session() as session:
+        for offset in range(4):
+            session.add(
+                Price(
+                    interval_start=floor + dt.timedelta(hours=offset),
+                    buy_gross=1.0,
+                    full_price=1.0,
+                    sell_gross=0.5,
+                    source="api",
+                )
+            )
+        session.add(
+            Telemetry(
+                ts=now,
+                soc_pct=50.0,
+                pv_kw=0.0,
+                load_kw=1.0,
+                grid_import_kw=1.0,
+                grid_export_kw=0.0,
+                batt_charge_kw=0.0,
+                batt_discharge_kw=0.0,
+                stale=False,
+            )
+        )
+        session.add_all(
+            [
+                Forecast(
+                    run_id="recent",
+                    interval_start=now - dt.timedelta(days=1),
+                    kind="pv_raw",
+                    value=1.0,
+                    confidence="ok",
+                ),
+                Forecast(
+                    run_id="expired",
+                    interval_start=now - dt.timedelta(days=15),
+                    kind="pv_raw",
+                    value=1.0,
+                    confidence="ok",
+                ),
+            ]
+        )
+
+    run_id = await service.run_optimise()
+
+    with store.session() as session:
+        recent = session.get(Forecast, ("recent", now - dt.timedelta(days=1), "pv_raw"))
+        expired = session.get(Forecast, ("expired", now - dt.timedelta(days=15), "pv_raw"))
+        corrected = (
+            session.execute(
+                select(Forecast).where(Forecast.run_id == run_id, Forecast.kind == "pv")
+            )
+            .scalars()
+            .all()
+        )
+        raw = {
+            row.interval_start: row.value
+            for row in session.execute(
+                select(Forecast).where(Forecast.run_id == run_id, Forecast.kind == "pv_raw")
+            )
+            .scalars()
+        }
+        load_rows = (
+            session.execute(
+                select(Forecast)
+                .where(Forecast.run_id == run_id, Forecast.kind == "load")
+                .order_by(Forecast.interval_start)
+            )
+            .scalars()
+            .all()
+        )
+        run = session.get(Run, run_id)
+
+    assert recent is not None
+    assert expired is None
+    assert corrected
+    assert all(raw[row.interval_start] == pytest.approx(row.value / 0.5) for row in corrected)
+    assert load_rows[0].confidence == "low_confidence"
+    assert all(row.confidence == "ok" for row in load_rows[1:])
+    assert run is not None
+    safety = json.loads(run.safety)
+    assert safety["forecast_diagnostics"]["load"]["matched_hours"] == 20
+
+
+async def test_bootstrap_uses_separate_28_day_history_windows(monkeypatch) -> None:
+    settings = _settings().model_copy(
+        update={
+            "pstryk_history_bootstrap_days": 26,
+            "pstryk_meter_history_bootstrap_days": 27,
+            "telemetry_history_bootstrap_days": 28,
+        }
+    )
+    service = Service(settings, Store(":memory:"))
+    calls: list[tuple[str, int]] = []
+
+    async def prices(*, history_days: int) -> int:
+        calls.append(("prices", history_days))
+        return 0
+
+    async def meter(*, days_back: int) -> int:
+        calls.append(("meter", days_back))
+        return 0
+
+    async def telemetry(days: int) -> int:
+        calls.append(("telemetry", days))
+        return 0
+
+    monkeypatch.setattr(service, "refresh_prices", prices)
+    monkeypatch.setattr(service, "refresh_meter_values", meter)
+    monkeypatch.setattr(service, "bootstrap_telemetry_history", telemetry)
+
+    await service.bootstrap()
+
+    assert calls == [("prices", 26), ("meter", 27), ("telemetry", 28)]
 
 
 async def test_refresh_meter_values_persists_authoritative_billing_intervals(monkeypatch) -> None:
@@ -319,6 +669,31 @@ def test_load_history_has_no_sigen_fallback_without_pstryk_meter() -> None:
     assert service._load_samples(utcnow()) == []
 
 
+def test_load_forecast_diagnostics_identify_deficient_bucket_and_coverage() -> None:
+    settings = _settings()
+    store = Store(":memory:")
+    store.create_all()
+    service = Service(settings, store)
+    now = dt.datetime(2026, 8, 22, 12, 30, tzinfo=dt.UTC)
+    target = now.replace(minute=45)
+
+    load_map, confidence, point_confidence, diagnostics = service._load_forecast_map(
+        now, [(target, 0.25)]
+    )
+
+    assert load_map == {}
+    assert confidence == "low_confidence"
+    assert point_confidence == {target: "low_confidence"}
+    assert diagnostics["expected_completed_hours"] == 28 * 24
+    assert diagnostics["matched_hours"] == 0
+    assert diagnostics["rejected_hours"]["incomplete_telemetry"] == 28 * 24
+    assert diagnostics["low_confidence_points"] == 1
+    bucket = diagnostics["deficient_buckets"][0]
+    assert bucket["distinct_dates"] == 0
+    assert bucket["required_distinct_dates"] == 3
+    assert bucket["affected_intervals"] == [target.isoformat()]
+
+
 def test_hourly_from_map_sums_substeps_into_hours() -> None:
     base = dt.datetime(2026, 7, 13, 10, 0, tzinfo=dt.UTC)
     values = {
@@ -439,6 +814,9 @@ async def test_run_optimise_adds_shadow_vehicle_slots_while_relay_control_is_dis
             {start: 0.1 for start in starts},
             "ok",
             "ok",
+            1.0,
+            {start: "ok" for start in starts},
+            {"status": "ok", "matched_hours": 100, "deficient_buckets": []},
         )
 
     monkeypatch.setattr(service, "_forecast_maps_live", forecast_with_surplus)

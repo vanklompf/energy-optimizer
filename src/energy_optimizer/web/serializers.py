@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 
 from sqlalchemy import select
 
@@ -149,6 +150,12 @@ def _price_dict(p: Price | None) -> dict | None:
 def _run_dict(r: Run | None) -> dict | None:
     if r is None:
         return None
+    safety = None
+    if r.safety:
+        try:
+            safety = json.loads(r.safety)
+        except json.JSONDecodeError:
+            safety = {"raw": r.safety}
     return {
         "run_id": r.run_id,
         "ts": _iso(r.ts),
@@ -160,6 +167,7 @@ def _run_dict(r: Run | None) -> dict | None:
         "known_price_hours": r.known_price_hours,
         "solver_input_sha256": r.solver_input_sha256,
         "solve_ms": r.solve_ms,
+        "safety": safety,
     }
 
 
@@ -200,5 +208,4 @@ def _iso(value: dt.datetime | None) -> str | None:
 
 def _aware(value: dt.datetime) -> dt.datetime:
     return value if value.tzinfo else value.replace(tzinfo=dt.UTC)
-
 
