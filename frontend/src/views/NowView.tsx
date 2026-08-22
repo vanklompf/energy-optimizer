@@ -177,6 +177,7 @@ export default function NowView() {
   const price = data.current_price;
   const meter = data.billing_meter;
   const run = data.last_run;
+  const loadDiagnostics = run?.safety?.forecast_diagnostics?.load;
   const ev = data.ev;
   const evControl = data.ev_control;
   const bc = data.battery_control;
@@ -321,9 +322,18 @@ export default function NowView() {
             <>
               <div className={`badge ${STATUS_CLASS[run.status] ?? ""}`}>{run.status}</div>
               <p className="reason">{run.reason ?? "No reason recorded"}</p>
+              {run.safety?.warnings?.map((warning) => (
+                <p className="reason" key={warning}>{warning}</p>
+              ))}
               <ul className="metrics">
                 <li><span>Expected value</span><b>{fmt(run.objective_pln ? -run.objective_pln : null, " PLN")}</b></li>
                 <li><span>Known prices</span><b>{fmt(run.known_price_hours, " h", 0)}</b></li>
+                {loadDiagnostics && (
+                  <>
+                    <li><span>Matched load hours</span><b>{loadDiagnostics.matched_hours} / {loadDiagnostics.expected_completed_hours}</b></li>
+                    <li><span>Deficient load buckets</span><b>{loadDiagnostics.deficient_buckets.length}</b></li>
+                  </>
+                )}
                 <li title="Realised: Pstryk-settled cost minus optimiser cost over the same settled intervals">
                   <span>Saved today</span><b>{fmt(savings?.day.savings_pln, " PLN")}</b>
                 </li>
@@ -331,6 +341,13 @@ export default function NowView() {
                   <span>Saved 7 days</span><b>{fmt(savings?.week.savings_pln, " PLN")}</b>
                 </li>
               </ul>
+              {loadDiagnostics && loadDiagnostics.deficient_buckets.length > 0 && (
+                <p className="muted">
+                  Load history gaps: {loadDiagnostics.deficient_buckets.map((bucket) =>
+                    `${bucket.weekend ? "weekend" : "weekday"} ${String(bucket.local_hour).padStart(2, "0")}:00 (${bucket.distinct_dates}/${bucket.required_distinct_dates} dates)`
+                  ).join(", ")}
+                </p>
+              )}
             </>
           ) : (
             <p>No optimiser run yet.</p>

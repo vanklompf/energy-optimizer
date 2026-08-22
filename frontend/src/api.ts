@@ -43,6 +43,42 @@ export interface RunSummary {
   known_price_hours: number;
   solver_input_sha256: string | null;
   solve_ms: number | null;
+  safety: RunSafety | null;
+}
+
+export interface LoadDeficientBucket {
+  local_hour: number;
+  weekend: boolean;
+  distinct_dates: number;
+  required_distinct_dates: number;
+  affected_intervals: string[];
+}
+
+export interface LoadForecastDiagnostics {
+  lookback_days: number;
+  expected_completed_hours: number;
+  complete_telemetry_hours: number;
+  settled_meter_hours: number;
+  matched_hours: number;
+  rejected_hours: {
+    incomplete_telemetry: number;
+    missing_settlement: number;
+    settlement_without_complete_telemetry: number;
+  };
+  status: string;
+  forecast_points: number;
+  low_confidence_points: number;
+  deficient_buckets: LoadDeficientBucket[];
+}
+
+export interface RunSafety {
+  status: string;
+  blockers: string[];
+  warnings: string[];
+  control_enabled: boolean;
+  control_authorized: boolean;
+  control_blockers: string[];
+  forecast_diagnostics?: { load?: LoadForecastDiagnostics };
 }
 
 export interface StatusResponse {
